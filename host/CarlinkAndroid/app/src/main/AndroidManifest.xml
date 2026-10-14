@@ -24,6 +24,16 @@
          12L target; on 14+ the OS grants it at install for a sideloaded app (Play is what revokes
          it for non-calling apps). CallNotificationHost falls back to a plain card if refused. -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Wireless CarPlay uses the vehicle hotspot as the phone's Wi-Fi leg. The app is the
+         AirPlay endpoint on that network, so it must be allowed to open TCP sockets and perform
+         service discovery; CHANGE_NETWORK_STATE alone does not grant either capability. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <queries>
+        <package android:name="android.car.usb.handler" />
+    </queries>
 
     <!-- USB Host. required=false on purpose: the CPC200 adapter needs USB host at
          runtime, but GM AAOS (gm/gminfo37) does NOT advertise android.hardware.usb.host
@@ -92,15 +102,6 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.CAR_MODE" />
-            </intent-filter>
-
-            <!-- HOME/DEFAULT filter: makes Carlink selectable as the system Home app
-                 (Settings > Apps > Default apps > Home app). No runtime behavior change
-                 yet: MainActivity does not currently branch on a HOME launch. -->
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.HOME" />
-                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
 
             <!-- AAOS Media App Intent Filter -->
@@ -180,6 +181,7 @@
         <service
             android:name=".voice.CarlinkRecognitionService"
             android:exported="true"
+            android:permission="android.permission.BIND_SPEECH_RECOGNITION_SERVICE"
             android:label="@string/assistant_label">
             <intent-filter>
                 <action android:name="android.speech.RecognitionService" />

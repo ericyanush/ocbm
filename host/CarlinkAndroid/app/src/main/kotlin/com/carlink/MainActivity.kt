@@ -36,6 +36,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.carlink.logging.Logger
@@ -238,6 +239,7 @@ class MainActivity : ComponentActivity() {
                             carlinkManager = manager,
                             displayMode = displayMode,
                             onDisplayModeSelected = { onDisplayModeSelected(it) },
+                            onViewAreaChanged = { index -> applyCarPlayViewArea(index) },
                         )
                     }
                 }
@@ -330,9 +332,11 @@ class MainActivity : ComponentActivity() {
         val packageInfo = packageManager.getPackageInfo(packageName, 0)
         val appVersion = "${packageInfo.versionName}+${packageInfo.longVersionCode}"
 
+        Logger.initialize(this, appVersion)
+
         // DEBUG builds: full logcat output. RELEASE builds: WARN/ERROR only (enforced in
-        // Logger.log) and verbose pipeline tags disabled. The log-to-file feature was removed
-        // in this build — `adb logcat` is the only sink.
+        // Logger.log) and verbose pipeline tags disabled. File logging retains all messages
+        // emitted through Logger and ProbeLog, including INFO events hidden from release logcat.
         val isDebugBuild = BuildConfig.DEBUG
         Logger.setDebugLoggingEnabled(isDebugBuild)
 
@@ -404,7 +408,9 @@ class MainActivity : ComponentActivity() {
      * `ui/adaptive/WindowLayout.kt`). A content area that actually moved — the panel, the window
      * (split-screen), the bars around it or the safe area — needs a new CT_SUBSCRIBE: the box only
      * knows the geometry it was pushed. The manager is then rebuilt exactly as Reset Connection does.
-     * A live mid-session resize (`CMD_VIEW_AREA`) is NOT used: this app declares a single view area.
+     * Android window/panel geometry changes still require a new subscribe. CarPlay's own Dock
+     * resize is separate: it switches between the two advertised areas through the inbound
+     * `/command requestViewArea` path and does not rebuild the session.
      */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
@@ -636,9 +642,8 @@ class MainActivity : ComponentActivity() {
     /**
      * Applies the active [DisplayMode] to the window: hide the bars it hides, show the ones it
      * keeps, draw edge-to-edge into the cutout, and reveal hidden bars transiently on swipe. The
-     * window stays edge-to-edge in every mode; a visible bar is kept OUT of the video by the
-     * content area the profile derives (`barInsets`), not by letting the decor fit it — that keeps
-     * the surface, the pushed config and the touch basis one rectangle.
+     * window stays edge-to-edge in every mode. CarPlay's video SurfaceView remains full-panel;
+     * its negotiated compact view area is applied as a SurfaceControl crop independently of bars.
      */
     private fun applyDisplayMode() {
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
@@ -654,6 +659,18 @@ class MainActivity : ComponentActivity() {
         windowInsetsController.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         logInfo("[DISPLAY] Applied display mode ${appliedDisplayMode.name}", tag = "MAIN")
+    }
+
+    /** Keep vehicle system bars visible around the compact CarPlay view area. */
+    private fun applyCarPlayViewArea(index: Int) {
+        if (index == 0) {
+            applyDisplayMode()
+            return
+        }
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.show(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        logInfo("[DISPLAY] CarPlay compact view area selected; showing vehicle system bars", tag = "MAIN")
     }
 
     /**
@@ -698,6 +715,7 @@ fun CarlinkApp(
     carlinkManager: CarlinkManager,
     displayMode: DisplayMode = DisplayMode.DEFAULT,
     onDisplayModeSelected: (DisplayMode) -> DisplayModeOutcome = { DisplayModeOutcome.APPLIED },
+    onViewAreaChanged: (Int) -> Unit = {},
 ) {
     var showSettings by remember(carlinkManager) { mutableStateOf(false) }
     var connectionState by remember(carlinkManager) { mutableStateOf(CarlinkManager.State.DISCONNECTED) }
@@ -724,6 +742,7 @@ fun CarlinkApp(
                 showSettings = true
             },
             onStateChanged = { connectionState = it },
+            onViewAreaChanged = onViewAreaChanged,
         )
         AnimatedVisibility(
             visible = showSettings,

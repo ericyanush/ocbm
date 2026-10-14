@@ -45,6 +45,11 @@ data class VehicleConfigSpec(
     val safeHeight: Int = height,
     val drawUIOutsideSafeArea: Boolean = false,
     val wireless: Boolean = true,
+    /** This adapter is a BT/MFi bridge; its own SoftAP must stay down. */
+    val wifiAp: Boolean = false,
+    val wifiSsid: String? = null,
+    val wifiPass: String? = null,
+    val wifiChannel: Int? = null,
     val pairing: String = "just_works",
     val enablesHevc: Boolean = true,
     /** Steering-wheel media keys reach CarPlay through this HID, not a steering-wheel device. */
@@ -250,6 +255,12 @@ object VehicleConfigYaml {
         line("wireless: ${s.wireless}")
         line("hot_handover: false")
         line("pairing: ${s.pairing}")
+        // These are consumed by the adapter supervisor (not serde). They must be in the FIRST
+        // subscribe: it applies the vehicle AP credentials only on the host-present radio-wake edge.
+        line("wifi_ap: ${s.wifiAp}")
+        s.wifiSsid?.let { line("wifi_ssid: $it") }
+        s.wifiPass?.let { line("wifi_pass: $it") }
+        s.wifiChannel?.let { line("wifi_channel: $it") }
         line("rightHandDrive: false")
         // Emitted for shape parity with the pinned fixture; the box does not read it. Night mode is a
         // runtime /command (CMD_NIGHT_MODE), not a config value.
@@ -321,6 +332,9 @@ object VehicleConfigYaml {
         line("  enablesMapAppearance: true")
         line("  enablesCornerMasks: false")
         line("  enablesVideoPlayback: true")
+        // Keep the subscription shape at the known-good single-area setting while isolating the
+        // recent negotiation regression. The native receiver's /info still declares the two GM
+        // areas and negotiates viewAreas; only this pushed adapter YAML stays at its prior value.
         line("  enablesViewAreas: false")
         line("  enablesEnhancedSiri: false")
         line("  enablesFocusTransfer: false")

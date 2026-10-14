@@ -1,5 +1,6 @@
 package com.carlink.logging
 
+import android.content.Context
 import android.util.Log
 import com.carlink.BuildConfig
 import java.util.concurrent.ConcurrentHashMap
@@ -10,8 +11,8 @@ import java.util.concurrent.ConcurrentHashMap
  * - Uniform call surface (v/d/i/w/e plus the top-level logDebug/logInfo/logWarn/logError).
  * - logcat policy: DEBUG builds emit everything; RELEASE builds emit WARN/ERROR only, plus
  *   [Tags.PROTO_UNKNOWN] which always passes (protocol anomalies must reach logcat for
- *   post-mortem forensics). The log-to-file feature was removed in this variant — there is
- *   no listener fan-out and no preset/level UI.
+ *   post-mortem forensics). All events passing through this facade are also captured by the
+ *   bounded private rolling diagnostic log, including INFO/DEBUG events hidden from release logcat.
  * - Zero-cost [logDebugOnly] family: the message lambda runs only when debug logging is
  *   enabled AND the tag is enabled, so release builds compile verbose call sites to no-ops.
  *
@@ -66,6 +67,17 @@ object Logger {
     private var debugLoggingEnabled = true
 
     private val enabledTags = ConcurrentHashMap<String, Boolean>()
+
+    @Volatile
+    private var diagnosticStore: RollingDiagnosticLog? = null
+
+    /** Initialize the private rolling sink before session services start emitting diagnostics. */
+    fun initialize(
+        context: Context,
+        appVersion: String,
+    ) {
+        diagnosticStore = RollingDiagnosticLog.getInstance(context, appVersion)
+    }
 
     /** Enable/disable debug logging. When disabled (release builds), the verbose pipeline tags
      *  are turned off so their [logDebugOnly] call sites become no-ops. */
@@ -128,6 +140,8 @@ object Logger {
         message: String,
         throwable: Throwable? = null,
     ) {
+        // Persist all facade events, including INFO/DEBUG events suppressed from release logcat.
+        diagnosticStore?.append(level, tag, message, throwable)
         // DEBUG builds: emit everything. RELEASE builds: WARN/ERROR only, plus PROTO_UNKNOWN.
         val emit =
             BuildConfig.DEBUG || level.priority >= Level.WARN.priority || tag == Tags.PROTO_UNKNOWN

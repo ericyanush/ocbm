@@ -2,7 +2,11 @@ package com.carlink.ui
 
 import android.app.Activity
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.view.HapticFeedbackConstants
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -45,16 +49,20 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.carlink.CarlinkManager
+import com.carlink.logging.RollingDiagnosticLog
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.ui.adaptive.asWindowInsets
 import com.carlink.ui.settings.ControlTabContent
 import com.carlink.ui.settings.DisplayMode
+import com.carlink.ui.settings.HotspotTabContent
 import com.carlink.ui.settings.PhonesTabContent
 import com.carlink.ui.settings.SettingsTab
 import com.carlink.ui.theme.AutomotiveDimens
 import com.carlink.util.EdgeInsets
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Settings screen: a navigation rail (back, Phones / Control tabs, close-app, version) beside the
@@ -71,6 +79,26 @@ fun SettingsScreen(
     actions: SettingsActions,
 ) {
     var selectedTab by remember { mutableStateOf(SettingsTab.PHONES) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val diagnostics = remember(context) { RollingDiagnosticLog.getInitializedInstance() }
+    var exporting by remember { mutableStateOf(false) }
+    var logRevision by remember { mutableStateOf(0) }
+    var showPurgeConfirmation by remember { mutableStateOf(false) }
+    val exportLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri: Uri? ->
+            if (uri != null && diagnostics != null) {
+                exporting = true
+                scope.launch {
+                    val result = runCatching { withContext(Dispatchers.IO) { diagnostics.copyArchiveTo(uri) } }
+                    exporting = false
+                    logRevision++
+                    Toast.makeText(context, result.fold({ "Exported $it bytes of diagnostics" }, { "Log export failed: ${it.message}" }), Toast.LENGTH_LONG).show()
+                }
+            } else {
+                exporting = false
+            }
+        }
 
     LaunchedEffect(Unit) {
         logInfo("[UI_STATE] SettingsScreen opened - user is in app settings (NOT viewing CarPlay projection)", tag = "UI")
@@ -98,10 +126,71 @@ fun SettingsScreen(
             Box(modifier = Modifier.fillMaxHeight().weight(1f)) {
                 when (selectedTab) {
                     SettingsTab.PHONES -> PhonesPane(carlinkManager)
+                    SettingsTab.WIFI -> HotspotTabContent(carlinkManager)
                     SettingsTab.CONTROL ->
                         ControlTabContent(carlinkManager, connectionState, displayMode, actions.onDisplayModeSelected)
+                    SettingsTab.LOGS ->
+                        LogsPane(diagnostics, exporting, logRevision, onExport = {
+                            exporting = true
+                            exportLauncher.launch("carlink-diagnostics-${System.currentTimeMillis()}.zip")
+                        }, onPurge = { showPurgeConfirmation = true })
                 }
             }
+        }
+    }
+
+    if (showPurgeConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showPurgeConfirmation = false },
+            title = { Text("Delete diagnostic logs?") },
+            text = { Text("This removes the app's private rolling logs. It does not delete files already exported to USB or other storage.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showPurgeConfirmation = false
+                    scope.launch {
+                        val count = withContext(Dispatchers.IO) { diagnostics?.purge() ?: 0 }
+                        logRevision++
+                        Toast.makeText(context, "Purged $count log files", Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { showPurgeConfirmation = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun LogsPane(
+    diagnostics: RollingDiagnosticLog?,
+    exporting: Boolean,
+    revision: Int,
+    onExport: () -> Unit,
+    onPurge: () -> Unit,
+) {
+    val files = remember(diagnostics, revision) { diagnostics?.files().orEmpty() }
+    Column(
+        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
+        verticalArrangement =
+            androidx.compose.foundation.layout.Arrangement
+                .spacedBy(16.dp),
+    ) {
+        Text("Diagnostics", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            "Rolling logs are captured automatically, including session and adapter-protocol diagnostics. " +
+                "Export saves a ZIP through the system file picker; choose an attached USB drive if desired.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text("${files.size} files · ${diagnostics?.totalBytes() ?: 0} bytes", style = MaterialTheme.typography.bodySmall)
+        androidx.compose.material3.Button(onClick = onExport, enabled = diagnostics != null && !exporting) {
+            Text(if (exporting) "Preparing export…" else "Export logs to USB / storage")
+        }
+        TextButton(onClick = onPurge, enabled = diagnostics != null) { Text("Purge all app logs") }
+        files.forEach { file ->
+            Text("${file.name} · ${file.length()} bytes", style = MaterialTheme.typography.bodySmall)
+        }
+        if (diagnostics == null) {
+            Text("Logging has not initialized yet.", color = MaterialTheme.colorScheme.error)
         }
     }
 }

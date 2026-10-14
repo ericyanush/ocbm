@@ -85,6 +85,7 @@ private const val FIRST_FRAME_POLL_MS = 100L
 private class SessionUiState {
     var connectionState by mutableStateOf(CarlinkManager.State.DISCONNECTED)
     var statusText by mutableStateOf("Connect Adapter")
+    var viewAreaIndex by mutableStateOf(0)
 
     /** Container (content-area) dimensions, used for the adapter OPEN / declared-panel resolution. */
     var containerSize by mutableStateOf(IntSize.Zero)
@@ -118,29 +119,28 @@ private class SessionUiState {
  * Settings / Reset Device buttons, exactly the carlink_native main page. During a live session the
  * OEM "Exit" icon in CarPlay (`requestUI`) opens Settings via [onNavigateToSettings].
  *
- * The video surface is laid out to the DECLARED PANEL the session was built for
- * ([CarlinkManager.displayProfile]`.surfaceInsets` off the edge-to-edge window: the visible bars
- * plus the parity pixel): the same rectangle that went out in CT_SUBSCRIBE and that the decoder is
- * sized to, so touch — normalised over the surface — lands where iOS drew.
+ * The video surface stays full-panel in edge-to-edge coordinates so `requestViewArea` can crop the
+ * hardware-composer layer into the exact panel-coordinate rectangle advertised in `/info`. Touch is
+ * normalized against that same full-panel basis, including while the compact crop is active.
  */
 @Composable
 fun MainScreen(
     carlinkManager: CarlinkManager,
     onNavigateToSettings: () -> Unit,
     onStateChanged: (CarlinkManager.State) -> Unit = {},
+    onViewAreaChanged: (Int) -> Unit = {},
 ) {
     val ui = remember(carlinkManager) { SessionUiState() }
     val surfaceState = rememberVideoSurfaceState()
     val scope = rememberCoroutineScope()
     var showResetConfirm by remember(carlinkManager) { mutableStateOf(false) }
-    SessionEffects(carlinkManager, ui, surfaceState, onNavigateToSettings, onStateChanged)
+    SessionEffects(carlinkManager, ui, surfaceState, onNavigateToSettings, onStateChanged, onViewAreaChanged)
 
     // The surface rect comes from the SAME profile the config was built from — the bars the
     // session's display mode keeps visible plus the parity pixel — not from the live Compose
     // insets, which flip with transient bar reveals and would move the surface out from under
     // the pushed geometry. The safe area (cutout / waterfall / corners) only pads the buttons.
     val profile = carlinkManager.displayProfile
-    val surfaceInsets = profile?.surfaceInsets ?: EdgeInsets.NONE
     val safeAreaInsets = profile?.safeAreaInsets ?: EdgeInsets.NONE
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
@@ -148,7 +148,7 @@ fun MainScreen(
             carlinkManager,
             ui,
             surfaceState,
-            Modifier.fillMaxSize().windowInsetsPadding(surfaceInsets.asWindowInsets()).clipToBounds(),
+                Modifier.fillMaxSize().clipToBounds(),
         )
         if (!ui.projecting) {
             LoadingOverlay(carlinkManager, ui.statusText)
@@ -226,11 +226,13 @@ private fun SessionEffects(
     surfaceState: VideoSurfaceState,
     onNavigateToSettings: () -> Unit,
     onStateChanged: (CarlinkManager.State) -> Unit,
+    onViewAreaChanged: (Int) -> Unit,
 ) {
     // The callback object below is registered once per surface/size; read the latest lambdas
     // through rememberUpdatedState so a recomposed caller never leaves a stale capture inside it.
     val navigate by rememberUpdatedState(onNavigateToSettings)
     val stateSink by rememberUpdatedState(onStateChanged)
+    val viewAreaSink by rememberUpdatedState(onViewAreaChanged)
 
     LaunchedEffect(ui.connectionState) {
         logInfo("[UI_STATE] MainScreen connection state: ${ui.connectionState}", tag = "UI")
@@ -290,6 +292,11 @@ private fun SessionEffects(
                         navigate()
                     }
 
+                    override fun onViewAreaRequested(index: Int) {
+                        ui.viewAreaIndex = index
+                        viewAreaSink(index)
+                    }
+
                     override fun onPhoneTypeChanged(phoneType: PhoneType) {
                         logInfo("[UI_SURFACE] Phone type changed: $phoneType", tag = "UI")
                     }
@@ -329,6 +336,7 @@ private fun ProjectionSurface(
         key(carlinkManager) {
             VideoSurface(
                 modifier = Modifier.fillMaxSize(),
+                viewAreaIndex = ui.viewAreaIndex,
                 onSurfaceAvailable = { surface, width, height ->
                     logInfo("[UI_SURFACE] Surface available: ${width}x$height", tag = "UI")
                     surfaceState.onSurfaceAvailable(surface, width, height)

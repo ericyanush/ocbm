@@ -36,9 +36,10 @@ include(":projection")
 // projection API; see car-system-stubs/src/main/java/android/car/CarProjectionManager.java.
 include(":car-system-stubs")
 
-// GM AAOS USB-permission "handler squat" PROOF app (docs/59). Package android.car.usb.handler —
-// it impersonates the stock component GM's framework-res points at but stripped, so the framework
-// grants USB permission to it silently on every attach. Deliberately a SEPARATE module from :app:
-// it is a throwaway proof exercised by logcat and must never share identity with, or install over,
-// the daily-driver OCBM host app (zeno.carlink.ocbm). Standalone — depends on nothing else here.
+// GM AAOS fixed-handler USB owner. Package android.car.usb.handler matches the stripped framework
+// component and receives its silent per-attach grant. Deliberately a SEPARATE APK/UID from :app;
+// :app communicates with it through the signature-protected :usbbridge AIDL contract.
 include(":usbhandler")
+
+// AIDL contract shared by the app and the fixed-handler USB owner.
+include(":usbbridge")

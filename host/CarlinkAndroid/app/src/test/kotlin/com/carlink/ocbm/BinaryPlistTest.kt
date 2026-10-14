@@ -70,6 +70,27 @@ class BinaryPlistTest {
         assertEquals(listOf(1L, 2L), d["arr"])
     }
 
+    @Test
+    fun `binary plist writer round trips nested data and large integers`() {
+        val expected =
+            linkedMapOf<String, Any?>(
+                "enabled" to true,
+                "count" to 256L,
+                "features" to 417757137792L,
+                "label" to "Carlink ✓",
+                "payload" to byteArrayOf(0, 1, 0xFF.toByte()),
+                "items" to listOf(mapOf("width" to 120L), mapOf("width" to 180L)),
+            )
+
+        val decoded = BinaryPlist.parseDict(BinaryPlist.encodeDict(expected)) ?: error("encoded plist rejected")
+        assertEquals(true, decoded["enabled"])
+        assertEquals(256L, decoded["count"])
+        assertEquals(417757137792L, decoded["features"])
+        assertEquals("Carlink ✓", decoded["label"])
+        assertTrue((decoded["payload"] as ByteArray).contentEquals(expected["payload"] as ByteArray))
+        assertEquals(listOf(mapOf("width" to 120L), mapOf("width" to 180L)), decoded["items"])
+    }
+
     // ---- hostile / malformed input: null, never an exception --------------------------------------
 
     @Test

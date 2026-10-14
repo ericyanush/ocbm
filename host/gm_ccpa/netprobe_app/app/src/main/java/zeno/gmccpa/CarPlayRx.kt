@@ -94,7 +94,9 @@ class CarPlayRx(
     /** Where controller-id -> Ed25519 LTPK pairings persist across runs. */
     private val peerFile: String? = null,
     /** Stable 32-byte Ed25519 accessory seed. Changing it invalidates every existing pairing. */
-    private val edSeed: ByteArray = ByteArray(32) { (it * 31 + 7).toByte() }
+    private val edSeed: ByteArray = ByteArray(32) { (it * 31 + 7).toByte() },
+    /** Optional app-specific `/info` customization; null preserves the shared GM test asset. */
+    private val infoTransformer: ((ByteArray) -> ByteArray)? = null,
 ) {
     /**
      * The SAME device id, decimal. This asymmetry is deliberate and is the thing that was broken:
@@ -1532,14 +1534,21 @@ class CarPlayRx(
      * whose `uuid` does not match the HID `displayUUID`. It is a binary plist served as
      * `application/x-apple-binary-plist`; the XML stub this replaces would never have survived.
      *
-     * Built for this head unit: HEVC, 2400x960 @ 60 fps, fullscreen (no viewAreas, no cornerMasks,
-     * no alt/cluster display), touch panel + media buttons only (no D-pad, no knob, no telephony
-     * buttons), and the wireless CarPlay audio set including the AAC-ELD mic uplink.
+     * Built for this head unit: HEVC, 2400x960 @ 60 fps, full-panel plus the GM compact view area,
+     * no cornerMasks or alt/cluster display, touch panel + media buttons only (no D-pad, no knob,
+     * no telephony buttons), and the wireless CarPlay audio set including the AAC-ELD mic uplink.
      * Regenerate with the `infogen` tool if the identity or geometry changes — `deviceid`/`pi`/
      * `features` MUST stay equal to the Bonjour TXT or pair-verify fails.
      */
     private fun infoBlob(): ByteArray? = infoCache ?: try {
-        ctx.assets.open("info.bplist").use { it.readBytes() }.also { infoCache = it }
+        val source = ctx.assets.open("info.bplist").use { it.readBytes() }
+        val result = infoTransformer?.let { transform ->
+            runCatching { transform(source) }.getOrElse {
+                log.e("app-specific /info transform failed; serving the bundled plist: ${it.message}")
+                source
+            }
+        } ?: source
+        result.also { infoCache = it }
     } catch (t: Throwable) { log.e("assets/info.bplist: ${t.message}"); null }
 
     private var infoCache: ByteArray? = null

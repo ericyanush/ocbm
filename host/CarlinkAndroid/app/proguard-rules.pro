@@ -140,3 +140,7 @@
 # The Kotlin Compose compiler plugin keeps @Composable functions.
 # AGP keeps all manifest-declared components (Activity, Service, Receiver).
 # No additional rules needed for these.
+
+# gm_ccpa native JNI resolves these receiver classes and MFi callback methods by name.
+-keep class zeno.gmccpa.** { *; }
+-keep interface zeno.gmccpa.** { *; }

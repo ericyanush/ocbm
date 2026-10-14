@@ -1,10 +1,12 @@
 package com.carlink
 
 import android.content.Context
+import android.net.wifi.WifiManager
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.Surface
+import com.carlink.av.CarPlaySocketMediaBridge
 import com.carlink.audio.MicProfile
 import com.carlink.audio.MicrophoneCaptureManager
 import com.carlink.av.MediaAudioPlayer
@@ -35,11 +37,16 @@ import com.carlink.ocbm.HostInstanceNonce
 import com.carlink.ocbm.Ocbm
 import com.carlink.ocbm.OcbmAvLanes
 import com.carlink.ocbm.OcbmClient
+import com.carlink.ocbm.Mfi
 import com.carlink.ocbm.OemIcon
 import com.carlink.ocbm.UsbBulkTransport
 import com.carlink.ocbm.VehicleConfigSpec
 import com.carlink.ocbm.VehicleConfigYaml
+import com.carlink.ocbm.VehicleHotspotCredentials
+import com.carlink.ocbm.VehicleHotspotStore
 import com.carlink.ocbm.seam.SeamPipe
+import com.carlink.ocbm.seam.SeamCrypto
+import com.carlink.ocbm.seam.VoiceTag
 import com.carlink.protocol.AdapterConfig
 import com.carlink.protocol.MessageSerializer
 import com.carlink.protocol.MultiTouchAction
@@ -47,6 +54,11 @@ import com.carlink.protocol.PhoneType
 import com.carlink.util.DisplayProfile
 import com.carlink.util.LogCallback
 import com.carlink.util.PanelGeometry
+import zeno.gmccpa.CarPlayRx
+import zeno.gmccpa.NetworkDiagnostics
+import zeno.gmccpa.av.MicUplink
+import zeno.gmccpa.pair.MfiRelay
+import zeno.gmccpa.pair.NativeCore
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -232,6 +244,9 @@ class CarlinkManager(
         fun onStatusTextChanged(text: String)
 
         fun onHostUIPressed()
+
+        /** The phone requested a view area advertised in the receiver's `/info` plist. */
+        fun onViewAreaRequested(index: Int) {}
 
         /** Called when phone type becomes known or cleared. */
         fun onPhoneTypeChanged(phoneType: PhoneType) {}
@@ -499,6 +514,11 @@ class CarlinkManager(
     // because AAOS CarAudioFocus keys on the listener object.
     private var mediaPlayer: MediaAudioPlayer? = null
     private var voiceRouter: VoiceRouter? = null
+    /** Loopback ingress from the native AirPlay receiver, started only for an armed media session. */
+    @Volatile private var carPlaySocketBridge: CarPlaySocketMediaBridge? = null
+    @Volatile private var carPlayReceiver: CarPlayRx? = null
+    @Volatile private var carPlayMicUplink: MicUplink? = null
+    @Volatile private var carPlayMulticastLock: WifiManager.MulticastLock? = null
 
     // ---- microphone -------------------------------------------------------------------------
     private var microphoneManager: MicrophoneCaptureManager? = null
@@ -895,7 +915,7 @@ class CarlinkManager(
      * return-count limit, and because "get me a claimed transport" is a coherent step on its own.
      *
      * The [released] re-checks are the point of this function. [findDevice] can burn ~80 s worst
-     * case (10 x 3 s scans plus 20 x 250 ms permission polls), and `release()` runs OUTSIDE
+     * case (10 scans plus helper-side grant polls), and `release()` runs OUTSIDE
      * [lifecycleMutex], so the flag can flip under an in-flight start. Without them a released
      * manager goes on to claim the interface and bring up a full session — a zombie holding the
      * claim against its own replacement, whose start then fails with a claim error and, at
@@ -905,10 +925,20 @@ class CarlinkManager(
     private suspend fun acquireTransport(): UsbBulkTransport? {
         val t = UsbBulkTransport(context, usbLog)
 
+        if (!t.connect()) {
+            val detail = t.lastError ?: "USB helper unavailable"
+            logError("USB helper bind failed: $detail", tag = Logger.Tags.USB)
+            t.stop()
+            handleFailedStart("USB helper unavailable: $detail")
+            return null
+        }
+
         val dev = findDevice(t)
         if (dev == null) {
-            logError("Failed to find the OCBM adapter", tag = Logger.Tags.USB)
-            handleFailedStart("Adapter not found")
+            val detail = t.lastError ?: "Adapter not found or helper grant unavailable"
+            logError("Failed to find/open the OCBM adapter: $detail", tag = Logger.Tags.USB)
+            t.stop()
+            handleFailedStart(detail)
             return null
         }
         if (released) {
@@ -918,22 +948,34 @@ class CarlinkManager(
 
         setStatusText("Adapter found — opening...")
         if (!t.open(dev)) {
-            logError("Failed to claim the adapter's USB interface", tag = Logger.Tags.USB)
-            handleFailedStart("USB permission denied")
+            val detail = t.lastError ?: "USB helper could not claim the adapter"
+            logError("Failed to claim the adapter's USB interface: $detail", tag = Logger.Tags.USB)
+            t.stop()
+            handleFailedStart(detail)
             return null
         }
-        if (released) {
+        return if (released) {
             logWarn("[LIFECYCLE] released during USB open — closing and abandoning", tag = Logger.Tags.ADAPTR)
             t.stop()
-            return null
+            null
+        } else {
+            t
         }
-
-        return t
     }
 
     private suspend fun startImpl() {
         if (released) {
             logWarn("[LIFECYCLE] start() on a released manager — ignoring", tag = Logger.Tags.ADAPTR)
+            return
+        }
+
+        // The adapter's 0x5703 reply is sourced from these values. Without them, its stock AP
+        // (e.g. ccpa-fe01) is handed to the iPhone and poisons the wireless join for this session.
+        val hotspot = VehicleHotspotStore(context).credentials()
+        if (hotspot == null) {
+            setState(State.DISCONNECTED)
+            setStatusText("Set vehicle hotspot Wi-Fi in Settings before connecting")
+            logWarn("[CONFIG] vehicle hotspot SSID/password/channel missing or invalid; refusing CT_SUBSCRIBE", tag = Logger.Tags.ADAPTR)
             return
         }
 
@@ -970,13 +1012,89 @@ class CarlinkManager(
 
         // THE APP IS THE IGNITION: this is the presence latch that brings the box's radios up.
         setStatusText("Starting projection...")
-        if (!c.subscribe(VehicleConfigYaml.renderBytes(vehicleConfigSpec()))) {
+        if (!c.subscribe(VehicleConfigYaml.renderBytes(vehicleConfigSpec(hotspot)))) {
             handleError("usb — CT_SUBSCRIBE write failed")
             return
         }
         c.startHeartbeat()
 
+        // The adapter remains the Bluetooth/MFi coprocessor. The phone's Wi-Fi CarPlay control
+        // and A/V sessions terminate in this app, using gm_ccpa's receiver and Carlink's media
+        // pipes. SUBSCRIBE first so the serialized CH_MFI relay is available to pair-verify.
+        startCarPlayReceiver(c)
+
         setStatusText("Waiting for phone...")
+    }
+
+    private fun startCarPlayReceiver(owner: OcbmClient) {
+        if (carPlayReceiver != null) return
+        NetworkDiagnostics.start(context)
+        runCatching {
+            val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            carPlayMulticastLock = wifi.createMulticastLock("carlink-carplay-mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.onFailure { logWarn("[CP_RX] unable to acquire mDNS multicast lock: ${it.message}", tag = Logger.Tags.ADAPTR) }
+        val relay = object : MfiRelay {
+            override fun copyCertificate(): ByteArray {
+                val response = owner.mfiCertificate()
+                    ?: throw IllegalStateException("OCBM CH_MFI certificate request had no usable reply")
+                if (response.status != Mfi.STATUS_OK) {
+                    throw IllegalStateException(
+                        "OCBM CH_MFI certificate failed: ${response.statusName()} (${response.payload.size}B)",
+                    )
+                }
+                return response.payload
+            }
+
+            override fun createSignature(digest: ByteArray): ByteArray {
+                val response = owner.mfiSign(digest)
+                    ?: throw IllegalStateException("OCBM CH_MFI signature request had no usable reply")
+                if (response.status != Mfi.STATUS_OK) {
+                    throw IllegalStateException(
+                        "OCBM CH_MFI signature failed: ${response.statusName()} (${response.payload.size}B)",
+                    )
+                }
+                return response.payload
+            }
+        }
+        val receiver = CarPlayRx(
+            context,
+            mfiRelay = relay,
+            peerFile = java.io.File(context.filesDir, "carplay_peers.bin").absolutePath,
+        )
+        logInfo("[CP_RX] using shared gm_ccpa /info plist unchanged (no Carlink OEM icon overrides)", tag = Logger.Tags.ADAPTR)
+        receiver.onSessionUp = {
+            logInfo("[CP_RX] native receiver accepted a phone control session", tag = Logger.Tags.ADAPTR)
+            scope.launch {
+                if (client !== owner || carPlayReceiver !== receiver) return@launch
+                setState(State.DEVICE_CONNECTED)
+                setStatusText("Phone connected — starting CarPlay...")
+                if (carPlayMicUplink == null) {
+                    carPlayMicUplink = MicUplink(context).also { it.start() }
+                }
+            }
+        }
+        receiver.onSessionDown = {
+            logInfo("[CP_RX] phone control session ended", tag = Logger.Tags.ADAPTR)
+            scope.launch {
+                if (client !== owner || carPlayReceiver !== receiver) return@launch
+                carPlayMicUplink?.stop("CarPlay control session ended")
+                carPlayMicUplink = null
+                if (state == State.STREAMING) setState(State.DEVICE_CONNECTED)
+                setStatusText("Waiting for phone...")
+            }
+        }
+        receiver.onStalled = { count ->
+            logWarn("[CP_RX] phone accepted $count connection nudges without dialing back", tag = Logger.Tags.ADAPTR)
+        }
+        receiver.onListenerLost = { reason ->
+            logError("[CP_RX] receiver listener lost: $reason", tag = Logger.Tags.ADAPTR)
+        }
+        carPlayReceiver = receiver
+        receiver.start()
+        logInfo("[CP_RX] wireless CarPlay receiver started on control port 7011", tag = Logger.Tags.ADAPTR)
     }
 
     /**
@@ -985,7 +1103,7 @@ class CarlinkManager(
      * Derived from [config] so the decoder, the box's `/info` advertisement and the coordinate
      * space the box scales touch into all come from ONE number and cannot drift.
      */
-    private fun vehicleConfigSpec(): VehicleConfigSpec {
+    private fun vehicleConfigSpec(hotspot: VehicleHotspotCredentials): VehicleConfigSpec {
         // Detected panel first (DisplayProfile.geometry, already clamped and legalised); the stored
         // AdapterConfig only fills in when no profile exists. The spec's own checks are a backstop.
         val g = displayProfile?.geometry ?: PanelGeometry.fromConfig(config)
@@ -1001,6 +1119,10 @@ class CarlinkManager(
         val spec =
             VehicleConfigSpec(
                 enablesHevc = caps.hevc,
+                wifiAp = false,
+                wifiSsid = hotspot.ssid,
+                wifiPass = hotspot.password,
+                wifiChannel = hotspot.channel,
                 name = config.boxName,
                 width = g.width,
                 height = g.height,
@@ -1030,7 +1152,8 @@ class CarlinkManager(
      * Stop and disconnect.
      *
      * @param reboot when true, also asks the box to reboot. Expect ~50 s of device absence and a
-     *   fresh Android USB permission grant afterwards; grants are per-attachment.
+     *   fresh attach cycle afterwards. The fixed-handler helper receives GM's silent USB grant and
+     *   reacquires the raw pipe; the main app never requests USB permission itself.
      */
     fun stop(reboot: Boolean = false) {
         // Synchronous by contract (release()/onDestroy needs teardown before returning).
@@ -1061,14 +1184,23 @@ class CarlinkManager(
         currentPhoneType = null
         currentWifi = null
         codecDeferred = true
+        carPlayReceiver?.let { receiver ->
+            logInfo("[CP_RX] stopping wireless receiver", tag = Logger.Tags.ADAPTR)
+            receiver.stop()
+        }
+        carPlayReceiver = null
+        carPlayMicUplink?.stop("Carlink session stopping")
+        carPlayMicUplink = null
+        carPlayMulticastLock?.let { lock -> runCatching { if (lock.isHeld) lock.release() } }
+        carPlayMulticastLock = null
         callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         clearCachedMediaMetadata()
         clearSessionUiState()
         stopMicrophoneCapture()
 
         if (reboot) {
-            // Manual verb only, never automated: the device disappears for ~50 s and
-            // re-enumerates, and Android's USB permission grant does not survive that.
+            // Manual verb only, never automated: the device disappears for ~50 s and re-enumerates.
+            // The fixed-handler helper receives a fresh silent grant on attach.
             logWarn("[LIFECYCLE] MGMT_REBOOT requested", tag = Logger.Tags.ADAPTR)
             runCatching { client?.mgmtAction(Ocbm.MGMT_REBOOT) }
         }
@@ -1159,6 +1291,10 @@ class CarlinkManager(
      */
     fun setNightMode(night: Boolean) {
         logInfo("[NIGHT] AAOS night=$night", tag = Logger.Tags.ADAPTR)
+        if (carPlayReceiver != null) {
+            scope.launch(Dispatchers.IO) { NativeCore.setNightMode(night) }
+            return
+        }
         val c = client ?: return
         scope.launch(Dispatchers.IO) {
             c.sendNightMode(night)
@@ -1179,6 +1315,10 @@ class CarlinkManager(
      */
     fun setLimitedUI(limited: Boolean) {
         logInfo("[DRIVE] limitedUI=$limited", tag = Logger.Tags.ADAPTR)
+        if (carPlayReceiver != null) {
+            scope.launch(Dispatchers.IO) { NativeCore.setLimitedUI(limited) }
+            return
+        }
         val c = client ?: return
         scope.launch(Dispatchers.IO) {
             c.sendCommand(if (limited) Ocbm.CMD_LIMITED_UI_ON else Ocbm.CMD_LIMITED_UI_OFF)
@@ -1365,6 +1505,10 @@ class CarlinkManager(
         )
 
     private fun sendMediaButton(index: Byte) {
+        if (carPlayReceiver != null) {
+            scope.launch(Dispatchers.IO) { NativeCore.mediaButton(index.toInt()) }
+            return
+        }
         val c = client ?: return
         scope.launch(Dispatchers.IO) { c.sendMediaButton(index) }
     }
@@ -1486,8 +1630,9 @@ class CarlinkManager(
      * two-finger HID report the descriptor requires.
      */
     fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>) {
-        val c = client ?: return
         if (touches.isEmpty()) return
+        val receiverActive = carPlayReceiver != null
+        val c = if (receiverActive) null else client ?: return
         for (t in touches.sortedBy { it.id }.take(MAX_CONTACTS)) {
             val phase =
                 when (t.action) {
@@ -1496,9 +1641,17 @@ class CarlinkManager(
                     MultiTouchAction.UP -> Ocbm.TOUCH_UP
                     else -> continue
                 }
-            // Non-blocking by construction (the client queues), so no dispatch hop is needed and the
-            // touches keep their ordering with respect to each other and to earlier frames.
-            c.sendTouch(phase, t.x, t.y, finger = t.id)
+            if (receiverActive) {
+                val nativePhase = when (phase) {
+                    Ocbm.TOUCH_DOWN -> 0
+                    Ocbm.TOUCH_MOVE -> 1
+                    else -> 2
+                }
+                NativeCore.touch(nativePhase, t.x, t.y, config.width, config.height)
+            } else {
+                // Non-blocking by construction (the client queues), preserving touch ordering.
+                c?.sendTouch(phase, t.x, t.y, finger = t.id)
+            }
         }
     }
 
@@ -1624,7 +1777,7 @@ class CarlinkManager(
         val pipe = SeamPipe(VIDEO_PIPE_BYTES, VIDEO_PIPE_DEPTH)
         val renderer =
             VideoRenderer(config.width, config.height, surface) {
-                client?.requestKeyframe()
+                requestCurrentKeyframe()
             }
         renderer.start()
         val thread = lanes.runConsumer("cp-video", pipe) { renderer.consume(it) }
@@ -1643,7 +1796,7 @@ class CarlinkManager(
         // Under gm_ccpa this was free — attaching a renderer dropped the seam socket and the box
         // force-keyframed on re-dial. A virtual pipe is invisible to the box, so we ask.
         // Throttled at 500 ms client-side, so the paths that already request are unharmed.
-        client?.requestKeyframe()
+        requestCurrentKeyframe()
 
         logInfo("[LIFECYCLE] Video epoch #$seq open at ${config.width}x${config.height}", tag = Logger.Tags.VIDEO)
     }
@@ -1757,6 +1910,9 @@ class CarlinkManager(
      */
     fun videoFramesRendered(): Long = videoEpoch?.renderer?.framesRendered?.get() ?: 0L
 
+    private fun requestCurrentKeyframe(): Boolean =
+        if (carPlayReceiver != null) NativeCore.forceKeyFrame() else client?.requestKeyframe() ?: false
+
     /**
      * Recover video after the settings overlay closes.
      *
@@ -1774,7 +1930,7 @@ class CarlinkManager(
         val e = videoEpoch ?: return
         logInfo("[LIFECYCLE] Recovering video after overlay close (state=$state)", tag = Logger.Tags.VIDEO)
         val before = e.renderer.framesRendered.get()
-        client?.requestKeyframe()
+        requestCurrentKeyframe()
 
         scope.launch {
             delay(OVERLAY_RECOVERY_WATCHDOG_MS)
@@ -1907,7 +2063,14 @@ class CarlinkManager(
         // onMicGate would early-return on the stale flag and uplink at the WRONG rate. The
         // identity check closes the same window from the other side.
         c.onUplinkGate = { on, rate, ch, codec ->
-            scope.launch { if (client === c) onMicGate(on, rate, ch, codec) }
+            scope.launch {
+                if (client !== c) return@launch
+                if (carPlayReceiver != null) {
+                    logDebug("[MIC] ignoring adapter CT_UPLINK; native receiver owns the Wi-Fi microphone path", tag = Logger.Tags.ADAPTR)
+                    return@launch
+                }
+                onMicGate(on, rate, ch, codec)
+            }
         }
 
         c.onPhoneIdentity = { json -> scope.launch { onPhoneIdentity(json) } }
@@ -1951,11 +2114,57 @@ class CarlinkManager(
         lanes.runConsumer("cp-audio", lanes.mediaPipe) { player.consume(it) }
         lanes.runConsumer("cp-voice", lanes.voicePipe) { router.consume(it) }
 
+        // The wireless receiver's native AvSession writes decoded CarPlay media to loopback TCP.
+        // Adapt those streams into these exact same render/audio pipes; the USB OCBM decrypt seams
+        // remain in place for the adapter's normal data path and the two sources never need separate
+        // renderer or AudioTrack implementations.
+        val bridge = CarPlaySocketMediaBridge(
+            log = ProbeLog.sub("CP_RX_BRIDGE"),
+            output = object : CarPlaySocketMediaBridge.Output {
+                override fun video(payload: ByteArray): Boolean {
+                    val epoch = videoEpoch ?: return false
+                    val framed = ByteArray(4 + payload.size)
+                    framed[0] = (payload.size ushr 24).toByte()
+                    framed[1] = (payload.size ushr 16).toByte()
+                    framed[2] = (payload.size ushr 8).toByte()
+                    framed[3] = payload.size.toByte()
+                    System.arraycopy(payload, 0, framed, 4, payload.size)
+                    return epoch.pipe.write(framed)
+                }
+
+                override fun media(payload: ByteArray, sampleRate: Int, channels: Int): Boolean =
+                    lanes.mediaPipe.write(
+                        VoiceTag.wrap(
+                            payload,
+                            VoiceTag.Fmt(sampleRate, channels, SeamCrypto.ATYPE_MEDIA, SeamCrypto.CODEC_AAC_LC),
+                        ),
+                    )
+
+                override fun voice(payload: ByteArray, sampleRate: Int, channels: Int, audioType: Int): Boolean =
+                    lanes.voicePipe.write(
+                        VoiceTag.wrap(
+                            payload,
+                            VoiceTag.Fmt(sampleRate, channels, audioType, SeamCrypto.CODEC_AAC_ELD),
+                        ),
+                    )
+
+                override fun metadata(marker: Int, payload: ByteArray) = onMetadata(marker, payload)
+            },
+        )
+        if (bridge.start()) {
+            carPlaySocketBridge?.stop()
+            carPlaySocketBridge = bridge
+        } else {
+            logWarn("[CP_RX_BRIDGE] Could not bind localhost receiver ports; OCBM media path remains active", tag = Logger.Tags.ADAPTR)
+        }
+
         // The Surface may already be waiting; if not, initialize()'s debounce opens the epoch.
         scope.launch { startCodecIfDeferred() }
     }
 
     private fun onLanesRetired() {
+        carPlaySocketBridge?.stop()
+        carPlaySocketBridge = null
         // Contract with OcbmAvLanes: the video pipe is OURS, so we must close it here. Lanes
         // close only the two audio pipes; a video consumer left parked on an open pipe would
         // hold its codec and burn the join timeout.
@@ -2255,6 +2464,16 @@ class CarlinkManager(
                 val url = (d["params"] as? Map<*, *>)?.get("url") as? String
                 logInfo("[META] requestUI${url?.let { " ($it)" } ?: ""} — bringing the app forward", tag = Logger.Tags.ADAPTR)
                 scope.launch { callback?.onHostUIPressed() }
+            }
+            "requestViewArea" -> {
+                val params = d["params"] as? Map<*, *>
+                val index = (params?.get("viewAreaIndex") as? Number)?.toInt()
+                if (index == null || index !in 0..1) {
+                    logWarn("[META] requestViewArea has invalid viewAreaIndex=$index", tag = Logger.Tags.ADAPTR)
+                } else {
+                    logInfo("[META] requestViewArea index=$index", tag = Logger.Tags.ADAPTR)
+                    scope.launch { callback?.onViewAreaRequested(index) }
+                }
             }
             null -> logWarn("[META] META_CMD has no string 'type'", tag = Logger.Tags.ADAPTR)
             else -> if (unhandledCommands.add(type)) logInfo("[META] command '$type' (not handled)", tag = Logger.Tags.ADAPTR)
@@ -2557,21 +2776,18 @@ class CarlinkManager(
         }
     }
 
-    /**
-     * Find the adapter, polling for a USB permission grant rather than awaiting the broadcast —
-     * on this head unit the permission dialog frequently never appears and the broadcast is
-     * often lost, so a blocking wait deadlocks bring-up.
-     */
-    private suspend fun findDevice(t: UsbBulkTransport): android.hardware.usb.UsbDevice? {
+    /** Poll the helper's device list/grant state; this app must never request USB permission. */
+    private suspend fun findDevice(t: UsbBulkTransport): String? {
         var attempts = 0
         while (attempts < 10) {
             val dev = t.findQuiet()
             if (dev != null) {
                 if (t.hasPermission(dev)) {
-                    log("OCBM adapter found")
+                    log("OCBM adapter found via USB helper: $dev")
                     return dev
                 }
-                t.requestPermissionAsync(dev)
+                // The fixed-handler package receives GM's silent attach grant. The app must never
+                // call requestPermission: its own UID is not the USB owner and would show the prompt.
                 repeat(20) {
                     if (t.hasPermission(dev)) return dev
                     delay(250)
@@ -2791,12 +3007,12 @@ class CarlinkManager(
             scope.launch(Dispatchers.IO) {
                 logInfo("[FRAME_INTERVAL] Keyframe schedule armed (2.5s initial, 30s periodic)", tag = Logger.Tags.VIDEO)
                 delay(2500)
-                client?.requestKeyframe()
+                requestCurrentKeyframe()
                 var requestCount = 0
                 while (isActive) {
                     delay(30000)
                     requestCount++
-                    val sent = client?.requestKeyframe() ?: false
+                    val sent = requestCurrentKeyframe()
                     logDebug("[FRAME_INTERVAL] Periodic keyframe #$requestCount sent=$sent", tag = Logger.Tags.VIDEO)
                 }
             }

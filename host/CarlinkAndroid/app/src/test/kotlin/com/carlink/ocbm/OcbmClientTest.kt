@@ -1,6 +1,8 @@
 package com.carlink.ocbm
 
 import com.carlink.logging.ProbeLog
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -132,6 +134,32 @@ class OcbmClientTest {
         }
         assertNotNull("a CT_SUBSCRIBE must reach the wire", payload)
         assertArrayEquals(byteArrayOf(Ocbm.CT_SUBSCRIBE) + cfg, payload)
+    }
+
+    @Test
+    fun `MFi signature requests correlate the reply and preserve adapter failure status`() {
+        val t = FakeTransport()
+        val c = subscribedClient(t)
+        val completed = CountDownLatch(1)
+        var response: Mfi.Response? = null
+        val digest = ByteArray(Mfi.DIGEST_LEN) { it.toByte() }
+
+        Thread {
+            response = c.mfiSign(digest, timeoutMs = 1000)
+            completed.countDown()
+        }.start()
+
+        val request = t.awaitFrameOn(Ocbm.CH_MFI)!!
+        assertEquals(Mfi.OP_CREATE_SIGNATURE, request[0])
+        assertEquals(Mfi.DIGEST_LEN, ((request[1].toInt() and 0xFF) shl 8) or (request[2].toInt() and 0xFF))
+        assertArrayEquals(digest, request.copyOfRange(3, 3 + digest.size))
+        val tag = request.last()
+        t.deliver(Ocbm.CH_MFI, byteArrayOf(Mfi.STATUS_FAILED, 0, 0, tag))
+
+        assertTrue("the relay should complete on the adapter response", completed.await(1, TimeUnit.SECONDS))
+        assertEquals(Mfi.STATUS_FAILED, response?.status)
+        assertEquals(tag, response?.tag)
+        assertTrue(response?.payload?.isEmpty() == true)
     }
 
     // ---- uplink byte layouts ---------------------------------------------------------------------

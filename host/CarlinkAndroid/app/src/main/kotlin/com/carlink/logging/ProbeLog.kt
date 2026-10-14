@@ -67,6 +67,7 @@ object ProbeLog {
         val line = if (sub == null) msg else "[${sub.padEnd(SUB_WIDTH)}] $msg"
         // Log.println rather than Log.i/w/e so the level is a value, not a call-site choice.
         Log.println(level, TAG, line)
+        RollingDiagnosticLog.getInitializedInstance()?.appendProbe(level, line)
         mirror?.invoke(line)
     }
 }

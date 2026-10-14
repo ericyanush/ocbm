@@ -1,11 +1,14 @@
 package com.carlink.ui.components
 
 import android.content.Context
+import android.graphics.Rect
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.SurfaceControl
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.os.Build
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 
@@ -72,6 +75,39 @@ class VideoSurfaceView
          */
         var callback: Callback? = null
 
+        private var viewAreaIndex = 0
+
+        /** Crop/position the HWC layer in the panel's coordinates, without scaling the video. */
+        fun setCarPlayViewArea(index: Int) {
+            if (Build.VERSION.SDK_INT < 31 || index !in VIEW_AREAS.indices) return
+            // The normal full-panel layout is already the SurfaceView default. Avoid a SurfaceFlinger
+            // geometry transaction during app startup; only touch the layer after an actual resize
+            // request (or when returning from compact mode).
+            if (index == 0 && viewAreaIndex == 0) return
+            viewAreaIndex = index
+            applyViewAreaGeometry()
+        }
+
+        private fun applyViewAreaGeometry() {
+            if (Build.VERSION.SDK_INT < 31) return
+            val control = surfaceControl
+            if (!control.isValid) return
+            val area = VIEW_AREAS[viewAreaIndex]
+            runCatching {
+                SurfaceControl.Transaction().use { transaction ->
+                    transaction.setGeometry(control, area, area, Surface.ROTATION_0)
+                    transaction.apply()
+                }
+            }.onFailure { logWarn("[VIDEO_SURFACE_VIEW] view-area geometry failed: ${it.message}", tag = "UI") }
+        }
+
+        private companion object {
+            val VIEW_AREAS = listOf(
+                Rect(0, 0, 2400, 960),
+                Rect(188, 118, 1604, 960),
+            )
+        }
+
         /**
          * One-shot latch — true after [surfaceCreated] fires, cleared on the first
          * [surfaceChanged] (which is when [Callback.onSurfaceCreated] is delivered).
@@ -129,6 +165,7 @@ class VideoSurfaceView
             // Known log-spam hazard: fires on every rotation/resize/HDR/format change.
             // Acceptable at INFO for debugging surface sizing; switch to logDebugOnly if noisy.
             logInfo("[VIDEO_SURFACE_VIEW] Surface: ${width}x$height", tag = "UI")
+            if (viewAreaIndex != 0) applyViewAreaGeometry()
 
             if (isSurfaceCreated) {
                 isSurfaceCreated = false

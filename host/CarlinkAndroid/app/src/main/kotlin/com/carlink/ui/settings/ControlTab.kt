@@ -81,7 +81,7 @@ private const val DISCONNECT_PHONE_UNSUPPORTED = "Requires adapter firmware supp
  *  - Disconnect Phone: NOTHING today — disabled with a reason until the box grows a
  *    phone-disconnect verb and advertises it. It used to send `MGMT_RESTART_WIRELESS` in disguise.
  *  - Restart Wireless: `MGMT_RESTART_WIRELESS`, confirmed; does not touch a wired phone.
- *  - Reboot Adapter: `MGMT_REBOOT`, confirmed; ~50 s absence and a USB permission prompt after.
+ *  - Reboot Adapter: `MGMT_REBOOT`, confirmed; ~50 s absence, then helper-driven silent re-grant.
  *  - Disconnect Adapter: CT_STOP + release USB, confirmed, off the main thread.
  *  - Reset Connection: the clean-slate reset ([CarlinkManager.cleanSlateReset]), confirmed.
  */
@@ -229,8 +229,8 @@ private val REBOOT_CONFIRM =
         title = "Reboot Adapter?",
         text =
             "The adapter will reboot and any live projection session will drop. " +
-                "It is gone for about 50 seconds while it restarts and re-enumerates on USB; " +
-                "Android may then ask for USB permission again before the app reconnects.",
+                "It is gone for about 50 seconds while it restarts and re-enumerates on USB. " +
+                "The USB helper should reconnect automatically when it returns.",
         confirmLabel = "Reboot",
     )
 

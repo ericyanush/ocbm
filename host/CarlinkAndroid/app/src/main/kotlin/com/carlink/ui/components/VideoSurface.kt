@@ -38,6 +38,7 @@ import com.carlink.logging.logWarn
 @Composable
 fun VideoSurface(
     modifier: Modifier = Modifier,
+    viewAreaIndex: Int = 0,
     onSurfaceAvailable: (Surface, Int, Int) -> Unit,
     onSurfaceDestroyed: () -> Unit,
     // Optional: when null, SurfaceHolder size changes are SILENTLY DROPPED (see `?.invoke`
@@ -109,6 +110,7 @@ fun VideoSurface(
                     }
             }
         },
+        update = { it.setCarPlayViewArea(viewAreaIndex) },
     )
 }
 

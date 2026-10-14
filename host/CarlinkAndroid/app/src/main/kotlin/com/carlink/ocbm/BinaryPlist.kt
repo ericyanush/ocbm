@@ -32,6 +32,132 @@ object BinaryPlist {
      */
     fun parseDict(bytes: ByteArray): Map<String, Any?>? = runCatching { Reader(bytes).topDict() }.getOrNull()
 
+    /** Encode the value types used by the receiver's `/info` document as a binary plist. */
+    fun encodeDict(value: Map<String, Any?>): ByteArray = Writer().encode(value)
+
+    private class Writer {
+        private val objects = ArrayList<ByteArray>()
+
+        fun encode(root: Map<String, Any?>): ByteArray {
+            val top = add(root)
+            val objectData = java.io.ByteArrayOutputStream()
+            val offsets = ArrayList<Long>(objects.size)
+            objectData.write(MAGIC)
+            for (obj in objects) {
+                offsets += objectData.size().toLong()
+                objectData.write(obj)
+            }
+            val tableOffset = objectData.size().toLong()
+            val offsetSize = bytesFor(tableOffset)
+            for (offset in offsets) writeUnsigned(objectData, offset, offsetSize)
+            objectData.write(ByteArray(6))
+            objectData.write(offsetSize)
+            objectData.write(bytesFor((objects.size - 1).toLong()))
+            writeUnsigned(objectData, objects.size.toLong(), 8)
+            writeUnsigned(objectData, top.toLong(), 8)
+            writeUnsigned(objectData, tableOffset, 8)
+            return objectData.toByteArray()
+        }
+
+        private fun add(value: Any?): Int {
+            val encoded = when (value) {
+                null -> byteArrayOf(0x00)
+                is Boolean -> byteArrayOf(if (value) 0x09 else 0x08)
+                is ByteArray -> sized(0x40, value.size, value)
+                is String -> encodeString(value)
+                is Byte, is Short, is Int, is Long -> encodeInteger((value as Number).toLong())
+                is Float, is Double -> {
+                    val out = java.io.ByteArrayOutputStream(9)
+                    out.write(0x23)
+                    writeUnsigned(out, java.lang.Double.doubleToRawLongBits((value as Number).toDouble()), 8)
+                    out.toByteArray()
+                }
+                is List<*> -> {
+                    val refs = value.map(::add)
+                    container(0xA0, refs)
+                }
+                is Map<*, *> -> {
+                    val entries = value.entries.map { (key, item) ->
+                        require(key is String) { "binary plist dictionary keys must be strings" }
+                        add(key) to add(item)
+                    }
+                    val refSize = bytesFor((objects.size - 1).toLong())
+                    val out = java.io.ByteArrayOutputStream()
+                    writeCount(out, 0xD0, entries.size)
+                    entries.forEach { (key, _) -> writeUnsigned(out, key.toLong(), refSize) }
+                    entries.forEach { (_, item) -> writeUnsigned(out, item.toLong(), refSize) }
+                    out.toByteArray()
+                }
+                else -> error("unsupported binary plist value ${value::class.java.name}")
+            }
+            objects += encoded
+            return objects.lastIndex
+        }
+
+        private fun container(marker: Int, refs: List<Int>): ByteArray {
+            val out = java.io.ByteArrayOutputStream()
+            writeCount(out, marker, refs.size)
+            val width = bytesFor((objects.size - 1).toLong())
+            refs.forEach { writeUnsigned(out, it.toLong(), width) }
+            return out.toByteArray()
+        }
+
+        private fun encodeString(value: String): ByteArray {
+            val ascii = value.all { it.code <= 0x7F }
+            val data = if (ascii) value.toByteArray(Charsets.US_ASCII) else value.toByteArray(Charsets.UTF_16BE)
+            val out = java.io.ByteArrayOutputStream(data.size + 10)
+            writeCount(out, if (ascii) 0x50 else 0x60, if (ascii) value.length else data.size / 2)
+            out.write(data)
+            return out.toByteArray()
+        }
+
+        private fun encodeInteger(value: Long): ByteArray {
+            val width = when {
+                value in Byte.MIN_VALUE..Byte.MAX_VALUE -> 1
+                value in Short.MIN_VALUE..Short.MAX_VALUE -> 2
+                value in Int.MIN_VALUE..Int.MAX_VALUE -> 4
+                else -> 8
+            }
+            val out = java.io.ByteArrayOutputStream(width + 1)
+            out.write(0x10 or Integer.numberOfTrailingZeros(width))
+            writeUnsigned(out, value, width)
+            return out.toByteArray()
+        }
+
+        private fun sized(marker: Int, count: Int, data: ByteArray): ByteArray {
+            val out = java.io.ByteArrayOutputStream(data.size + 10)
+            writeCount(out, marker, count)
+            out.write(data)
+            return out.toByteArray()
+        }
+
+        private fun writeCount(out: java.io.ByteArrayOutputStream, marker: Int, count: Int) {
+            if (count < 15) {
+                out.write(marker or count)
+            } else {
+                out.write(marker or 0x0F)
+                val width = when {
+                    count <= 0xFF -> 1
+                    count <= 0xFFFF -> 2
+                    else -> 4
+                }
+                out.write(0x10 or Integer.numberOfTrailingZeros(width))
+                writeUnsigned(out, count.toLong(), width)
+            }
+        }
+
+        private fun bytesFor(value: Long): Int = when {
+            value <= 0xFF -> 1
+            value <= 0xFFFF -> 2
+            value <= 0xFFFFFFFFL -> 4
+            else -> 8
+        }
+
+        private fun writeUnsigned(out: java.io.ByteArrayOutputStream, value: Long, width: Int) {
+            for (shift in (width - 1) * 8 downTo 0 step 8) out.write((value ushr shift).toInt() and 0xFF)
+        }
+    }
+
     private class Reader(
         private val b: ByteArray,
     ) {

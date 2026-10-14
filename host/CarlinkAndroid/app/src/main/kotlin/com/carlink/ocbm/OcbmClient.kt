@@ -4,6 +4,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * The OCBM host client — the Kotlin equivalent of `ocbm-host`'s `Link` and the macOS
@@ -853,11 +854,10 @@ class OcbmClient(
         armLanes()
         log.i(">> CT_SUBSCRIBE (${config.size}B config) — this is the radio-wake edge")
         if (config.isNotEmpty()) {
-            config
-                .toString(Charsets.UTF_8)
-                .trim()
-                .lines()
-                .forEach { log.i("     | $it") }
+            config.toString(Charsets.UTF_8).trim().lines().forEach { line ->
+                val safeLine = WIFI_PASSWORD_LINE.replace(line) { match -> "${match.groupValues[1]}<redacted>" }
+                log.i("     | $safeLine")
+            }
         }
         return true
     }
@@ -966,40 +966,96 @@ class OcbmClient(
 
     /**
      * Serializes ALL CH_MFI traffic. The channel has TWO concurrent consumers — the native receiver
-     * core's MFi relay (on control-connection threads) and any probe/bring-up cert/sign — and the
-     * wire response carries no opcode echo or request id, so without a lock a certificate can be
-     * returned as the answer to a signature request (auth-setup then fails and the session drops).
+     * core's MFi relay (on control-connection threads) and any probe/bring-up cert/sign. The echoed
+     * tag correlates replies even when requests time out or multiple consumers are active; the lock
+     * still prevents overlapping transactions against the adapter's single MFi coprocessor.
      */
-    private val mfiLock = Any()
+    private val mfiLock = ReentrantLock(true)
+    private var mfiTag = 0
+
+    private fun nextMfiTag(): Byte {
+        mfiTag = (mfiTag % 255) + 1
+        return mfiTag.toByte()
+    }
 
     private fun mfiRequest(
-        req: ByteArray,
+        operation: String,
+        buildRequest: (Byte) -> ByteArray,
         timeoutMs: Long,
         expectedOk: (ByteArray) -> Boolean,
     ): Mfi.Response? {
-        synchronized(mfiLock) {
+        val startedNs = System.nanoTime()
+        val deadlineNs = startedNs + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        if (!mfiLock.tryLock(timeoutMs, TimeUnit.MILLISECONDS)) {
+            log.e("!! CH_MFI $operation lock wait exceeded ${timeoutMs}ms")
+            return null
+        }
+        try {
+            val tag = nextMfiTag()
             // Drain stale/late replies from a previous request UNDER the lock, so this request's poll
             // cannot pick up an earlier answer that arrived after that caller's timeout.
-            while (mfiQ.poll() != null) { /* discard */ }
-            if (!send(Ocbm.CH_MFI, req)) return null
-            val deadline = System.currentTimeMillis() + timeoutMs
+            var staleReplies = 0
+            while (mfiQ.poll() != null) staleReplies++
+            if (staleReplies > 0) log.w("!! CH_MFI $operation discarded $staleReplies queued stale reply/replies")
+            if (!send(Ocbm.CH_MFI, buildRequest(tag))) {
+                log.e("!! CH_MFI $operation request write failed (tag=${tag.toUByte()})")
+                return null
+            }
+            var malformedReplies = 0
             while (true) {
-                val remaining = deadline - System.currentTimeMillis()
-                if (remaining <= 0) return null
-                val pl = mfiQ.poll(remaining, TimeUnit.MILLISECONDS) ?: return null
-                val resp = Mfi.parse(pl, pl.size) ?: continue
-                // Weak length correlation until the protocol grows a request id: an OK reply whose
-                // payload length doesn't match this op is a stale/mismatched answer — keep waiting.
-                // Error statuses carry no payload and are accepted as-is (a misattributed transient
-                // FAILED just triggers the caller's retry, which is benign).
-                if (resp.ok && !expectedOk(resp.payload)) {
-                    log.w("!! CH_MFI stale/mismatched OK reply (${resp.payload.size}B) discarded")
+                val remainingNs = deadlineNs - System.nanoTime()
+                if (remainingNs <= 0) {
+                    log.e("!! CH_MFI $operation timed out after ${elapsedMs(startedNs)}ms (tag=${tag.toUByte()}, malformed=$malformedReplies)")
+                    return null
+                }
+                val pl = mfiQ.poll(remainingNs, TimeUnit.NANOSECONDS)
+                if (pl == null) {
+                    log.e("!! CH_MFI $operation timed out after ${elapsedMs(startedNs)}ms (tag=${tag.toUByte()}, malformed=$malformedReplies)")
+                    return null
+                }
+                val resp = Mfi.parse(pl, pl.size)
+                if (resp == null) {
+                    malformedReplies++
+                    log.w("!! CH_MFI $operation ignored malformed response (${pl.size}B, tag=${tag.toUByte()})")
                     continue
                 }
+                if (resp.tag != null) {
+                    if (resp.tag != tag) {
+                        log.w("!! CH_MFI $operation reply tag=${resp.tag.toUByte()} mismatches request tag=${tag.toUByte()} — stale reply discarded")
+                        continue
+                    }
+                    logMfiResponse(operation, resp, startedNs, tagged = true)
+                    return resp
+                }
+                // Weak length correlation until the protocol grows a request id: an OK reply whose
+                // payload length doesn't match this op is a stale/mismatched answer — keep waiting.
+                // Accept an untagged reply for compatibility with older adapter firmware.
+                if (resp.ok && !expectedOk(resp.payload)) {
+                    log.w("!! CH_MFI $operation ignored untagged OK response with unexpected payload length ${resp.payload.size}B")
+                    continue
+                }
+                logMfiResponse(operation, resp, startedNs, tagged = false)
                 return resp
             }
+        } finally {
+            mfiLock.unlock()
         }
     }
+
+    private fun logMfiResponse(
+        operation: String,
+        response: Mfi.Response,
+        startedNs: Long,
+        tagged: Boolean,
+    ) {
+        val tagDescription = response.tag?.toUByte()?.toString() ?: if (tagged) "missing" else "untagged"
+        val message = "<< CH_MFI $operation status=${response.statusName()} payload=${response.payload.size}B " +
+            "tag=$tagDescription elapsed=${elapsedMs(startedNs)}ms"
+        if (response.ok) log.i(message) else log.e(message)
+    }
+
+    private fun elapsedMs(startedNs: Long): Long =
+        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)
 
     /**
      * Fetch the MFi certificate. Generous timeout: the box takes a bounded flock on
@@ -1008,7 +1064,7 @@ class OcbmClient(
     fun mfiCertificate(timeoutMs: Long = 12_000): Mfi.Response? {
         log.i(">> CH_MFI copy_certificate")
         // A certificate is ~945 B; a 128-B OK reply is the signature answer to another request.
-        return mfiRequest(Mfi.certRequest(), timeoutMs) { it.size > Mfi.SIG_LEN }
+        return mfiRequest("copy_certificate", { tag -> Mfi.certRequest(tag) }, timeoutMs) { it.size > Mfi.SIG_LEN }
     }
 
     /**
@@ -1020,7 +1076,11 @@ class OcbmClient(
         timeoutMs: Long = 15_000,
     ): Mfi.Response? {
         log.i(">> CH_MFI create_signature (${digest.size}B digest)")
-        return mfiRequest(Mfi.signRequest(digest), timeoutMs) { it.size == Mfi.SIG_LEN }
+        return mfiRequest("create_signature", { tag -> Mfi.signRequest(digest, tag) }, timeoutMs) { it.size == Mfi.SIG_LEN }
+    }
+
+    private companion object {
+        val WIFI_PASSWORD_LINE = Regex("^(\\s*wifi_pass\\s*:\\s*).*$")
     }
 
     // ---- CH_MGMT --------------------------------------------------------------------------------

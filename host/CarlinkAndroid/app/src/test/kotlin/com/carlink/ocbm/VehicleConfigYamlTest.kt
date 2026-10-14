@@ -23,6 +23,7 @@ version: 1
 wireless: true
 hot_handover: false
 pairing: just_works
+wifi_ap: false
 rightHandDrive: false
 nightMode: false
 displayPanelsConfig:
@@ -125,6 +126,22 @@ metadata:
     fun `Apple's own misspelling is preserved`() {
         // "High Fidelty" is Apple's typo. Correcting it costs the touch bits.
         assertTrue(VehicleConfigYaml.render(VehicleConfigSpec()).contains("touchScreenMode: High Fidelty"))
+    }
+
+    @Test
+    fun `the vehicle hotspot is placed in the subscribe config for the adapter handoff`() {
+        val spec =
+            VehicleConfigSpec(
+                wifiSsid = "myChevrolet 32D4",
+                wifiPass = "truckpass123",
+                wifiChannel = 36,
+            )
+        val doc = VehicleConfigYaml.render(spec)
+        assertTrue(doc.contains("wifi_ap: false\n"))
+        assertTrue(doc.contains("wifi_ssid: myChevrolet 32D4\n"))
+        assertTrue(doc.contains("wifi_pass: truckpass123\n"))
+        assertTrue(doc.contains("wifi_channel: 36\n"))
+        assertTrue(doc.indexOf("wifi_ssid:") < doc.indexOf("displayPanelsConfig:"))
     }
 
     @Test
