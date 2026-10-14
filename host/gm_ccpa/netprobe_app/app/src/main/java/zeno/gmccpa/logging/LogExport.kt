@@ -343,6 +343,11 @@ object LogExport {
      * done (or on failure) via `use`.
      */
     private fun writeArtifact(context: Context, out: OutputStream, options: Options): WriteOutcome {
+        // The capture writer drains its queue on a 1 Hz schedule. Export can be requested between
+        // ticks, so force that queued tail onto disk before taking the file list and reading it.
+        // writeArtifact runs on the export worker (never the UI thread), and flush() serializes
+        // against the scheduled drain with LogCapture's flush lock.
+        LogCapture.flush()
         val files = LogCapture.logFiles(context)
         val redactor = if (options.redact) Redactor() else null
         val counting = CountingOutputStream(out)

@@ -10,6 +10,8 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import zeno.gmccpa.pair.MfiRelay
 import zeno.gmccpa.pair.NativeCore
 import zeno.gmccpa.pair.SrpServer
@@ -193,6 +195,8 @@ class CarPlayRx(
 
     /** `onRegistrationFailed` fired — [advertisedAt] will never be stamped, so stop waiting on it. */
     @Volatile private var advertFailed = false
+    /** Released by either terminal NsdManager registration callback; lets startup gate on reality. */
+    private val advertRegistration = CountDownLatch(1)
 
     /** One connect-out at a time. See the guard in [connectOutWithRetry]. */
     private val dialInFlight = AtomicBoolean(false)
@@ -357,9 +361,10 @@ class CarPlayRx(
         )
     }
 
-    fun start() {
+    fun start(discoveryPausedInitially: Boolean = false) {
         if (stopped) { log.e("start() on a stopped receiver — construct a new CarPlayRx instead"); return }
         if (!running.compareAndSet(false, true)) { log.i("already running"); return }
+        discoveryPaused.set(discoveryPausedInitially)
         // Every caller is already off the main thread, and the bind below must stay that way. Say so
         // if that ever stops being true rather than letting it surface as a NetworkOnMainThread.
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper())
@@ -406,6 +411,18 @@ class CarPlayRx(
 
         log.i("CarPlay RX up on :$port deviceid=$deviceId features=$FEATURES")
         log.i("=> advertising _airplay._tcp AND browsing _carplay-ctrl._tcp (discovery is bidirectional)")
+    }
+
+    /** Wait off the UI thread until NsdManager confirms our CarPlay advert is live. */
+    fun awaitAdvertRegistered(timeoutMs: Long): Boolean {
+        if (advertisedAt != 0L) return true
+        if (advertFailed) return false
+        return try {
+            advertRegistration.await(timeoutMs, TimeUnit.MILLISECONDS) && advertisedAt != 0L
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
     }
 
     /**
@@ -483,15 +500,19 @@ class CarPlayRx(
         }
         val l = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(s: NsdServiceInfo) {
+                if (stopped) { log.i("late advert registration ignored — receiver already stopped"); return }
                 log.i("advertise _airplay._tcp:$listenPort REGISTERED as '${s.serviceName}'")
                 advertisedAt = System.currentTimeMillis()
+                advertRegistration.countDown()
                 SessionTrace.met(X_ADVERT)
                 SessionTrace.Board.up(B_ADVERT_NSD, "'${s.serviceName}' _airplay._tcp:$listenPort")
             }
             override fun onRegistrationFailed(s: NsdServiceInfo, c: Int) {
+                if (stopped) { log.i("late advert failure ignored — receiver already stopped"); return }
                 // Latch it. advertisedAt is stamped only by onServiceRegistered, so without this the
                 // connect-out waits on an event that is never coming.
                 advertFailed = true
+                advertRegistration.countDown()
                 log.e("advertise FAILED code=$c")
                 // Resolved, not missing: the failure is the answer, and Board.failed is its E line.
                 SessionTrace.cancel(X_ADVERT, "NsdManager reported onRegistrationFailed code=$c")
@@ -798,6 +819,7 @@ class CarPlayRx(
         // Re-query periodically rather than once: the peer can move mid-retry.
         if (discoveryPaused.get()) { log.i("connect-out suppressed — discovery is paused"); return }
         var candidates = dialCandidates(serviceName, host, peerPort)
+        NetworkDiagnostics.snapshot("connect-out retry chain started candidates=${candidates.size}")
         for (attempt in 1..10) {
             if (!running.get()) return
             if (discoveryPaused.get()) { log.i("connect-out abandoned — discovery was paused"); return }
@@ -826,6 +848,7 @@ class CarPlayRx(
         }
         log.w("connect-out: 10 attempts with no usable response from the phone " +
               "(tried ${candidates.joinToString { "${it.first.hostAddress}:${it.second}" }})")
+        NetworkDiagnostics.snapshot("connect-out exhausted 10 attempts without accepted response")
         // Do NOT hold the cooldown after a failure — the next resolve may carry a new (live) port.
         lastDial.clear()
     }
@@ -922,6 +945,9 @@ class CarPlayRx(
             return true
         } catch (t: Throwable) {
             log.w("connect-out to ${host.hostAddress}:$peerPort failed: ${t.javaClass.simpleName}: ${t.message}")
+            if (t is java.net.NoRouteToHostException || t.message?.contains("ENETUNREACH", ignoreCase = true) == true) {
+                NetworkDiagnostics.snapshot("connect-out failed with unreachable network (${t.javaClass.simpleName})")
+            }
             return false
         }
     }
@@ -1291,12 +1317,14 @@ class CarPlayRx(
         onDialAccepted?.let { cb -> fenced("onDialAccepted") { cb() } }
         if (liveConnections.get() > 0) { dialsSinceInbound.set(0); return }
         val n = dialsSinceInbound.incrementAndGet()
+        if (n == 1 || n == STALL_DIALS) {
+            NetworkDiagnostics.snapshot("accepted connect nudge count=$n without inbound control")
+        }
         if (n != STALL_DIALS) return   // report the crossing once, not every dial after it
         log.e("!! STALLED: $n consecutive connect-outs accepted with no inbound control connection on :$port")
-        log.e("!! The phone can reach this receiver and is answering the nudge — it is choosing not to")
-        log.e("!! dial back. Observed cause: iOS reads our _airplay TXT and never resolves SRV, so it")
-        log.e("!! holds no address for us. Reconnecting Bluetooth to the car FROM THE IPHONE clears it;")
-        log.e("!! restarting this app or power-cycling the adapter does not. Device-observed 2026-08-27.")
+        log.e("!! The nudge received an accepted/ambiguous response, but no inbound control connection followed.")
+        log.e("!! Acceptance proves only that the outbound request got a response; it does not prove the")
+        log.e("!! phone retained a usable route back. Compare [net] snapshots, mDNS candidates, and adapter events.")
         onStalled?.let { cb -> fenced("onStalled") { cb(n) } }
     }
 

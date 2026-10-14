@@ -3,6 +3,7 @@ package zeno.gmccpa
 import zeno.gmccpa.ocbm.Ocbm
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Bundle
@@ -11,6 +12,11 @@ import zeno.gmccpa.logging.LogCapture
 import zeno.gmccpa.logging.LogExport
 import zeno.gmccpa.logging.SessionSummary
 import zeno.gmccpa.logging.SessionTrace
+
+private const val REQUEST_RECORD_AUDIO = 0x4343
+private const val ADVERT_READY_WAIT_MS = 5_000L
+private const val HCI_READY_WAIT_MS = 25_000L
+private const val HCI_RADIO_RETRY_WAIT_MS = 20_000L
 
 /**
  * GM CCPA — the instrument shell for the wireless CarPlay receiver.
@@ -48,6 +54,9 @@ class MainActivity : Activity() {
         set(v) { SessionHolder.cpRx = v }
     /** Set once the phone has a live session, so [onResume] can restore the CarPlay screen. */
     @Volatile private var sessionUp = false
+    /** Defer startup until the user has answered the mic prompt; a denial does not block CarPlay. */
+    private var micPermissionRequestInFlight = false
+    private var afterMicPermission: (() -> Unit)? = null
 
     /**
      * Period of the `## STATUS` anchor while the receiver is up. Slower than SessionTrace's 30 s
@@ -64,7 +73,12 @@ class MainActivity : Activity() {
      */
     private val supervisor: SessionSupervisor by lazy {
         SessionSupervisor(object : SessionSupervisor.Actions {
-            override fun reannounce(): Boolean = cpRx?.reannounce() ?: false
+            override fun reannounce(): Boolean {
+                NetworkDiagnostics.snapshot("recovery rung 0 reannounce requested")
+                val accepted = cpRx?.reannounce() ?: false
+                NetworkDiagnostics.snapshot("recovery rung 0 reannounce dispatched accepted=$accepted")
+                return accepted
+            }
             // Cheap and non-blocking: `subscribed` is the app's own view of the link, and the
             // heartbeat's write-failure path clears it, so a dead adapter reads false here.
             override fun boxLinkAlive(): Boolean = ocbmProbe?.client?.subscribed == true
@@ -76,12 +90,26 @@ class MainActivity : Activity() {
             // observable from the BT_PHASE events that follow.
             override fun setBoxRadios(on: Boolean): Boolean {
                 val p = ocbmProbe ?: return false
-                runAsync { runCatching { p.setRadios(on) }.onFailure { emit("CT_RADIO failed: ${it.message}") } }
+                NetworkDiagnostics.snapshot("CT_RADIO ${if (on) "on" else "off"} requested")
+                runAsync {
+                    NetworkDiagnostics.snapshot("CT_RADIO ${if (on) "on" else "off"} command starting")
+                    runCatching { p.setRadios(on) }
+                        .onSuccess { NetworkDiagnostics.snapshotAfter("CT_RADIO ${if (on) "on" else "off"} command returned", 500) }
+                        .onFailure { emit("CT_RADIO failed: ${it.message}"); NetworkDiagnostics.snapshot("CT_RADIO failed") }
+                    NetworkDiagnostics.snapshotAfter("CT_RADIO ${if (on) "on" else "off"} settled", 3000)
+                }
                 return true
             }
             override fun restartBoxWireless(): Boolean {
                 val p = ocbmProbe ?: return false
-                runAsync { runCatching { p.disconnectPhone() }.onFailure { emit("restart-wireless failed: ${it.message}") } }
+                NetworkDiagnostics.snapshot("MGMT_RESTART_WIRELESS requested")
+                runAsync {
+                    runCatching { p.disconnectPhone() }
+                        .onSuccess { NetworkDiagnostics.snapshotAfter("MGMT_RESTART_WIRELESS command returned", 500) }
+                        .onFailure { emit("restart-wireless failed: ${it.message}"); NetworkDiagnostics.snapshot("MGMT_RESTART_WIRELESS failed") }
+                    NetworkDiagnostics.snapshotAfter("MGMT_RESTART_WIRELESS settled", 3000)
+                    NetworkDiagnostics.snapshotAfter("MGMT_RESTART_WIRELESS follow-up", 10000)
+                }
                 return true
             }
             override fun pauseDiscovery() { cpRx?.pauseDiscovery() }
@@ -90,6 +118,10 @@ class MainActivity : Activity() {
                 // The phase word is the supervisor's; LinkState stays the colour/label vocabulary the
                 // launcher screen already speaks, so the two are mapped rather than merged.
                 ui.setState(linkStateFor(phase), detail)
+                if (phase in setOf(RxPhase.HANDOFF_SENT, RxPhase.INBOUND_EXPECTED,
+                        RxPhase.SESSION_UP, RxPhase.STALLED, RxPhase.BOX_LOST_SESSION_UP)) {
+                    NetworkDiagnostics.snapshot("supervisor phase=${phase.name} detail=$detail")
+                }
             }
         })
     }
@@ -115,7 +147,7 @@ class MainActivity : Activity() {
         RxPhase.STALLED -> LinkState.FAILED
     }
 
-    private fun toggleCarPlayRx() {
+    private fun toggleCarPlayRx(pauseDiscoveryInitially: Boolean = false) {
         val cur = cpRx
         if (cur == null) {
             emit(""); emit("==================== CARPLAY RX (Car bit + connect-out) ====================")
@@ -133,7 +165,7 @@ class MainActivity : Activity() {
                 peerFile = java.io.File(filesDir, "carplay_peers.bin").absolutePath
             )
             bindReceiver(rx)
-            cpRx = rx; rx.start()
+            cpRx = rx; rx.start(pauseDiscoveryInitially)
             // The receiver coming up is the start of the app's session, so the periodic status
             // anchor starts here — not on the phone's control connection, because the waiting phase
             // (advert up? browse up? peer seen?) is exactly where a capture opened at a random
@@ -411,7 +443,7 @@ class MainActivity : Activity() {
         // (SecurityException on getSoftApConfiguration, EACCES on hostapd.conf), so LauncherUi
         // prefills the known value and keeps it editable. --es ssid/--es pass still override.
         ui = LauncherUi(this).apply {
-            onStart = { runAsync { autoStart(manual = true) } }
+            onStart = { withMicPermission { runAsync { autoStart(manual = true) } } }
             // abortClaimWait first, on THIS thread: a Start with no adapter sits in awaitClaimable
             // for up to ten minutes ON the command executor, so the stop queued behind it could not
             // run until the wait ended — Stop was dead for exactly as long as it was needed. The
@@ -467,12 +499,13 @@ class MainActivity : Activity() {
         // the only key that attributes this process's ~250 framework lines per session (CCodec,
         // MediaCodec, BufferQueueProducer, …) in a whole-OS capture. See ProbeLog.identity.
         ProbeLog.identity(this)
+        NetworkDiagnostics.start(applicationContext)
         // Capture was only ever started from BootReceiver, the USB trampoline and the scope menu —
         // never from here, so a launcher start recorded nothing at all and the drive-ready process
         // had no logcap-pump thread. start() is idempotent and self-reaping, so calling it on every
         // onCreate is free when capture is already running.
         runCatching { LogCapture.start(applicationContext, CapturePrefs.config(this)) }
-        dispatchIntent(intent)
+        withMicPermission { dispatchIntent(intent) }
     }
 
     /** The intent decides the path: a USB attach or an --es run verb is explicit; anything else
@@ -556,7 +589,33 @@ class MainActivity : Activity() {
         // something else, and moving or guarding it would silently break pairing. This call is
         // idempotent; it costs nothing and pins the requirement in place.
         ocbm()
-        if (cpRx == null) toggleCarPlayRx()      // advertise before the box even wakes its radios
+        // Never let discovery nudge the phone until BOTH sides are actually ready. In particular,
+        // the iPhone indexes our endpoint when NsdManager confirms registration; starting the box
+        // first can hand it an SSID and trigger a connect-out against a receiver iOS cannot find.
+        var rx = cpRx
+        if (rx == null) {
+            toggleCarPlayRx(pauseDiscoveryInitially = true)
+            rx = cpRx
+        } else rx.pauseDiscovery()
+        if (rx == null) {
+            setStatus(LinkState.FAILED, "CarPlay receiver could not be started")
+            return zeno.gmccpa.ocbm.OcbmProbe.LinkResult()
+        }
+        if (!rx.awaitAdvertRegistered(ADVERT_READY_WAIT_MS)) {
+            emit("receiver advert did not register within ${ADVERT_READY_WAIT_MS / 1000}s — rebuilding it once before touching the adapter")
+            cpRx = null
+            rx.stop()
+            toggleCarPlayRx(pauseDiscoveryInitially = true)
+            rx = cpRx
+            if (rx == null || !rx.awaitAdvertRegistered(ADVERT_READY_WAIT_MS)) {
+                val why = "CarPlay service advertisement is not registered; the iPhone cannot discover this receiver"
+                emit("!! $why — automatic retry exhausted")
+                setStatus(LinkState.FAILED, why)
+                return zeno.gmccpa.ocbm.OcbmProbe.LinkResult()
+            }
+            emit("receiver advert registered on the second attempt")
+        }
+        emit("receiver advert confirmed; discovery remains paused until the adapter reports HCI ready")
         setStatus(LinkState.CLAIMING, "claiming the adapter…")
         try {
             // GATE ON THE RESULT. runAll() reports failure by RETURNING, not by throwing (every
@@ -569,6 +628,34 @@ class MainActivity : Activity() {
                 emit("link NOT established: ${r.failureDetail()}")
                 return r
             }
+            if (!r.subscribed) {
+                setStatus(LinkState.FAILED, "adapter linked, but radio subscription did not start")
+                return r
+            }
+            val probe = ocbm()
+            var hciReady = probe.awaitHciPresent(HCI_READY_WAIT_MS)
+            if (!hciReady && !probe.hasSeenHci()) {
+                // A controller that never attached is different from one that dropped after being
+                // up. Give the box's wireless supervisor one explicit restart, then wait once for
+                // its expected reattach; do not repeatedly tear down/reclaim the whole session.
+                emit("adapter has not reported HCI after ${HCI_READY_WAIT_MS / 1000}s — restarting only the box wireless stack once")
+                val restarted = runCatching { probe.disconnectPhone() }.getOrDefault(false)
+                if (restarted) hciReady = probe.awaitHciPresent(HCI_RADIO_RETRY_WAIT_MS)
+                else emit("wireless-stack restart was not acknowledged")
+            } else if (!hciReady) {
+                // HCI was present and then vanished; SessionSupervisor owns the radio-only recovery
+                // ladder for this regression. Avoid racing it with a second restart from startup.
+                emit("HCI was seen and then dropped — waiting for the supervisor's radio recovery")
+                hciReady = probe.awaitHciPresent(HCI_RADIO_RETRY_WAIT_MS)
+            }
+            if (!hciReady) {
+                val why = "adapter Bluetooth controller is not ready; radio recovery did not restore HCI"
+                emit("!! $why — discovery/nudges remain paused; use Restart Session after checking the adapter")
+                setStatus(LinkState.FAILED, why)
+                return r
+            }
+            rx.resumeDiscovery()
+            emit("adapter HCI is present and receiver advert is registered — enabling phone discovery")
             // The supervisor writes the state word from here on. A synchronous setStatus() next to an
             // async supervisor event raced it, and losing that race visibly reverted the status line.
             supervisor.onBoxLinked(r.mfiProven)
@@ -763,7 +850,43 @@ class MainActivity : Activity() {
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
-        dispatchIntent(intent)
+        withMicPermission { dispatchIntent(intent) }
+    }
+
+    /** Ask in the visible launcher, not from the background mic-capture thread. */
+    private fun withMicPermission(continuation: () -> Unit) {
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            emit("MIC_PERMISSION RECORD_AUDIO=GRANTED")
+            continuation()
+            return
+        }
+        afterMicPermission = continuation
+        if (micPermissionRequestInFlight) return
+        micPermissionRequestInFlight = true
+        val rationale = shouldShowRequestPermissionRationale(android.Manifest.permission.RECORD_AUDIO)
+        emit("MIC_PERMISSION RECORD_AUDIO=NOT_GRANTED; requesting from visible MainActivity (rationale=$rationale)")
+        try {
+            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
+        } catch (t: Throwable) {
+            micPermissionRequestInFlight = false
+            emit("MIC_PERMISSION request failed: ${t.javaClass.simpleName}: ${t.message}; continuing without mic")
+            afterMicPermission?.also { afterMicPermission = null }?.invoke()
+        }
+    }
+
+    @Deprecated("Use the platform permission callback; this app targets API 32")
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_RECORD_AUDIO) return
+        micPermissionRequestInFlight = false
+        val granted = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        emit("MIC_PERMISSION RECORD_AUDIO=${if (granted) "GRANTED" else "DENIED"}; " +
+            "CarPlay will continue, but Siri/call microphone uplink will be unavailable")
+        if (!granted && uiAlive()) {
+            ui.setDetail("Microphone permission denied — CarPlay can connect, but Siri/call mic is unavailable")
+        }
+        afterMicPermission?.also { afterMicPermission = null }?.invoke()
     }
 
     /**
@@ -1085,7 +1208,10 @@ class MainActivity : Activity() {
         rx.onSessionDown = { onCarPlaySessionDown() }
         rx.onStalled = { n -> onCarPlayStalled(n) }
         rx.onListenerLost = { why -> onCarPlayListenerLost(why) }
-        rx.onDialAccepted = { supervisor.onDialAccepted() }
+        rx.onDialAccepted = {
+            NetworkDiagnostics.snapshot("phone accepted connect nudge; inbound control expected")
+            supervisor.onDialAccepted()
+        }
     }
 
     /**

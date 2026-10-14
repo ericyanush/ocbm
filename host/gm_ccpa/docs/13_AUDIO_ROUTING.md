@@ -471,7 +471,11 @@ looper), and the fix moves those edges from ~12 s apart to ~1 s. `AacPlayer` is 
 
 **Truck result (2026-09-04):** the mic uplink works end to end. CarPlay raises the AAOS mic-in-use
 indicator when it requests the mic and it clears cleanly on release; there is no GM AAOS mic volume/gain
-control (none is expected).
+control (none is expected). **Caveat from 2026-10-14 testing:** newer logs show `AudioRecord` creation
+failing for both calls and Siri. The earlier install-time grant assumption was incorrect for Play
+installs and is not portable to ordinary sideloads; the app now requests `RECORD_AUDIO` visibly and
+checks the permission/app-op before opening the recorder. A denial does not block CarPlay, but the mic
+uplink remains unavailable until permission is granted in the prompt or the app's system settings.
 
 
 `MicUplink.kt` (204 lines) connects eagerly to `127.0.0.1:9112` (the same socket carries the capture
@@ -484,7 +488,10 @@ an activity-based gate would clip the onset.
   framing, encryption with the stream input key, and the byte-order swap.
 - **Capture**: `AudioRecord(VOICE_COMMUNICATION, 16000, MONO, PCM_16BIT, minBufferSize × 3)`, 20 ms
   chunks, dedicated thread at `URGENT_AUDIO`.
-- **Manifest**: `RECORD_AUDIO` + `FOREGROUND_SERVICE_MICROPHONE`, granted at install (`-g`).
+- **Manifest/runtime**: `RECORD_AUDIO` + `FOREGROUND_SERVICE_MICROPHONE`; `MainActivity` requests
+  `RECORD_AUDIO` at runtime. `-g` can grant it for some adb sideload flows, but Play installs and
+  other installers must not be assumed to do so. `MicUplink` logs permission, app-op, available input
+  device types, recorder state/session/buffer, and routed input at each capture gate.
 - **`ERROR_DEAD_OBJECT` is recoverable** — recreate in place, cap retries, guard against a recreate
   completing after `stop()` timed out (otherwise holds the Intel SST HAL input stream open forever).
 

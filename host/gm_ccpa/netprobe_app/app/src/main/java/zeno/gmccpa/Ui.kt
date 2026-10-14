@@ -155,10 +155,26 @@ class LauncherUi(private val act: Activity) {
 
     // Credential state lives here as plain strings, NOT as EditTexts held across dialog lifetimes:
     // a dialog's views are torn down on dismiss, so keeping references to them means reading stale or
-    // detached widgets on the next session start.
-    var ssid: String = "myChevrolet 32D4"; private set
-    var pass: String = "123456789000";     private set
-    var chan: String = "36";               private set
+    // detached widgets on the next session start. Keep the selected vehicle hotspot in app-private
+    // storage as well: AAOS can kill this process during a key cycle, and the adapter needs the same
+    // SSID/passphrase/channel when the app starts and subscribes again.
+    private val credentialPrefs = act.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    var ssid: String = credentialPrefs.getString(PREF_SSID, DEFAULT_SSID) ?: DEFAULT_SSID
+        private set
+    var pass: String = credentialPrefs.getString(PREF_PASS, DEFAULT_PASS) ?: DEFAULT_PASS
+        private set
+    var chan: String = credentialPrefs.getString(PREF_CHANNEL, DEFAULT_CHANNEL) ?: DEFAULT_CHANNEL
+        private set
+
+    private fun persistCredentials() {
+        // apply() updates the in-memory preference map immediately and writes the tiny setting set
+        // asynchronously, avoiding disk I/O on the UI thread. These values stay in app-private data.
+        credentialPrefs.edit()
+            .putString(PREF_SSID, ssid)
+            .putString(PREF_PASS, pass)
+            .putString(PREF_CHANNEL, chan)
+            .apply()
+    }
 
     private val dot = View(act)
     private val stateText = TextView(act)
@@ -434,6 +450,7 @@ class LauncherUi(private val act: Activity) {
                 ssid = eSsid.text.toString().trim()
                 pass = ePass.text.toString().trim()
                 chan = eChan.text.toString().trim()
+                persistCredentials()
                 refreshCredSummary()
                 onCredentials(ssid, pass, chan)
             }
@@ -446,6 +463,7 @@ class LauncherUi(private val act: Activity) {
         newSsid?.let { ssid = it }
         newPass?.let { pass = it }
         newChan?.let { chan = it }
+        if (newSsid != null || newPass != null || newChan != null) persistCredentials()
         refreshCredSummary()
     }
 
@@ -485,5 +503,12 @@ class LauncherUi(private val act: Activity) {
 
     private companion object {
         const val RESTART_LABEL = "Restart Session"
+        const val PREFS_NAME = "vehicle_hotspot"
+        const val PREF_SSID = "ssid"
+        const val PREF_PASS = "passphrase"
+        const val PREF_CHANNEL = "channel"
+        const val DEFAULT_SSID = "myChevrolet 32D4"
+        const val DEFAULT_PASS = "123456789000"
+        const val DEFAULT_CHANNEL = "36"
     }
 }

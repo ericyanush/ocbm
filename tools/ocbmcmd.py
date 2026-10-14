@@ -81,6 +81,11 @@ def run(cmd: str, timeout: float = 15.0, raw: bool = False):
     m = re.findall(re.escape(done) + r"(\d+)", text)
     if m:
         status = int(m[-1])
+    else:
+        # Do not turn a console attach/PTY failure into a successful empty command. Callers use
+        # this tool for diagnostics and deployment verification; success requires the box-side
+        # completion sentinel, not merely a USB device that enumerated.
+        status = 1
 
     # The shell prompt is written without a trailing newline, so it prefixes the marker's line
     # (`[(19:05)root@~]#__OCBM_B123__`) — match the marker at the line's end, not as the whole line.
@@ -93,7 +98,10 @@ def run(cmd: str, timeout: float = 15.0, raw: bool = False):
         if done in s:
             break
         out.append(ln)
-    return ("\n".join(out).strip("\n") if started else text.strip()), status
+    body = "\n".join(out).strip("\n") if started else text.strip()
+    if not m and not body:
+        body = "ocbmcmd: no completion marker received from the box console"
+    return body, status
 
 
 def main():

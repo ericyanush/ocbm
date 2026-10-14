@@ -24,6 +24,7 @@ struct Link {
     ep_out: u8,
     seq: u32,
     reasm: p::Reassembler,
+    last_send_error: Option<String>,
 }
 
 impl Link {
@@ -37,10 +38,20 @@ impl Link {
             }
         };
         self.seq = self.seq.wrapping_add(1);
-        self.h
-            .write_bulk(self.ep_out, &buf[..n], Duration::from_secs(2))
-            .map(|w| w == n)
-            .unwrap_or(false)
+        match self.h.write_bulk(self.ep_out, &buf[..n], Duration::from_secs(2)) {
+            Ok(w) if w == n => {
+                self.last_send_error = None;
+                true
+            }
+            Ok(w) => {
+                self.last_send_error = Some(format!("short bulk write: {w}/{n} bytes"));
+                false
+            }
+            Err(e) => {
+                self.last_send_error = Some(format!("bulk OUT error: {e:?} ({e})"));
+                false
+            }
+        }
     }
 
     fn recv(&mut self, out: &mut [u8], deadline: Instant) -> Option<(u16, u8, usize)> {
@@ -104,7 +115,7 @@ fn open() -> Link {
     let h = dev.open().expect("open (permissions?)");
     let _ = h.claim_interface(ifnum);
     eprintln!("[probe] IF{ifnum} bulk IN=0x{ep_in:02x} OUT=0x{ep_out:02x}");
-    Link { h, ep_in, ep_out, seq: 0, reasm: p::Reassembler::new() }
+    Link { h, ep_in, ep_out, seq: 0, reasm: p::Reassembler::new(), last_send_error: None }
 }
 
 fn now_ms() -> u64 {
@@ -239,9 +250,17 @@ fn main() {
     let mut last_seq: Option<u16> = None;
     let stop_at = Instant::now() + Duration::from_secs(secs);
     let mut next_hb = Instant::now();
+    let mut transport_failed = false;
     while Instant::now() < stop_at {
         if Instant::now() >= next_hb {
-            link.send(p::CH_CTRL, &[p::CT_HEARTBEAT]);
+            if !link.send(p::CH_CTRL, &[p::CT_HEARTBEAT]) {
+                eprintln!(
+                    "[probe] heartbeat USB write failed ({}); OCBM transport is no longer usable",
+                    link.last_send_error.as_deref().unwrap_or("unknown USB error")
+                );
+                transport_failed = true;
+                break;
+            }
             next_hb = Instant::now() + Duration::from_secs(1);
         }
         let Some((ch, flags, l)) = link.recv(&mut out, Instant::now() + Duration::from_millis(250))
@@ -280,7 +299,51 @@ fn main() {
         link.send(p::CH_CTRL, &[p::CT_LOG_CTL, 0, 0, 0]);
     }
     if cfg_path.is_some() {
-        link.send(p::CH_CTRL, &[p::CT_STOP]);
-        println!("[probe] CT_STOP sent");
+        if transport_failed {
+            eprintln!("[probe] skipping CT_STOP because heartbeat write failed; box-side session state is unknown");
+            return;
+        }
+        let stop_sent = link.send(p::CH_CTRL, &[p::CT_STOP]);
+        println!("[probe] CT_STOP {}", if stop_sent { "sent" } else { "USB write failed" });
+
+        // CT_STOP clears host presence synchronously in ocbmd, but radio teardown runs
+        // asynchronously in session_supervisor. Keep the USB session open long enough to observe
+        // the cleared state and give the supervisor time to consume the edge before dropping the
+        // interface; otherwise an immediate next console attach can race the previous session's
+        // radio cleanup.
+        let cleanup_deadline = Instant::now() + Duration::from_secs(20);
+        let mut host_gone = false;
+        let mut mgmt_replies = 0u32;
+        while Instant::now() < cleanup_deadline && !host_gone {
+            if !link.send(p::CH_MGMT, &[p::MGMT_GET_INFO]) {
+                eprintln!("[probe] cleanup MGMT_GET_INFO USB write failed");
+                break;
+            }
+            let poll_deadline = (Instant::now() + Duration::from_secs(1)).min(cleanup_deadline);
+            while Instant::now() < poll_deadline {
+                let Some((ch, _, l)) = link.recv(&mut out, poll_deadline) else { break };
+                if ch == p::CH_MGMT && l >= 2 && out[0] == p::MGMT_INFO {
+                    let info = String::from_utf8_lossy(&out[1..l]);
+                    mgmt_replies += 1;
+                    println!("[probe] cleanup MGMT_INFO: {info}");
+                    host_gone = info.contains("\"host_present\":false");
+                    if host_gone {
+                        break;
+                    }
+                }
+            }
+        }
+        if host_gone {
+            // The supervisor samples the flag on its one-second loop and radio teardown follows
+            // that edge. This short grace is not a substitute for host_gone above; it lets the
+            // teardown start/settle before the probe releases its USB interface.
+            let settle_until = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < settle_until {
+                let _ = link.recv(&mut out, settle_until);
+            }
+            println!("[probe] teardown grace complete; releasing USB interface");
+        } else {
+            eprintln!("[probe] WARNING: host teardown unconfirmed after 20 s (MGMT_INFO replies={mgmt_replies}); box may still be busy or the USB link stopped responding");
+        }
     }
 }

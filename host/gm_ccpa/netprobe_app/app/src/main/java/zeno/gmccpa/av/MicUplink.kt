@@ -1,9 +1,16 @@
 package zeno.gmccpa.av
 
 import android.annotation.SuppressLint
+import android.Manifest
+import android.app.AppOpsManager
+import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
+import android.media.AudioDeviceInfo
 import android.media.MediaRecorder
+import android.os.Process
 import zeno.gmccpa.ProbeLog
 import zeno.gmccpa.logging.SessionTrace
 import java.io.BufferedReader
@@ -39,7 +46,9 @@ import java.util.concurrent.atomic.AtomicLong
  * (`docs/13_AUDIO_ROUTING.md` §4). The ELD bail exists only for an aarch64/Pi build made with
  * `--no-default-features`. Do not assume this class is dormant.
  */
-class MicUplink {
+class MicUplink(context: Context) {
+
+    private val context = context.applicationContext
 
     private val log = ProbeLog.sub("mic")
     private val running = AtomicBoolean(false)
@@ -162,7 +171,7 @@ class MicUplink {
         }
     }
 
-    @SuppressLint("MissingPermission")   // RECORD_AUDIO is declared and granted at install (-g)
+    @SuppressLint("MissingPermission")
     private fun startCapture(rate: Int, channels: Int) {
         // A re-SETUP can change the format, and the peer broadcasts a fresh `uplink on` for each.
         // Without this the CAS below swallows it and we keep capturing at the old rate while the
@@ -173,11 +182,33 @@ class MicUplink {
         }
         if (!capturing.compareAndSet(false, true)) return
         activeRate = rate; activeChannels = channels
+        val permissionGranted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager
+        val appOpMode = runCatching {
+            appOps?.checkOpNoThrow(AppOpsManager.OPSTR_RECORD_AUDIO, Process.myUid(), context.packageName)
+        }.getOrNull()
+        val inputDevices = runCatching {
+            (context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
+                ?.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                ?.joinToString(",") { "${it.id}:${deviceTypeName(it.type)}" }
+                ?: "unavailable"
+        }.getOrDefault("unavailable")
+        log.i("capture preflight permission=${if (permissionGranted) "GRANTED" else "DENIED"} " +
+            "appOp=${appOpMode?.let(::appOpName) ?: "unknown"} inputs=[$inputDevices] " +
+            "source=VOICE_COMMUNICATION format=${rate}Hz/${channels}ch")
+        if (!permissionGranted || appOpMode == AppOpsManager.MODE_IGNORED || appOpMode == AppOpsManager.MODE_ERRORED) {
+            log.e("microphone capture blocked by permission/app-op — no mic for this gate")
+            capturing.set(false)
+            SessionTrace.Board.note(BOARD, "FAILED (RECORD_AUDIO permission/app-op denied — no mic this gate)")
+            return
+        }
         val mask = if (channels >= 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
         val minBuf = AudioRecord.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT)
         // Each failure below already logs its own E; the board gets a note(), not a second E.
         if (minBuf <= 0) {
-            log.e("getMinBufferSize failed ($rate/$channels) — no mic for this gate"); capturing.set(false)
+            log.e("getMinBufferSize failed ($rate/$channels) result=$minBuf — no mic for this gate")
+            capturing.set(false)
             SessionTrace.Board.note(BOARD, "FAILED (getMinBufferSize($rate/$channels) refused — no mic this gate)"); return
         }
         val rec = try {
@@ -188,7 +219,9 @@ class MicUplink {
             SessionTrace.Board.note(BOARD, "FAILED (AudioRecord threw ${t.javaClass.simpleName} — no mic this gate)"); return
         }
         if (rec.state != AudioRecord.STATE_INITIALIZED) {
-            log.e("AudioRecord uninitialised — releasing; no mic for this gate"); runCatching { rec.release() }   // deliberate: discard
+            log.e("AudioRecord uninitialised state=${rec.state} recordingState=${rec.recordingState} " +
+                "session=${rec.audioSessionId} buffer=${minBuf * 3}B inputs=[$inputDevices] — releasing; no mic for this gate")
+            runCatching { rec.release() }   // deliberate: discard
             capturing.set(false)
             SessionTrace.Board.note(BOARD, "FAILED (AudioRecord uninitialised — no mic this gate)"); return
         }
@@ -208,8 +241,31 @@ class MicUplink {
         captureThread = Thread({ captureLoop(rec, bytesPerChunk) }, "mic-capture").apply {
             isDaemon = true; start()
         }
-        log.i("capturing VOICE_COMMUNICATION ${rate}Hz ${channels}ch, ${bytesPerChunk}B/chunk (capture #$captures)")
+        val routedInput = runCatching {
+            rec.routedDevice?.let { "${it.id}:${deviceTypeName(it.type)}" } ?: "none"
+        }.getOrDefault("unavailable")
+        log.i("capturing VOICE_COMMUNICATION ${rate}Hz ${channels}ch, ${bytesPerChunk}B/chunk " +
+            "(capture #$captures session=${rec.audioSessionId} routedInput=$routedInput)")
         SessionTrace.Board.up(BOARD, "gate OPEN — capturing VOICE_COMMUNICATION ${rate}Hz ${channels}ch, ${bytesPerChunk}B/${CHUNK_MS}ms")
+    }
+
+    private fun appOpName(mode: Int): String = when (mode) {
+        AppOpsManager.MODE_ALLOWED -> "allowed"
+        AppOpsManager.MODE_IGNORED -> "ignored"
+        AppOpsManager.MODE_ERRORED -> "errored"
+        AppOpsManager.MODE_DEFAULT -> "default"
+        else -> mode.toString()
+    }
+
+    private fun deviceTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "built-in-mic"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth-sco"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "wired-headset"
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "usb-device"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "usb-headset"
+        AudioDeviceInfo.TYPE_TELEPHONY -> "telephony"
+        AudioDeviceInfo.TYPE_REMOTE_SUBMIX -> "remote-submix"
+        else -> "type-$type"
     }
 
     private fun captureLoop(rec: AudioRecord, chunk: Int) {

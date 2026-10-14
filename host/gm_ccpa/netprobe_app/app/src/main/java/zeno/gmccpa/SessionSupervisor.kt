@@ -326,6 +326,13 @@ class SessionSupervisor(private val act: Actions) {
             // health regressions, so the two together are a loop with a session in the middle.
             RxPhase.SESSION_UP, RxPhase.BOX_LOST_SESSION_UP, RxPhase.GRACE -> log.i("session is live or in grace — noting the box fault, not acting on it")
             else -> {
+                // mDNS re-announcement cannot restore a missing controller. Start at the existing
+                // radio-only CT_RADIO rung for an HCI loss; keep the cheaper mDNS rung for other
+                // health faults. This still avoids a host_present flap and full session teardown.
+                if (missing and Ocbm.BH_HCI_PRESENT != 0) {
+                    rung = maxOf(rung, 1)
+                    log.w("HCI regressed outside a live session — prioritizing radio recovery over mDNS-only recovery")
+                }
                 to(RxPhase.BOX_UNHEALTHY, detail)
                 escalate(detail)
             }
@@ -441,6 +448,7 @@ class SessionSupervisor(private val act: Actions) {
         inboundTimer = arm(inboundTimer, INBOUND_TIMEOUT_MS) {
             if (phase == RxPhase.INBOUND_EXPECTED) {
                 log.w("no dial-back within ${INBOUND_TIMEOUT_MS / 1000}s of an accepted nudge")
+                NetworkDiagnostics.snapshot("inbound dial-back timeout after accepted nudge")
                 // Same reason as the grace timer: escalate() alone leaves the phase where it was, and
                 // a stale INBOUND_EXPECTED would never re-arm its own deadline.
                 to(RxPhase.ARMED, "no dial-back — recovering")
@@ -472,6 +480,10 @@ class SessionSupervisor(private val act: Actions) {
             // left to fire — the receiver would go quiet permanently and look idle while doing
             // nothing. to() restores discovery on the way out.
             to(RxPhase.ARMED, "grace expired — resuming discovery and recovering")
+            if (boxHealth >= 0 && (boxHealth and Ocbm.BH_HCI_PRESENT) == 0) {
+                rung = maxOf(rung, 1)
+                log.w("session grace expired with HCI still absent — starting at radio recovery")
+            }
             escalate("the session ended and the phone did not come back")
         }
     }

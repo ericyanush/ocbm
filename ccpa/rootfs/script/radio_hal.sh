@@ -59,8 +59,22 @@ CAPS=/tmp/radio_caps
 WLAN_STATE=/tmp/.radio_wlan_state
 BT_STATE=/tmp/.radio_bt_state
 LOGP="[radio_hal]"
+TRACE=/var/log/ocbm_radio_bringup.log
 
-log() { echo "$LOGP $*"; }
+# Keep a tiny phase trace on flash for radio bring-up. The OCBM console and /tmp logs can both
+# become inaccessible if loading/attaching a radio driver wedges the adapter, so record only the
+# script's existing status lines (normally a few KB) in a file that survives a power cycle.
+if [ "$VERB" = bt_on ]; then
+  : > "$TRACE" 2>/dev/null
+  printf '[radio-trace] bt_on entry uptime=%s\n' "$(cut -d' ' -f1 /proc/uptime 2>/dev/null)" >> "$TRACE" 2>/dev/null
+fi
+
+log() {
+  echo "$LOGP $*"
+  if [ "$VERB" = bt_on ]; then
+    printf '[%s] %s %s\n' "$(cut -d' ' -f1 /proc/uptime 2>/dev/null)" "$LOGP" "$*" >> "$TRACE" 2>/dev/null
+  fi
+}
 
 # Single-flight per subsystem. mkdir is the portable atomic test-and-set on busybox (no flock
 # dependency). A concurrent second bring-up must not run - the supervisor can manufacture
@@ -178,6 +192,14 @@ bt_responsive() {  # $1 = hci dev
   timeout 5 hciconfig "$1" name 2>/dev/null | grep -q "Name:"
 }
 
+# Fast, bounded probe for the attach convergence loop. The full five-second timeout above is
+# appropriate for a final health decision, but multiplying it by 30 polls made one attach attempt
+# capable of occupying the radio lock for 150 seconds. A one-second probe is retried; transient
+# misses are expected and must not turn into minutes of silent work while the host waits.
+bt_responsive_fast() {  # $1 = hci dev
+  timeout 1 hciconfig "$1" name 2>/dev/null | grep -q "Name:"
+}
+
 # Confirmed variant - used for DECISIONS, never inside a poll loop.
 #
 # MEASURED on an RTL8822CS: a healthy, attached controller intermittently times out a name read
@@ -272,8 +294,13 @@ bt_set_name() {  # $1 = hci dev
 # Returns 0 if the driver is loaded (or was already), 1 if there is nothing to load.
 wlan_driver_up() {
   [ -n "$RADIO_WLAN_INSMOD" ] || { log "no WLAN insmod mapping for this unit"; return 1; }
-  [ -e "/tmp/${RADIO_WLAN_MODULES%% *}" ] || tar -xzf "$RADIO_KO_TARBALL" -C /tmp 2>/dev/null \
-                                          || tar -xf "$RADIO_KO_TARBALL" -C /tmp 2>/dev/null
+  _need_extract=0
+  for _m in $RADIO_WLAN_MODULES; do [ -e "/tmp/$_m" ] || _need_extract=1; done
+  if [ "$_need_extract" = 1 ]; then
+    tar -xzf "$RADIO_KO_TARBALL" -C /tmp 2>/dev/null \
+      || tar -xf "$RADIO_KO_TARBALL" -C /tmp 2>/dev/null \
+      || { log "failed to extract WLAN modules from ${RADIO_KO_TARBALL:-<unset>}"; return 1; }
+  fi
   log "wlan driver: $RADIO_WLAN_INSMOD"
   _old=$IFS; IFS=';'
   for _cmd in $RADIO_WLAN_INSMOD; do
@@ -286,7 +313,13 @@ wlan_driver_up() {
     if [ -n "$_mod" ] && grep -q "^$_mod " /proc/modules 2>/dev/null; then
       log "  $_mod already loaded"
     else
-      $_cmd 2>&1 | sed "s|^|$LOGP   |"
+      _out=$( $_cmd 2>&1 ); _rc=$?
+      [ -n "$_out" ] && echo "$_out" | sed "s|^|$LOGP   |"
+      if [ "$_rc" -ne 0 ]; then
+        log "  WLAN module command failed (status=$_rc): $_cmd"
+        IFS=$_old
+        return 1
+      fi
     fi
     IFS=';'
   done
@@ -601,8 +634,23 @@ do_bt_on() {
         log "       contains an hci_uart module."
       fi
 
-      [ -n "$RADIO_BT_PRELOAD" ] && [ -n "${RADIO_BT_PRELOAD_CMD:-}" ] && {
-        log "firmware preload: $RADIO_BT_PRELOAD_CMD"; $RADIO_BT_PRELOAD_CMD >/dev/null 2>&1; }
+      if [ -n "$RADIO_BT_PRELOAD" ] && [ -n "${RADIO_BT_PRELOAD_CMD:-}" ]; then
+        log "firmware preload: $RADIO_BT_PRELOAD_CMD"
+        RADIO_PRELOAD_TRACE=/var/log/ocbm_fw_preload.log
+        : > "$RADIO_PRELOAD_TRACE" 2>/dev/null
+        $RADIO_BT_PRELOAD_CMD >"$RADIO_PRELOAD_TRACE" 2>&1
+        _pre_rc=$?
+        if [ "$_pre_rc" -ne 0 ]; then
+          log "firmware preload failed (status=$_pre_rc); refusing UART attach"
+          tail -10 "$RADIO_PRELOAD_TRACE" 2>/dev/null | while IFS= read -r _pre_line; do log "preload: $_pre_line"; done
+          publish "$BT_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" \
+                  "detail=firmware-preload-failed-$_pre_rc"
+          return 1
+        fi
+        log "firmware preload completed successfully"
+      else
+        log "no firmware preload command mapped for this unit"
+      fi
 
       # NEVER launch an attach while another helper still owns the UART. Learned on hardware:
       # a controller can sit at `UP RUNNING` and still be wedged (name read times out), so we
@@ -665,14 +713,22 @@ do_bt_on() {
           log "reclaim+reset (attempt $_try)"; bt_reclaim_reset
         fi
         log "attach attempt $_try: $RADIO_BT_ATTACH_CMD"
-        setsid $RADIO_BT_ATTACH_CMD </dev/null >/tmp/radio_bt_attach.log 2>&1 &
+        # Keep the helper's own diagnostics across a power-cycle too. The adapter can stop
+        # servicing OCBM as soon as the UART line discipline is attached, making /tmp and the live
+        # console unavailable precisely when these messages are most useful.
+        RADIO_ATTACH_TRACE=/var/log/ocbm_hciattach.log
+        : > "$RADIO_ATTACH_TRACE" 2>/dev/null
+        setsid $RADIO_BT_ATTACH_CMD </dev/null >"$RADIO_ATTACH_TRACE" 2>&1 &
         _n=0
         while [ "$_n" -lt 30 ]; do
-          _d=$(hci_dev 2>/dev/null) && bt_responsive "$_d" && break
+          _d=$(hci_dev 2>/dev/null) && bt_responsive_fast "$_d" && break
           _n=$((_n+1)); sleep 0.5
+          if [ $((_n % 5)) -eq 0 ]; then
+            log "  attach attempt $_try still waiting (${_n}/30 polls, hci=${_d:-absent})"
+          fi
         done
         _d=$(hci_dev 2>/dev/null) || _d=""
-        [ -n "$_d" ] && bt_responsive "$_d" && break
+        [ -n "$_d" ] && bt_responsive_fast "$_d" && break
         log "  attempt $_try did not converge"
       done
       if [ -n "$_d" ] && bt_responsive "$_d"; then

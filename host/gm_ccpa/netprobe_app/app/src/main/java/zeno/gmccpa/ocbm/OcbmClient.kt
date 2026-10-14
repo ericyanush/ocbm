@@ -86,6 +86,23 @@ class OcbmClient(
     @Volatile var lastBtPhaseReplay = false; private set
     /** Last `CT_BOX_HEALTH` bitmask the box pushed. -1 until it has said anything. */
     @Volatile var lastBoxHealth: Int = -1; private set
+
+    /** Current HCI readiness, requiring a health report from the current subscription. */
+    fun awaitHciPresent(timeoutMs: Long): Boolean {
+        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        while (running.get() && subscribed) {
+            val health = lastBoxHealth
+            if (health >= 0 && (health and Ocbm.BH_HCI_PRESENT) != 0) return true
+            val left = deadline - android.os.SystemClock.elapsedRealtime()
+            if (left <= 0) return false
+            try { Thread.sleep(minOf(100L, left)) }
+            catch (_: InterruptedException) { Thread.currentThread().interrupt(); return false }
+        }
+        return false
+    }
+
+    /** True when this subscription saw HCI at least once, even if a later health update lost it. */
+    fun hasSeenHci(): Boolean = hciState == HCI_SEEN
     /** Last CT_PROJ_MODE seen this session. Advisory — see [Ocbm.pmName]. */
     @Volatile var lastProjMode: Byte = Ocbm.PM_NONE; private set
     /** Last CT_PHONE_IDENT JSON seen this session, or "" when cleared / not yet identified. */
@@ -694,6 +711,7 @@ class OcbmClient(
     fun subscribe(config: ByteArray): Boolean {
         if (!running.get()) { log.w("subscribe after stop — refusing (would re-latch the box)"); return false }
         configBlob = config
+        lastBoxHealth = -1 // do not let the prior subscription's HCI bit satisfy this wake edge
         val pl = ByteArray(1 + config.size)
         pl[0] = Ocbm.CT_SUBSCRIBE
         System.arraycopy(config, 0, pl, 1, config.size)

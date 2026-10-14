@@ -120,7 +120,9 @@ the real end-to-end sequence, §7.1), `carplay_ui`, `mdns_self`, `carplay_stop`,
 
 The passphrase cannot be read programmatically on the head unit; read it from Settings ▸ Hotspot
 (`com.gm.hmi.connection`'s `WifiHotspotActivity`) and type it into the app's hotspot field, or pass it
-as `--es pass`.
+as `--es pass`. SSID, passphrase, and channel are saved in the app's private preferences when the
+credentials are saved, so they are reused after an app restart or vehicle key cycle. Clearing the
+app's storage (or uninstalling it) resets them to the built-in defaults.
 
 ### Watch the box
 

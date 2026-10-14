@@ -156,10 +156,28 @@ for m in $WLAN_MODS; do
   [ -n "$l" ] && WLAN_INSMOD="$WLAN_INSMOD$l
 "
 done
+# The vendor IW416 dispatcher expresses moal's parameter through a shell variable
+# (`mod_para="$nxpWiFiConfig"`), so safe_cmd correctly refuses to serialize it. The owned
+# IW416 wlan_on.sh has the equivalent, concrete vendor parameter. Keep this exception tied to
+# both the detected IW416 SDIO id and the modules actually present in this unit's tarball; other
+# NXP parts and all other chipsets continue to use only their own closed-form dispatcher lines.
+if [ "$SDIO_DEV" = 0x9159 ] \
+   && echo " $WLAN_MODS " | grep -q ' mlan\.ko ' \
+   && echo " $WLAN_MODS " | grep -q ' moal\.ko '; then
+  WLAN_INSMOD='insmod /tmp/mlan.ko
+insmod /tmp/moal.ko mod_para=nxp/wifi_mod_para.conf
+'
+fi
 # Attach helper invocation, anchored at line start so `if [ -e ... ]` tests and echo lines can
 # never be mistaken for the command itself.
 BT_ATTACH_CMD=""
 [ -n "$BT_ATTACH" ] && BT_ATTACH_CMD=$(grep -hE "^[[:space:]]*$BT_ATTACH " /script/attach_bluetooth.sh 2>/dev/null \
+                       | head -1 | sed 's/^[[:space:]]*//' | safe_cmd)
+# Some controllers require a firmware download before the UART attach. Preserve that ordering
+# from this unit's own dispatcher; extracting only hciattach silently skipped the IW416's
+# fw_loader_linux step and attempted to attach an uninitialized controller.
+BT_PRELOAD_CMD=""
+[ -n "$BT_PRELOAD" ] && BT_PRELOAD_CMD=$(grep -hE "^[[:space:]]*$BT_PRELOAD " /script/attach_bluetooth.sh 2>/dev/null \
                        | head -1 | sed 's/^[[:space:]]*//' | safe_cmd)
 # Ordering constraint: some parts wedge if BT attaches before the WLAN driver is up. The vendor
 # encodes this as a wait loop inside the attach script; its presence is the signal.
@@ -265,6 +283,7 @@ BT_MAC=""
   echo "RADIO_KO_TARBALL=$KO_TARBALL"
   echo "RADIO_BT_ATTACH=$BT_ATTACH"
   echo "RADIO_BT_PRELOAD=$BT_PRELOAD"
+  echo "RADIO_BT_PRELOAD_CMD=\"$BT_PRELOAD_CMD\""
   echo "RADIO_BT_UART=/dev/ttymxc2"
   echo "RADIO_BACKEND=$BACKEND"
   echo "RADIO_WLAN_MODULES=\"$WLAN_MODS\""

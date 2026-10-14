@@ -888,6 +888,12 @@ class OcbmProbe(context: Context) {
 
     fun stats(): String = client?.statsLine() ?: "no client"
 
+    /** Wait for the current CT_SUBSCRIBE to produce a fresh box-health report with HCI present. */
+    fun awaitHciPresent(timeoutMs: Long): Boolean = client?.awaitHciPresent(timeoutMs) ?: false
+
+    /** Distinguish a controller that never attached from one that attached and later dropped. */
+    fun hasSeenHci(): Boolean = client?.hasSeenHci() ?: false
+
     /**
      * Terminal for this instance: `ops` is shut down, so no box command may be submitted afterwards.
      * Both callers (`MainActivity.stopEverything`, the `ocbm_stop` command) drop the probe and the

@@ -108,11 +108,11 @@
 #                    DHCP lease from the adapter's udhcpd)
 #   --pass PW        root password; implies ssh. Omit for the shipped blank-password unit —
 #                    `install` prompts for an IP/password only if the default endpoint is dead
-#   --via ssh|telnet transport (default ssh, changed 2026-09-05). TELNET IS THE RESCUE PATH:
+#   --via ssh|telnet transport (default ssh). TELNET IS THE RESCUE PATH:
 #                    it exists so a unit whose dropbear/authorized_keys is broken can be repaired,
 #                    and it moves files as 2 KB base64 chunks through a line-oriented shell. Do not
 #                    route a deploy through it because it happens to be the older default —
-#                    measured 2026-09-05, `scp -O` does 1.8 MB over USB-NCM in ~0.6 s.
+#                    measured 2026-09-05, SFTP-mode scp does 1.8 MB over USB-NCM in ~0.6 s.
 #   --host-if enX    your USB-NCM interface; forced to a static 192.168.50.1 while waiting
 #                    for a cold boot, for when macOS will not re-DHCP the new interface
 #   --run-dir DIR    where backups/reports land (default scratchpad/ncmbase_<stamp>)
@@ -185,11 +185,15 @@ gate() {
 # agent/default identities provide. NOTE: never add `-o PubkeyAuthentication=no` here — dropbear on
 # this unit has NO root password set, so forcing password auth turns a working box into a confusing
 # "Permission denied (publickey,password)".
-[ -f "$HOME/.ssh/id_ccpa_ncm" ] && SSH_KEY_OPTS=(-o IdentityFile="$HOME/.ssh/id_ccpa_ncm") || SSH_KEY_OPTS=()
-SSH_OPTS=("${SSH_KEY_OPTS[@]}"
-          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
-          -o ConnectTimeout=8 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa
-          -o KexAlgorithms=+diffie-hellman-group14-sha1 -o Ciphers=+aes128-ctr)
+SSH_OPTS=()
+if [ -f "$HOME/.ssh/id_ccpa_ncm" ]; then
+  SSH_OPTS+=(-o IdentityFile="$HOME/.ssh/id_ccpa_ncm")
+fi
+SSH_OPTS+=(
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+  -o ConnectTimeout=8 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa
+  -o KexAlgorithms=+diffie-hellman-group14-sha1 -o Ciphers=+aes128-ctr
+)
 
 box() {   # run a shell command on the box; stdout passthrough, exit status preserved
   if [ "$VIA" = telnet ]; then python3 "$BOXSH" --host "$BOX" --timeout "${BOX_TIMEOUT:-45}" run "$1"
@@ -201,18 +205,18 @@ box_slow() { BOX_TIMEOUT=600 box "$1"; }   # 528 MHz ARM: whole-rootfs scans nee
 boxq() { box "$1" >/dev/null 2>&1; }
 push() {  # $1 local  $2 remote  [$3 mode]
   if [ "$VIA" = telnet ]; then python3 "$BOXSH" --host "$BOX" --mode "${3:-755}" put "$1" "$2" >/dev/null
-  else scp "${SSH_OPTS[@]}" -O "$1" "root@$BOX:$2" >/dev/null && ssh "${SSH_OPTS[@]}" "root@$BOX" "chmod ${3:-755} $2"; fi
+  else scp "${SSH_OPTS[@]}" "$1" "root@$BOX:$2" >/dev/null && ssh "${SSH_OPTS[@]}" "root@$BOX" "chmod ${3:-755} $2"; fi
 }
 pull() {  # $1 remote  $2 local
-  # Under ssh just use scp: it is faster than the nc trick AND reliable. The nc path below stays for
-  # TELNET mode only, where the alternative is 2 KB base64 chunks. Do not promote it back to the
-  # default — measured 2026-09-05 on this USB-NCM link, a single-shot `busybox nc` truncated a
-  # 1.8 MB binary at 380 KB and again at 432 KB (different points, so it is the tool and its
-  # backgrounded listener dying with the shell session, not the link); `scp -O` moved the same file
-  # in ~0.6 s, md5-identical. The md5 check below is what caught that, which is why it stays.
+  # Under ssh use modern scp/SFTP. `-O` selects the legacy SCP protocol and requires a remote `scp`
+  # executable, which the adapter does not ship; the SSH-minimal image provides an SFTP server.
+  # The nc path below stays for TELNET mode only, where the alternative is 2 KB base64 chunks. Do
+  # not promote it back to the default — measured 2026-09-05 on this USB-NCM link, a single-shot
+  # `busybox nc` truncated a 1.8 MB binary at 380 KB and again at 432 KB (different points, so it
+  # is the tool and its backgrounded listener dying with the shell session, not the link).
   if [ "$VIA" != telnet ]; then
-    scp "${SSH_OPTS[@]}" -O "root@$BOX:$1" "$2" >/dev/null && [ -s "$2" ] && return 0
-    warn "scp pull of $1 failed; falling back to base64"
+    scp "${SSH_OPTS[@]}" "root@$BOX:$1" "$2" >/dev/null && [ -s "$2" ] && return 0
+    warn "SFTP pull of $1 failed; falling back to telnet/base64"
     python3 "$BOXSH" --host "$BOX" --timeout 180 get "$1" "$2" >/dev/null
     return
   fi
@@ -496,13 +500,20 @@ ls -la /tmp/bk'
   for f in manifest.txt MD5SUMS mtd0.bin mtd1.bin mtd2.bin rootfs.tar.gz; do
     say "pulling $f"; pull "/tmp/bk/$f" "$RUN_DIR/backup_pre/$f"
   done
+  local backup_dir="$RUN_DIR/backup_pre" f expected got
+  for f in manifest.txt mtd0.bin mtd1.bin mtd2.bin rootfs.tar.gz; do
+    expected=$(awk -v path="/tmp/bk/$f" '$2 == path { print $1; exit }' "$backup_dir/MD5SUMS")
+    got=$(md5 -q "$backup_dir/$f")
+    [ -n "$expected" ] && [ "$got" = "$expected" ] \
+      || die "downloaded backup $f failed the adapter-side MD5 check (host=$got, adapter=$expected); leaving /tmp/bk intact"
+  done
   box 'rm -rf /tmp/bk' >/dev/null
-  cat "$RUN_DIR/backup_pre/mtd0.bin" "$RUN_DIR/backup_pre/mtd1.bin" "$RUN_DIR/backup_pre/mtd2.bin" \
+  cat "$backup_dir/mtd0.bin" "$backup_dir/mtd1.bin" "$backup_dir/mtd2.bin" \
       > "$RUN_DIR/backup_pre/full_nor_16MB.bin"
-  ( cd "$RUN_DIR/backup_pre" && shasum -a 256 ./* > SHA256SUMS )
-  local sz; sz=$(stat -f %z "$RUN_DIR/backup_pre/full_nor_16MB.bin")
+  ( cd "$backup_dir" && shasum -a 256 ./* > SHA256SUMS )
+  local sz; sz=$(stat -f %z "$backup_dir/full_nor_16MB.bin")
   [ "$sz" = 16777216 ] || die "recomposed NOR is $sz bytes, expected 16777216 — the backup is not trustworthy; do not proceed"
-  say "backup verified → $RUN_DIR/backup_pre/full_nor_16MB.bin (SPI-programmer restore image)"
+  say "backup verified → $backup_dir/full_nor_16MB.bin (SPI-programmer restore image)"
 }
 
 phase_earlyaccess() {
@@ -836,8 +847,12 @@ phase_baselinediff() {
   # `--keep-web` exists for the rare case someone wants the UI kept, and the backup phase
   # captures /etc/boa in rootfs.tar.gz either way.
   local custom_cgi
-  custom_cgi=$(grep '^etc/boa/cgi-bin/' "$RUN_DIR/extra.files" 2>/dev/null \
-               | grep -vE '(server|upload)\.cgi$' | sed 's|.*/||' | tr '\n' ' ')
+  # Use awk rather than a grep pipeline: with `set -euo pipefail`, grep -v returns 1 when
+  # there are no custom CGIs (the normal stock-firmware case), which would abort `all` before
+  # its confirmation gate even though an empty result is valid.
+  custom_cgi=$(awk -F/ '
+    /^etc\/boa\/cgi-bin\// && $NF !~ /^(server|upload)\.cgi$/ { print $NF }
+  ' "$RUN_DIR/extra.files" | tr '\n' ' ')
   if [ -n "${custom_cgi// /}" ]; then
     say "web UI: this unit carries the custom CGI set ($custom_cgi)"
     say "        — removed with boa, as intended for the NCM base."
@@ -974,8 +989,10 @@ phase_audit() {
   #     were dangling before this script ran and are all `test -e` guarded;
   #   * the owned start_main_service.sh references /script/ocbm_boot.sh, which is exactly what
   #     is NOT installed on the NCM base — guarded, and flag-gated off besides.
-  # So classify: a reference whose every occurrence sits behind a `test -e` / `[ -e ]` guard is
-  # fine. One that would actually execute is a real fault.
+  # So classify direct -e/-f/-x guards and the verified transitive guards used by this base:
+  # supportStaMode gates the vendor wpa_supplicant copy, and radio_detect selects `owned` only
+  # when both owned WLAN/BT scripts exist. Keep that logic in a separately tested helper;
+  # one-line grep heuristics miss these shell control-flow relationships.
   local dangling; dangling=$(grep -oE '^  [^ ]+ -> MISSING [^ ]+' "$RUN_DIR/audit.txt" || true)
   if [ -n "$dangling" ]; then
     # Line shape is:  "  <file> -> MISSING <ref>"  → fields f, "->", "MISSING", r.
@@ -985,24 +1002,15 @@ phase_audit() {
     # an answer. The payload also asserts the file is readable instead of reading an empty
     # grep result as innocence.
     local payload="$RUN_DIR/audit_refs.sh"
-    { echo '#!/bin/sh'
+    {
+      echo '#!/bin/sh'
       while read -r f _ _ r; do
         [ -n "$f" ] && [ -n "$r" ] || continue
-        printf 'classify %s %s\n' "$f" "$r"
+        printf '/tmp/audit_classify_ref.sh "%s" "%s"\n' "$f" "$r"
       done <<< "$dangling"
-    } > "$payload.args"
-    { cat <<'EOS'
-#!/bin/sh
-classify() {
-  f=$1; r=$2
-  [ -f "$f" ] || { echo "UNREADABLE $f (cannot classify $r)"; return; }
-  u=$(grep -n -- "$r" "$f" 2>/dev/null | grep -v 'test -e' | grep -v '\[ -e' | grep -vE '^[0-9]+:[[:space:]]*#')
-  if [ -n "$u" ]; then echo "UNGUARDED $f -> $r :: $u"; else echo "guarded   $f -> $r"; fi
-}
-EOS
-      grep '^classify ' "$payload.args"
       echo 'echo CLASSIFY_DONE'
     } > "$payload"
+    push "$REPO/tools/audit_classify_ref.sh" /tmp/audit_classify_ref.sh
     push "$payload" /tmp/audit_refs.sh
     box 'sh /tmp/audit_refs.sh' | tee "$RUN_DIR/audit_refs.txt"
     grep -q CLASSIFY_DONE "$RUN_DIR/audit_refs.txt" || die "reference classification did not run to completion — not trusting its result"
@@ -1010,7 +1018,7 @@ EOS
       grep -E "UNGUARDED|UNREADABLE" "$RUN_DIR/audit_refs.txt" | sed 's/^/    /' >&2
       die "an unguarded reference to a removed file would execute at boot — fix before rebooting"
     fi
-    say "$(grep -c guarded "$RUN_DIR/audit_refs.txt") dangling references, all guarded by test -e — expected on this base"
+    say "$(grep -c guarded "$RUN_DIR/audit_refs.txt") dangling references, all verified as guarded — expected on this base"
   fi
   say "audit clean"
 }
