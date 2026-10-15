@@ -651,6 +651,30 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeIsEncrypted(
     .unwrap_or(0)
 }
 
+/// Milliseconds since the most recent CarPlay A/V activity; -1 means no activity or a stale handle.
+#[no_mangle]
+pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeAvIdleMs(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle <= 0 {
+        return -1;
+    }
+    std::panic::catch_unwind(|| {
+        let slot = core();
+        match slot.as_ref() {
+            Some((gen, native)) if *gen == handle as u64 => native
+                .server
+                .av_idle_ms()
+                .and_then(|ms| jlong::try_from(ms).ok())
+                .unwrap_or(-1),
+            _ => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
 /// Send a single-touch HID report to the iPhone.
 ///
 /// `carplayd` takes touch over a `127.0.0.1:9110` socket because its producer (ocbmd) is a separate

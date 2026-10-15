@@ -73,6 +73,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -528,6 +530,10 @@ class CarlinkManager(
     private var lastTouchContactCount = 0
     @Volatile private var carPlayMicUplink: MicUplink? = null
     @Volatile private var carPlayMulticastLock: WifiManager.MulticastLock? = null
+    /** Invalidates delayed teardown work when a replacement phone control session arrives. */
+    private val carPlaySessionGeneration = AtomicLong(0)
+    /** One adapter-radio recovery attempt per continuous no-phone interval; never reboot USB/box. */
+    private val wirelessRecoveryAttempted = AtomicBoolean(false)
 
     // ---- microphone -------------------------------------------------------------------------
     private var microphoneManager: MicrophoneCaptureManager? = null
@@ -1080,6 +1086,8 @@ class CarlinkManager(
         )
         logInfo("[CP_RX] using shared GM /info with Carlink return-icon customization", tag = Logger.Tags.ADAPTR)
         receiver.onSessionUp = {
+            carPlaySessionGeneration.incrementAndGet()
+            wirelessRecoveryAttempted.set(false)
             logInfo("[CP_RX] native receiver accepted a phone control session", tag = Logger.Tags.ADAPTR)
             scope.launch {
                 if (client !== owner || carPlayReceiver !== receiver) return@launch
@@ -1091,17 +1099,66 @@ class CarlinkManager(
             }
         }
         receiver.onSessionDown = {
-            logInfo("[CP_RX] phone control session ended", tag = Logger.Tags.ADAPTR)
+            val endedGeneration = carPlaySessionGeneration.incrementAndGet()
+            logInfo("[CP_RX] phone control session ended; retiring phone-only state (generation=$endedGeneration)", tag = Logger.Tags.ADAPTR)
             scope.launch {
                 if (client !== owner || carPlayReceiver !== receiver) return@launch
+                // A quick reconnect can race this callback's main-thread work. Do not let teardown
+                // from the previous connection blank the new session's metadata or decoder.
+                if (receiver.sessionLive || carPlaySessionGeneration.get() != endedGeneration) {
+                    logInfo("[CP_RX] stale session-down cleanup skipped; replacement session is live", tag = Logger.Tags.ADAPTR)
+                    return@launch
+                }
                 carPlayMicUplink?.stop("CarPlay control session ended")
                 carPlayMicUplink = null
+                connectedPhoneMac = null
+                clearCachedMediaMetadata()
                 if (state == State.STREAMING) setState(State.DEVICE_CONNECTED)
-                setStatusText("Waiting for phone...")
+                setStatusText("Phone disconnected — waiting to reconnect...")
+                withContext(Dispatchers.IO) {
+                    // Joining the decoder can take up to 1.5s; never do it on the UI dispatcher.
+                    if (client === owner && carPlayReceiver === receiver &&
+                        carPlaySessionGeneration.get() == endedGeneration && !receiver.sessionLive) {
+                        retireVideoEpoch("phone control session ended")
+                    } else {
+                        logInfo("[CP_RX] video epoch retirement skipped; a new phone session arrived", tag = Logger.Tags.ADAPTR)
+                    }
+                }
             }
         }
         receiver.onStalled = { count ->
             logWarn("[CP_RX] phone accepted $count connection nudges without dialing back", tag = Logger.Tags.ADAPTR)
+            if (wirelessRecoveryAttempted.compareAndSet(false, true)) {
+                scope.launch {
+                    // Let a late inbound dial win. This recovery bounces only the adapter's BT/radio
+                    // stack; it deliberately preserves the USB/MFi management session.
+                    delay(3_000)
+                    if (client !== owner || carPlayReceiver !== receiver || receiver.sessionLive) {
+                        logInfo("[CP_RX] automatic wireless recovery skipped; session changed or phone returned", tag = Logger.Tags.ADAPTR)
+                        return@launch
+                    }
+                    val checks = withContext(Dispatchers.IO) { receiver.selfTest() }
+                    val required = setOf("listening", "native core", "/info", "MFi relay")
+                    val failed = checks.filter { it.name in required && !it.ok }
+                    if (failed.isNotEmpty()) {
+                        logWarn("[CP_RX] wireless recovery withheld; receiver prerequisites failed: " +
+                            failed.joinToString { "${it.name}=${it.detail}" }, tag = Logger.Tags.ADAPTR)
+                        return@launch
+                    }
+                    if (receiver.sessionLive || client !== owner) {
+                        logInfo("[CP_RX] automatic wireless recovery cancelled; phone/session returned", tag = Logger.Tags.ADAPTR)
+                        return@launch
+                    }
+                    logWarn("[CP_RX] no phone control session after $count accepted nudges; restarting adapter wireless stack once (USB/MFi retained)", tag = Logger.Tags.ADAPTR)
+                    setStatusText("Reconnecting phone — restarting Bluetooth...")
+                    val status = withContext(Dispatchers.IO) { owner.mgmtAction(Ocbm.MGMT_RESTART_WIRELESS) }
+                    logInfo("[CP_RX] automatic RESTART_WIRELESS status=$status", tag = Logger.Tags.ADAPTR)
+                    setStatusText(
+                        if (status == 0) "Bluetooth restarted — waiting for phone..."
+                        else "Phone not connected — tap Restart session to retry",
+                    )
+                }
+            }
         }
         receiver.onListenerLost = { reason ->
             logError("[CP_RX] receiver listener lost: $reason", tag = Logger.Tags.ADAPTR)

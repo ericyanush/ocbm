@@ -5,26 +5,21 @@ plugins {
 // ─────────────────────────────────────────────────────────────────────────────
 // The GM AAOS fixed-handler USB owner. See the USB permission split section in OCBMANDROID.md.
 //
-// GM's Y181 image ships `config_UsbDeviceConnectionHandling_component =
-// android.car.usb.handler/android.car.usb.handler.UsbHostManagementActivity` but STRIPS the
-// package, so `deviceAttachedForFixedHandler` throws NameNotFoundException and the third-party
-// implicit-grant path dead-ends → the permission dialog reappears on every attach.
-//
-// This module installs a /data app UNDER that exact package name. When present in the foreground
-// user (user 10), the framework resolves THIS app as the fixed handler and calls
-// `grantDevicePermission(device, ourUid)` SILENTLY on every attach — no dialog, no root.
+// This module installs a /data app under GM's fixed-handler package name. On the target truck,
+// the framework silently grants that package USB permission on attach. The configured activity is
+// intentionally omitted: original Carlink testing showed the grant still works, while declaring
+// the activity triggered driving distraction overlays.
 //
 // This APK holds the granted device permission and owns the raw USB pipe. It stays separate from
 // the daily-driver `:app` (zeno.carlink.ocbm), which only binds through :usbbridge.
 //
-// Structure mirrors AOSP `packages/services/Car/car-usb-handler`; divergences (NoDisplay instead of
-// the Dialog picker, no MANAGE_USB) are called out in the manifest — a /data untrusted_app cannot
-// hold MANAGE_USB and does not need it here.
+// The exported bridge service owns USB I/O. No activity, attach receiver, or MANAGE_USB permission
+// is required; a /data untrusted_app cannot hold MANAGE_USB and does not need it here.
 // ─────────────────────────────────────────────────────────────────────────────
 
 android {
-    // MUST equal the stripped package GM points its fixed-handler config at. This is the entire
-    // mechanism — a different applicationId is just an ordinary app and gets the dialog.
+    // MUST equal the package GM's fixed-handler path grants. The bridge service uses that grant;
+    // the configured activity itself is deliberately absent to avoid the GM distraction overlay.
     namespace = "android.car.usb.handler"
     compileSdk = 37
 
@@ -49,9 +44,7 @@ android {
     }
 
     buildFeatures {
-        // No Compose, no BuildConfig, no AndroidX — the proof uses only platform classes
-        // (android.app.Activity, android.hardware.usb.*, android.util.Log) so the APK is tiny and
-        // the build has nothing to break.
+        // No Compose, no BuildConfig, no AndroidX — the helper uses platform USB/service APIs.
         buildConfig = false
     }
 }

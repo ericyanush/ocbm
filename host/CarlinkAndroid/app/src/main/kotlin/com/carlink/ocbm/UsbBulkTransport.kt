@@ -27,6 +27,14 @@ class UsbBulkTransport(
     context: Context,
     private val log: ProbeLog.Logger,
 ) : RawBulkTransport {
+    private data class BindingCleanup(
+        val remote: IUsbBridge?,
+        val unregisterCallback: Boolean,
+        val closeDevice: Boolean,
+        val connection: ServiceConnection?,
+        val unbindService: Boolean,
+    )
+
     companion object {
         const val VID_CARLINKIT = 0x1314
         const val PID_OCBM = 0x2d00
@@ -35,8 +43,18 @@ class UsbBulkTransport(
     private val appContext = context.applicationContext
     private val connected = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
+    private val connectStarted = AtomicBoolean(false)
     private val transferIds = AtomicLong(1)
     private val writeLock = Any()
+    private val lifecycleLock = Any()
+
+    // ServiceConnection callbacks arrive on the main thread, while connect()/stop() run on
+    // workers. Keep registration, terminal-state changes, and binder ownership serialized so a
+    // late onServiceConnected cannot resurrect a transport after timeout/stop.
+    @Volatile private var stopped = false
+    private var bound = false
+    private var callbackRegistered = false
+    private var stopLogged = false
 
     @Volatile private var bridge: IUsbBridge? = null
 
@@ -84,6 +102,10 @@ class UsbBulkTransport(
     fun connect(timeoutMs: Long = 5_000): Boolean {
         check(Looper.myLooper() != Looper.getMainLooper()) { "USB helper bind must not block the main thread" }
         if (bridge != null) return true
+        if (!connectStarted.compareAndSet(false, true)) {
+            lastError = "USB helper connection has already been attempted"
+            return false
+        }
         lastError = null
         val ready = CountDownLatch(1)
         val intent =
@@ -102,38 +124,76 @@ class UsbBulkTransport(
                     service: IBinder,
                 ) {
                     val remote = IUsbBridge.Stub.asInterface(service)
-                    bridge = remote
-                    try {
-                        remote.registerCallback(callback)
-                    } catch (e: RemoteException) {
-                        lastError = "USB helper callback registration failed: ${e.message}"
-                        log.e("[USB_HELPER] $lastError")
-                    } finally {
+                    var stale = false
+                    synchronized(lifecycleLock) {
+                        if (stopped || serviceConnection !== this) {
+                            stale = true
+                        } else {
+                            try {
+                                remote.registerCallback(callback)
+                                callbackRegistered = true
+                                bridge = remote
+                            } catch (e: RemoteException) {
+                                lastError = "USB helper callback registration failed: ${e.message}"
+                                log.e("[USB_HELPER] $lastError")
+                            } finally {
+                                ready.countDown()
+                            }
+                        }
+                    }
+                    if (stale) {
+                        // If stop won the race, never retain this binder or callback. The
+                        // callback is transport-specific, so unregistering it cannot affect a
+                        // later transport instance.
+                        runCatching { remote.unregisterCallback(callback) }
+                        log.i("[USB_HELPER] discarded late service connection after transport shutdown")
                         ready.countDown()
                     }
                 }
 
                 override fun onServiceDisconnected(name: ComponentName) {
-                    bridge = null
-                    lastError = "USB helper service disconnected"
+                    synchronized(lifecycleLock) {
+                        if (serviceConnection === this) {
+                            bridge = null
+                            callbackRegistered = false // service process/binder is gone
+                            lastError = "USB helper service disconnected"
+                        }
+                    }
                     signalDead()
                     ready.countDown()
                 }
 
                 override fun onBindingDied(name: ComponentName) {
-                    bridge = null
-                    lastError = "USB helper service binding died"
+                    synchronized(lifecycleLock) {
+                        if (serviceConnection === this) {
+                            bridge = null
+                            callbackRegistered = false
+                            lastError = "USB helper service binding died"
+                        }
+                    }
                     signalDead()
                     ready.countDown()
                 }
 
                 override fun onNullBinding(name: ComponentName) {
-                    lastError = "USB helper returned a null service binding"
+                    synchronized(lifecycleLock) {
+                        if (serviceConnection === this) {
+                            lastError = "USB helper returned a null service binding"
+                        }
+                    }
                     ready.countDown()
                 }
             }
-        serviceConnection = connection
-        return bindAndAwait(intent, connection, ready, timeoutMs)
+        synchronized(lifecycleLock) {
+            if (stopped) {
+                lastError = "USB helper transport was stopped before binding"
+                return false
+            }
+            serviceConnection = connection
+        }
+        val success = bindAndAwait(intent, connection, ready, timeoutMs)
+        if (!success) abortConnection(connection)
+        return success
     }
 
     private fun bindAndAwait(
@@ -143,17 +203,26 @@ class UsbBulkTransport(
         timeoutMs: Long,
     ): Boolean =
         try {
-            val bound = appContext.bindService(intent, connection, Context.BIND_AUTO_CREATE)
-            if (!bound) {
-                lastError = "bindService returned false; helper is unavailable to this AAOS user"
-                log.e("[USB_HELPER] $lastError")
-                serviceConnection = null
+            val didBind = synchronized(lifecycleLock) {
+                if (stopped || serviceConnection !== connection) {
+                    false
+                } else {
+                    appContext.bindService(intent, connection, Context.BIND_AUTO_CREATE).also {
+                        bound = it
+                    }
+                }
+            }
+            if (!didBind) {
+                if (!stopped) {
+                    lastError = "bindService returned false; helper is unavailable to this AAOS user"
+                    log.e("[USB_HELPER] $lastError")
+                }
                 false
             } else if (!ready.await(timeoutMs, TimeUnit.MILLISECONDS)) {
                 lastError = "timed out binding USB helper service"
                 log.e("[USB_HELPER] $lastError")
                 false
-            } else if (bridge == null) {
+            } else if (synchronized(lifecycleLock) { stopped || bridge == null }) {
                 if (lastError.isNullOrBlank()) lastError = "USB helper binder unavailable"
                 false
             } else {
@@ -174,6 +243,30 @@ class UsbBulkTransport(
             log.e("[USB_HELPER] $lastError")
             false
         }
+
+    /** Permanently invalidate this bind attempt and release any state acquired so far. */
+    private fun abortConnection(connection: ServiceConnection) {
+        val cleanup = synchronized(lifecycleLock) {
+            if (serviceConnection !== connection) return
+            stopped = true
+            val remote = bridge
+            val shouldUnregister = callbackRegistered
+            val shouldUnbind = bound
+            val shouldClose = remote != null
+            bridge = null
+            callbackRegistered = false
+            bound = false
+            serviceConnection = null
+            BindingCleanup(remote, shouldUnregister, shouldClose, connection, shouldUnbind)
+        }
+        if (cleanup.remote != null && cleanup.unregisterCallback) {
+            runCatching { cleanup.remote.unregisterCallback(callback) }
+        }
+        if (cleanup.remote != null && cleanup.closeDevice) runCatching { cleanup.remote.close() }
+        connected.set(false)
+        running.set(false)
+        if (cleanup.unbindService) runCatching { appContext.unbindService(connection) }
+    }
 
     /** Adapter names and permission status are queried by the helper UID. */
     fun findQuiet(): String? =
@@ -258,17 +351,34 @@ class UsbBulkTransport(
     }
 
     override fun stop() {
-        running.set(false)
-        connected.set(false)
-        val remote = bridge
-        bridge = null
-        if (remote != null) {
-            runCatching { remote.unregisterCallback(callback) }
-            runCatching { remote.close() }
+        val cleanup = synchronized(lifecycleLock) {
+            running.set(false)
+            connected.set(false)
+            val remote = bridge
+            val shouldUnregister = callbackRegistered
+            val connection = serviceConnection
+            val shouldUnbind = bound
+            stopped = true
+            bridge = null
+            callbackRegistered = false
+            bound = false
+            serviceConnection = null
+            val shouldLog = !stopLogged
+            stopLogged = true
+            Pair(
+                BindingCleanup(remote, shouldUnregister, remote != null, connection, shouldUnbind),
+                shouldLog,
+            )
         }
-        serviceConnection?.let { runCatching { appContext.unbindService(it) } }
-        serviceConnection = null
-        log.i("[USB_HELPER] transport stopped and helper unbound")
+        val plan = cleanup.first
+        if (plan.remote != null && plan.unregisterCallback) {
+            runCatching { plan.remote.unregisterCallback(callback) }
+        }
+        if (plan.remote != null && plan.closeDevice) runCatching { plan.remote.close() }
+        if (plan.connection != null && plan.unbindService) {
+            runCatching { appContext.unbindService(plan.connection) }
+        }
+        if (cleanup.second) log.i("[USB_HELPER] transport stopped and helper unbound")
     }
 
     private fun signalDead() {

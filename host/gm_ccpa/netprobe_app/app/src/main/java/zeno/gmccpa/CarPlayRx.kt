@@ -9,6 +9,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -223,6 +224,7 @@ class CarPlayRx(
     @Volatile private var lastDetectedKey: String? = null
 
     companion object {
+        private const val AV_IDLE_CLOSE_MS = 30_000L
         /**
          * The identity the CCPA derives for itself, which the app's Bonjour advert MUST match — iOS
          * ties the Wi-Fi accessory to the one it authenticated over Bluetooth (the box_identity
@@ -398,7 +400,7 @@ class CarPlayRx(
         }
         server = srv
         if (srv != null) {
-            log.i("listening on :$port")
+            log.i("listening on ${srv.inetAddress?.hostAddress}:${srv.localPort} (wildcard=${srv.inetAddress?.isAnyLocalAddress == true})")
             SessionTrace.Board.up(B_LISTENER, ":$port")
             pool.execute { acceptLoop(srv) }
         }
@@ -997,7 +999,7 @@ class CarPlayRx(
                     continue
                 }
                 acceptFailures = 0
-                log.i(">>> INBOUND CONTROL CONNECTION from ${c.inetAddress?.hostAddress}:${c.port}")
+                log.i(">>> INBOUND CONTROL CONNECTION local=${c.localAddress?.hostAddress}:${c.localPort} peer=${c.inetAddress?.hostAddress}:${c.port}")
                 dialsSinceInbound.set(0)
                 // Claim the liveness slot HERE, before anything else — specifically before the
                 // incumbent is closed below.
@@ -1191,6 +1193,11 @@ class CarPlayRx(
         val peer = "${c.inetAddress?.hostAddress}:${c.port}"
         val xVerify = "pair-verify gen=$handle"
         var wasEncrypted = false
+        var rxBytes = 0L
+        var txBytes = 0L
+        var closeReason = "receiver loop ended"
+        val firstRequestLine = HttpStartLineProbe("request", handle, log::i)
+        val firstResponseLine = HttpStartLineProbe("response", handle, log::i)
         // Per-generation names, so a superseded pump's cancel in its finally cannot drop the
         // expectation the hijacking connection just armed under the same step name.
         SessionTrace.Board.up(B_CTRL, "$peer gen=$handle plaintext — pair-verify pending")
@@ -1201,32 +1208,59 @@ class CarPlayRx(
         try {
             c.soTimeout = 30000
             c.tcpNoDelay = true
+            runCatching { c.keepAlive = true }
+                .onSuccess { log.i("control TCP keepalive enabled with platform defaults (gen=$handle)") }
+                .onFailure { log.w("could not enable control TCP keepalive (gen=$handle): ${it.message}") }
             val ins = c.getInputStream()
             val out = c.getOutputStream()
             val buf = ByteArray(16384)
             while (running.get()) {
-                // 30 s SO_RCVTIMEO matches the reference (`set_read_timeout(30 s)` just before `arm_keepalive` in
-                // `run_pairing_server`'s per-connection path, `ccpa/carplayd/src/main.rs`). Breaking on timeout
-                // is reference-correct for the pre-A/V phase: the `WouldBlock` arm of `serve_connection`
-                // (`crates/vendor/receiver/src/net.rs`) closes the connection when
-                // `av_idle_ms()` is None (no A/V ever flowed) or A/V has been idle >= 30 s.
-                //
-                // NOT YET IMPLEMENTED (both are real gaps, see docs/11_HARDENING_PLAN.md status ledger rows N13–N16):
-                //   • the A/V-flowing case — the reference CONTINUES on timeout while A/V is live,
-                //     which needs `ControlServer::av_idle_ms()` (`crates/vendor/receiver/src/server.rs`) exported over JNI;
-                //   • `arm_keepalive` 3s/3s/3 (`fn arm_keepalive`, `ccpa/carplayd/src/main.rs`, armed per control connection) for ~12 s dead-link detect, which
-                //     java.net.Socket cannot express but android.system.Os.setsockoptInt can.
-                // Until av_idle_ms is exported, an unconditional `continue` here would match no
-                // reference state at all and would leak sessions on silent link loss.
-                val n = try { ins.read(buf) } catch (t: Throwable) {
+                // Match the native reference: a 30 s idle control socket is not a dead session if
+                // CarPlay A/V is still flowing. SO_KEEPALIVE is enabled as an additional hint, but
+                // Android does not expose per-socket probe timing here; the A/V-idle cutoff is the
+                // bounded liveness mechanism and remains authoritative.
+                val n = try {
+                    ins.read(buf)
+                } catch (t: SocketTimeoutException) {
+                    val avIdle = NativeCore.avIdleMs(handle)
+                    if (avIdle != null && avIdle < AV_IDLE_CLOSE_MS) {
+                        log.i("control read idle 30s but A/V active (idle=${avIdle}ms, gen=$handle); keeping session")
+                        continue
+                    }
+                    log.i("control and A/V idle timeout (avIdle=${avIdle ?: "unknown"}ms, gen=$handle); closing stale session")
+                    closeReason = "control/A/V idle timeout (avIdle=${avIdle ?: "unknown"}ms)"
+                    -1
+                } catch (t: Throwable) {
+                    // Keepalive ETIMEDOUT / reset errors are not SO_RCVTIMEO; they always retire
+                    // the session, even if the last A/V packet was recent.
+                    closeReason = "read error ${t.javaClass.simpleName}: ${t.message}"
                     log.i("read ended (gen=$handle): ${t.javaClass.simpleName}: ${t.message}"); -1
                 }
-                if (n <= 0) break
+                if (n <= 0) {
+                    if (closeReason == "receiver loop ended") closeReason = if (n == 0) "peer EOF" else "read returned $n"
+                    break
+                }
+                rxBytes += n
+                firstRequestLine.observe(buf, n)
                 // null reply = the core signalled close (feed error, panic, or this generation was
                 // superseded by a hijacking reconnect). Either way, end this connection.
-                val reply = NativeCore.feed(handle, buf.copyOf(n))
-                if (reply == null) { log.w("native feed signalled close (gen=$handle) — ending connection"); break }
-                if (reply.isNotEmpty()) { out.write(reply); out.flush() }
+                val reply = try {
+                    NativeCore.feed(handle, buf.copyOf(n))
+                } catch (t: Throwable) {
+                    closeReason = "native feed threw ${t.javaClass.simpleName}: ${t.message}"
+                    throw t
+                }
+                if (reply == null) {
+                    closeReason = "native feed requested close"
+                    log.w("native feed signalled close (gen=$handle) after rx=${rxBytes}B tx=${txBytes}B — ending connection")
+                    break
+                }
+                if (reply.isNotEmpty()) {
+                    txBytes += reply.size
+                    firstResponseLine.observe(reply, reply.size)
+                    out.write(reply)
+                    out.flush()
+                }
                 // The flip is the milestone worth calling out: pair-verify completed.
                 if (!wasEncrypted && NativeCore.isEncrypted(handle)) {
                     wasEncrypted = true
@@ -1243,9 +1277,11 @@ class CarPlayRx(
                 }
             }
         } catch (t: Throwable) {
+            if (closeReason == "receiver loop ended") closeReason = "handler error ${t.javaClass.simpleName}: ${t.message}"
             log.w("native control connection: ${t.javaClass.simpleName}: ${t.message}")
         } finally {
             try { c.close() } catch (_: Throwable) {}
+            log.i("control socket closed (gen=$handle peer=$peer rx=${rxBytes}B tx=${txBytes}B encrypted=$wasEncrypted reason=$closeReason)")
             // Destroy only THIS generation. If a hijacking reconnect already installed a newer core,
             // the Rust slot's gen no longer matches and this is a safe no-op — it will not tear down
             // the fresh session.
@@ -1577,6 +1613,65 @@ class CarPlayRx(
     }
 
     // ---- minimal HTTP/RTSP parsing ------------------------------------------------------------------
+
+    /**
+     * Captures only the first plaintext protocol start-line in one socket direction. The native
+     * receiver owns parsing; this is deliberately observational and never changes forwarded bytes.
+     * It logs no headers, query strings, or body data. Once TLS/encrypted framing begins, the line
+     * will not parse and the probe quietly stops after its bounded prefix.
+     */
+    private class HttpStartLineProbe(
+        private val direction: String,
+        private val generation: Long,
+        private val emit: (String) -> Unit,
+    ) {
+        private val prefix = ByteArray(MAX_START_LINE_BYTES)
+        private var size = 0
+        private var complete = false
+
+        fun observe(bytes: ByteArray, length: Int) {
+            if (complete) return
+            val limit = minOf(length, prefix.size - size)
+            for (i in 0 until limit) {
+                val b = bytes[i]
+                prefix[size++] = b
+                if (b == '\n'.code.toByte()) {
+                    complete = true
+                    emitLine()
+                    return
+                }
+            }
+            if (size == prefix.size) {
+                complete = true
+                emit("control $direction first line not recognized (gen=$generation, prefix=${size}B)")
+            }
+        }
+
+        private fun emitLine() {
+            val lineLength = (0 until size).firstOrNull { prefix[it] == '\r'.code.toByte() }
+                ?: (size - 1).coerceAtLeast(0)
+            val line = prefix.copyOfRange(0, lineLength).toString(Charsets.US_ASCII)
+            val response = RESPONSE_LINE.matchEntire(line)
+            if (response != null) {
+                emit("control first response status (gen=$generation): ${response.groupValues[1]} ${response.groupValues[2]}")
+                return
+            }
+            val request = REQUEST_LINE.matchEntire(line)
+            if (request != null) {
+                val target = request.groupValues[2].substringBefore('?').take(MAX_LOG_TARGET_CHARS)
+                emit("control first request line (gen=$generation): ${request.groupValues[1]} $target")
+            } else {
+                emit("control $direction first line not recognized (gen=$generation, ${lineLength}B)")
+            }
+        }
+
+        private companion object {
+            const val MAX_START_LINE_BYTES = 512
+            const val MAX_LOG_TARGET_CHARS = 160
+            val REQUEST_LINE = Regex("^([A-Z]{3,12})\\s+(\\S+)\\s+HTTP/1\\.[01]$")
+            val RESPONSE_LINE = Regex("^HTTP/1\\.[01]\\s+(\\d{3})(?:\\s+[^\\r\\n]*)?$")
+        }
+    }
 
     private class Req(val method: String, val path: String, val version: String,
                       val headers: Map<String, String>, val body: ByteArray)

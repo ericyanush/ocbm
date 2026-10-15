@@ -133,6 +133,13 @@ object NativeCore {
     /** True once pair-verify has completed and the channel flipped to ChaCha20-Poly1305. */
     fun isEncrypted(handle: Long): Boolean = handle > 0L && nativeIsEncrypted(handle)
 
+    /** Milliseconds since the last CarPlay A/V activity, or null when this generation is stale/no A/V yet. */
+    fun avIdleMs(handle: Long): Long? {
+        if (handle <= 0L) return null
+        val idle = nativeAvIdleMs(handle)
+        return idle.takeIf { it >= 0L }
+    }
+
     /** Destroy connection [handle]'s core. No-ops if [handle] is a superseded generation. */
     fun destroy(handle: Long) {
         if (handle > 0L) nativeDestroy(handle)
@@ -144,6 +151,7 @@ object NativeCore {
     ): Long
     private external fun nativeFeed(handle: Long, input: ByteArray): ByteArray?
     private external fun nativeIsEncrypted(handle: Long): Boolean
+    private external fun nativeAvIdleMs(handle: Long): Long
     private external fun nativeTouch(phase: Int, nx: Float, ny: Float, w: Int, h: Int): Boolean
     private external fun nativeTouchMulti(
         id1: Int, active1: Boolean, nx1: Float, ny1: Float,
