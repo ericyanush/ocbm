@@ -76,15 +76,37 @@ class VideoSurfaceView
         var callback: Callback? = null
 
         private var viewAreaIndex = 0
+        private var panelWidth = 2400
+        private var panelHeight = 960
 
         /** Crop/position the HWC layer in the panel's coordinates, without scaling the video. */
-        fun setCarPlayViewArea(index: Int) {
-            if (Build.VERSION.SDK_INT < 31 || index !in VIEW_AREAS.indices) return
+        fun setCarPlayViewArea(index: Int, panelWidth: Int, panelHeight: Int) {
+            if (index !in 0..1) {
+                logWarn("[VIDEO_SURFACE_VIEW] Ignoring invalid view-area index=$index", tag = "UI")
+                return
+            }
+            if (panelWidth <= 0 || panelHeight <= 0) {
+                logWarn("[VIDEO_SURFACE_VIEW] Ignoring invalid panel size=${panelWidth}x$panelHeight", tag = "UI")
+                return
+            }
+            if (Build.VERSION.SDK_INT < 31) {
+                logWarn("[VIDEO_SURFACE_VIEW] View-area crop requires API 31+ (device=${Build.VERSION.SDK_INT})", tag = "UI")
+                return
+            }
+            val panelSizeChanged = this.panelWidth != panelWidth || this.panelHeight != panelHeight
+            this.panelWidth = panelWidth
+            this.panelHeight = panelHeight
             // The normal full-panel layout is already the SurfaceView default. Avoid a SurfaceFlinger
             // geometry transaction during app startup; only touch the layer after an actual resize
             // request (or when returning from compact mode).
-            if (index == 0 && viewAreaIndex == 0) return
+            if (index == 0 && viewAreaIndex == 0 && !panelSizeChanged) return
             viewAreaIndex = index
+            logInfo(
+                "[VIDEO_SURFACE_VIEW] Applying view area index=$index panel=${panelWidth}x$panelHeight " +
+                    "rect=${viewArea(index)} " +
+                    "view=${width}x$height holderFrame=${holder.surfaceFrame}",
+                tag = "UI",
+            )
             applyViewAreaGeometry()
         }
 
@@ -92,21 +114,30 @@ class VideoSurfaceView
             if (Build.VERSION.SDK_INT < 31) return
             val control = surfaceControl
             if (!control.isValid) return
-            val area = VIEW_AREAS[viewAreaIndex]
+            val area = viewArea(viewAreaIndex)
             runCatching {
                 SurfaceControl.Transaction().use { transaction ->
                     transaction.setGeometry(control, area, area, Surface.ROTATION_0)
                     transaction.apply()
                 }
+                logInfo("[VIDEO_SURFACE_VIEW] SurfaceControl geometry applied: source=$area destination=$area", tag = "UI")
             }.onFailure { logWarn("[VIDEO_SURFACE_VIEW] view-area geometry failed: ${it.message}", tag = "UI") }
         }
 
-        private companion object {
-            val VIEW_AREAS = listOf(
-                Rect(0, 0, 2400, 960),
-                Rect(188, 118, 1604, 960),
-            )
-        }
+        private fun viewArea(index: Int): Rect =
+            if (index == 0) {
+                Rect(0, 0, panelWidth, panelHeight)
+            } else {
+                // This compact area is the measured GM app viewport on the target truck. Keep it
+                // bounded on a panel variant with smaller dimensions rather than issuing an invalid
+                // source crop; the normal target remains exactly (188,118)-(1604,960).
+                Rect(
+                    188.coerceAtMost(panelWidth),
+                    118.coerceAtMost(panelHeight),
+                    1604.coerceAtMost(panelWidth),
+                    960.coerceAtMost(panelHeight),
+                )
+            }
 
         /**
          * One-shot latch — true after [surfaceCreated] fires, cleared on the first

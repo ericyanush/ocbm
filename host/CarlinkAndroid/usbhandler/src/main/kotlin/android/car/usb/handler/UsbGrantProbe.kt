@@ -18,10 +18,10 @@ import android.util.Log
  *   2. It reads [UsbManager.hasPermission] and asserts it is already `true`. The proof FAILS if we
  *      would have to call [UsbManager.requestPermission] — that call is the dialog we are trying to
  *      eliminate, so this code never makes it. `true` here with no prior request == the silent grant.
- *   3. It opens the device and, for the CCPA-OCBM, claims interface 0 / finds the 0x83·0x02 bulk
- *      pair, proving the grant is real and usable end to end — then releases and closes immediately.
+ *   3. It briefly opens the CCPA-OCBM and claims/releases a bulk interface, proving the grant is
+ *      usable. The production USB session is owned by [com.carlink.usbhelper.UsbBridgeService].
  *
- * It drives no transport and keeps nothing open: production claiming lives in the real host app.
+ * It drives no transport and keeps nothing open; the production service claims its own connection.
  */
 object UsbGrantProbe {
     const val TAG = "UsbHandlerSquat"

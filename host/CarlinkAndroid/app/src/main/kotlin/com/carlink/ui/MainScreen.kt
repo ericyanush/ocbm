@@ -17,11 +17,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Settings
@@ -45,7 +47,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
@@ -148,7 +149,7 @@ fun MainScreen(
             carlinkManager,
             ui,
             surfaceState,
-                Modifier.fillMaxSize().clipToBounds(),
+                Modifier.fillMaxSize(),
         )
         if (!ui.projecting) {
             LoadingOverlay(carlinkManager, ui.statusText)
@@ -327,16 +328,37 @@ private fun ProjectionSurface(
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
+    val panelWidthPx = carlinkManager.panelWidthPx
+    val panelHeightPx = carlinkManager.panelHeightPx
+    val panelWidth = with(density) { panelWidthPx.toDp() }
+    val panelHeight = with(density) { panelHeightPx.toDp() }
     BoxWithConstraints(modifier = modifier) {
-        // Track the content area for the adapter OPEN resolution.
+        // Track AAOS's live content area for diagnostics only. The stream and its SurfaceView
+        // remain in the stable full-panel coordinate space even when this parent is narrowed.
         val containerPx = with(density) { IntSize(maxWidth.roundToPx(), maxHeight.roundToPx()) }
         LaunchedEffect(containerPx) {
-            if (containerPx.width > 0 && containerPx.height > 0) ui.containerSize = containerPx
+            if (containerPx.width > 0 && containerPx.height > 0) {
+                ui.containerSize = containerPx
+                logInfo(
+                    "[VIDEO_SURFACE] parent=${containerPx.width}x${containerPx.height}; " +
+                        "pinning view to panel=${panelWidthPx}x$panelHeightPx",
+                    tag = "UI",
+                )
+            }
         }
         key(carlinkManager) {
             VideoSurface(
-                modifier = Modifier.fillMaxSize(),
+                // AAOS narrows the Compose content bounds when it exposes the compact CarPlay
+                // area. Keep the SurfaceView at physical panel size and its origin at (0,0);
+                // SurfaceControl then crops it to the requested view area. TopStart + unbounded
+                // avoids centering this oversized child in the compact parent.
+                modifier =
+                    Modifier
+                        .wrapContentSize(Alignment.TopStart, unbounded = true)
+                        .requiredSize(panelWidth, panelHeight),
                 viewAreaIndex = ui.viewAreaIndex,
+                panelWidthPx = panelWidthPx,
+                panelHeightPx = panelHeightPx,
                 onSurfaceAvailable = { surface, width, height ->
                     logInfo("[UI_SURFACE] Surface available: ${width}x$height", tag = "UI")
                     surfaceState.onSurfaceAvailable(surface, width, height)

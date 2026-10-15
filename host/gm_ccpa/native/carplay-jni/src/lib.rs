@@ -396,6 +396,7 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut libc::c_void) -> j
     receiver::levers::set_dpad(false);         // touch only -> displays[].features 0x0A
     receiver::levers::set_knob(false);
     receiver::levers::set_telephony(false);
+    receiver::levers::set_multi_touch(true);   // /info asset advertises Apple's two-contact HID descriptor
     receiver::levers::set_altscreen(false);    // no type-111 cluster display in /info
     // ON for the resize experiment. iOS honours displays[].viewAreas ONLY when "viewAreas" is echoed
     // in the SETUP enabledFeatures (session.rs:664-666); with it off, the /info structure is present
@@ -688,6 +689,46 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeTouch(
     .unwrap_or(0)
 }
 
+/// Send both touchscreen contacts in the single 12-byte report advertised by `/info`.
+///
+/// CarPlay's multi-touch descriptor has two `Finger` collections in ONE report. Sending two
+/// single-contact reports overwrites the first contact; it does not create a second pointer.
+/// Android pointer IDs are carried as the descriptor's Transducer Index so iOS can retain contact
+/// identity while contacts move between report slots. A lifted/missing contact remains present in
+/// the report with its touch bit cleared.
+#[no_mangle]
+pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeTouchMulti(
+    _env: JNIEnv,
+    _class: JClass,
+    id1: jni::sys::jint,
+    active1: jni::sys::jboolean,
+    nx1: jni::sys::jfloat,
+    ny1: jni::sys::jfloat,
+    id2: jni::sys::jint,
+    active2: jni::sys::jboolean,
+    nx2: jni::sys::jfloat,
+    ny2: jni::sys::jfloat,
+    width: jni::sys::jint,
+    height: jni::sys::jint,
+) -> jni::sys::jboolean {
+    std::panic::catch_unwind(|| {
+        let report = receiver::hid::touch_report_multi_normalized(
+            id1.clamp(0, 255) as u8,
+            u8::from(active1 != 0),
+            nx1 as f64,
+            ny1 as f64,
+            id2.clamp(0, 255) as u8,
+            u8::from(active2 != 0),
+            nx2 as f64,
+            ny2 as f64,
+            width.clamp(1, 0x7fff) as u16,
+            height.clamp(1, 0x7fff) as u16,
+        );
+        u8::from(receiver::events::send_hid_report(1, &report))
+    })
+    .unwrap_or(0)
+}
+
 /// Tap one media-transport key on the advertised media-buttons HID device.
 ///
 /// uid **2** is `HID_UID_MEDIA_BUTTONS` (`receiver/src/info.rs:19`), the second HID device this
@@ -722,6 +763,21 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeMediaButton(
             &receiver::hid::media_button_report(receiver::hid::media_button::NONE),
         );
         u8::from(pressed && released)
+    })
+    .unwrap_or(0)
+}
+
+/// Invoke Siri on the wireless CarPlay event channel. Wired OCBM sessions dispatch this through
+/// the adapter, but in the in-app receiver path the encrypted event channel terminates here.
+#[no_mangle]
+pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeRequestSiriPress(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    std::panic::catch_unwind(|| {
+        let down = receiver::events::send_request_siri_action(2);
+        let up = receiver::events::send_request_siri_action(3);
+        u8::from(down && up)
     })
     .unwrap_or(0)
 }

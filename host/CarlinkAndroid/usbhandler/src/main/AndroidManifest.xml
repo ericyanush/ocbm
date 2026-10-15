@@ -3,7 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- ===================================================================================
-         "Handler squat" proof app — package android.car.usb.handler. Full rationale: docs/59.
+         GM fixed-handler USB owner — package android.car.usb.handler. Rationale: OCBMANDROID.md.
 
          Mirrors AOSP packages/services/Car/car-usb-handler (same package, same
          .UsbHostManagementActivity name that GM's config_UsbDeviceConnectionHandling_component
@@ -64,6 +64,12 @@
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
             </intent-filter>
         </receiver>
+
+        <!-- USB ownership remains in the UID granted by GM's fixed-handler path. This is a
+             bound-only service: it does not start a foreground service or display an activity. -->
+        <service
+            android:name="com.carlink.usbhelper.UsbBridgeService"
+            android:exported="true" />
 
     </application>
 

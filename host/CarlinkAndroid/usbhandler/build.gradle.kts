@@ -3,7 +3,7 @@ plugins {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The GM AAOS USB-permission "handler squat" proof app. See docs/59.
+// The GM AAOS fixed-handler USB owner. See the USB permission split section in OCBMANDROID.md.
 //
 // GM's Y181 image ships `config_UsbDeviceConnectionHandling_component =
 // android.car.usb.handler/android.car.usb.handler.UsbHostManagementActivity` but STRIPS the
@@ -14,9 +14,8 @@ plugins {
 // user (user 10), the framework resolves THIS app as the fixed handler and calls
 // `grantDevicePermission(device, ourUid)` SILENTLY on every attach — no dialog, no root.
 //
-// It is a PROOF, not the product: its whole job is to attach, confirm it already holds permission
-// (hasPermission == true with NO requestPermission call), open the device, and log it. It stays a
-// SEPARATE module so the daily-driver `:app` (zeno.carlink.ocbm) is never touched.
+// This APK holds the granted device permission and owns the raw USB pipe. It stays separate from
+// the daily-driver `:app` (zeno.carlink.ocbm), which only binds through :usbbridge.
 //
 // Structure mirrors AOSP `packages/services/Car/car-usb-handler`; divergences (NoDisplay instead of
 // the Dialog picker, no MANAGE_USB) are called out in the manifest — a /data untrusted_app cannot
@@ -33,12 +32,12 @@ android {
         applicationId = "android.car.usb.handler"
         minSdk = 32 // GM gminfo37 = Android 12L / API 32
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0-squatproof"
+        versionCode = 2
+        versionName = "0.2.0-usbbridge"
     }
 
     buildTypes {
-        // No minify: this is a debug proof exercised by logcat; keep class/method names readable.
+        // Keep helper diagnostics and USB service names readable in test builds.
         release {
             isMinifyEnabled = false
         }
@@ -55,4 +54,8 @@ android {
         // the build has nothing to break.
         buildConfig = false
     }
+}
+
+dependencies {
+    implementation(project(":usbbridge"))
 }

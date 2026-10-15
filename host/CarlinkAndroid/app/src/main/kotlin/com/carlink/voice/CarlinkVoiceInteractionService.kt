@@ -71,7 +71,7 @@ class CarlinkVoiceSession(
         val m = CarlinkManager.live
         val sent = m?.requestSiri() ?: false
         if (sent) {
-            logInfo("[VOICE] PTT (flags=0x%x) -> Siri hold pair sent".format(showFlags), tag = TAG)
+            logInfo("[VOICE] PTT (flags=0x%x) -> Siri request accepted".format(showFlags), tag = TAG)
         } else {
             logWarn("[VOICE] PTT (flags=0x%x) but no live CarPlay session — ignored".format(showFlags), tag = TAG)
         }

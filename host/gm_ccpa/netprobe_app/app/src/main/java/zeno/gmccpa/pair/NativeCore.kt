@@ -75,6 +75,15 @@ object NativeCore {
     fun touch(phase: Int, nx: Float, ny: Float, w: Int, h: Int): Boolean =
         available && nativeTouch(phase, nx, ny, w, h)
 
+    /** Send both contacts atomically in the advertised 12-byte multi-touch HID report. */
+    fun touchMulti(
+        id1: Int, active1: Boolean, nx1: Float, ny1: Float,
+        id2: Int, active2: Boolean, nx2: Float, ny2: Float,
+        w: Int, h: Int,
+    ): Boolean = available && nativeTouchMulti(
+        id1, active1, nx1, ny1, id2, active2, nx2, ny2, w, h,
+    )
+
     /** Ask iOS for a fresh IDR. Blocking (event channel) — never call from the UI thread. */
     fun forceKeyFrame(): Boolean = available && nativeForceKeyFrame()
 
@@ -98,6 +107,9 @@ object NativeCore {
      * Returns false between sessions, which is normal.
      */
     fun mediaButton(index: Int): Boolean = available && nativeMediaButton(index)
+
+    /** Blocking Siri hold pair on the active wireless CarPlay event channel; call off the UI thread. */
+    fun requestSiriPress(): Boolean = available && nativeRequestSiriPress()
 
     /**
      * Restrict ([limit] = true) or release the CarPlay UI for driving.
@@ -133,7 +145,13 @@ object NativeCore {
     private external fun nativeFeed(handle: Long, input: ByteArray): ByteArray?
     private external fun nativeIsEncrypted(handle: Long): Boolean
     private external fun nativeTouch(phase: Int, nx: Float, ny: Float, w: Int, h: Int): Boolean
+    private external fun nativeTouchMulti(
+        id1: Int, active1: Boolean, nx1: Float, ny1: Float,
+        id2: Int, active2: Boolean, nx2: Float, ny2: Float,
+        w: Int, h: Int,
+    ): Boolean
     private external fun nativeMediaButton(index: Int): Boolean
+    private external fun nativeRequestSiriPress(): Boolean
     private external fun nativeSetLimitedUI(limit: Boolean): Boolean
     private external fun nativeSetNightMode(night: Boolean): Boolean
     private external fun nativeForceKeyFrame(): Boolean

@@ -5,9 +5,69 @@ plugins {
     id("io.gitlab.arturbosch.detekt")
 }
 
+val gmCcpaRoot =
+    rootProject.projectDir.parentFile.parentFile
+        .resolve("host/gm_ccpa")
+val gmCcpaJavaRoot = gmCcpaRoot.resolve("netprobe_app/app/src/main/java")
+val gmCcpaKotlinSources =
+    listOf(
+        "zeno/gmccpa/CarPlayRx.kt",
+        "zeno/gmccpa/MdnsInspect.kt",
+        "zeno/gmccpa/MdnsResponder.kt",
+        "zeno/gmccpa/NetworkDiagnostics.kt",
+        "zeno/gmccpa/av/MicUplink.kt",
+        "zeno/gmccpa/logging/SessionTrace.kt",
+        "zeno/gmccpa/pair/NativeCore.kt",
+        "zeno/gmccpa/pair/SrpServer.kt",
+        "zeno/gmccpa/pair/Tlv8.kt",
+    ).map(gmCcpaJavaRoot::resolve)
+
+val gmRepoRoot = rootProject.projectDir.parentFile.parentFile
+val carPlayJniDir = gmCcpaRoot.resolve("native/carplay-jni")
+val cargoTargetDir =
+    file("${System.getProperty("user.home")}/.cache/cargo-targets/carlink-android-carplay-jni")
+val cargoJniOutput =
+    layout.buildDirectory.file("generated/carplayJni/jniLibs/x86_64/libcarplayjni.so")
+val ndkBin =
+    file(
+        "${System.getProperty("user.home")}/Library/Android/sdk/ndk/30.0.15729638/toolchains/llvm/prebuilt/darwin-x86_64/bin",
+    )
+val cargoExecutable = file("${System.getProperty("user.home")}/.cargo/bin/cargo")
+val fdkAacPrefix = gmRepoRoot.resolve("scratchpad/fdk/install-android-x86_64")
+
+val buildCarPlayJni =
+    tasks.register<Exec>("buildCarPlayJni") {
+        group = "build"
+        description = "Builds gm_ccpa's x86_64 Android CarPlay receiver JNI library."
+        executable = "bash"
+        args(
+            rootProject.projectDir.resolve("tools/build_carplay_jni.sh").absolutePath,
+            cargoTargetDir.absolutePath,
+            cargoJniOutput.get().asFile.absolutePath,
+            ndkBin.absolutePath,
+            cargoExecutable.absolutePath,
+            fdkAacPrefix.absolutePath,
+        )
+        inputs.files(fileTree(carPlayJniDir) { include("**/*.rs", "**/*.toml", "Cargo.lock") })
+        inputs.files(fileTree(gmRepoRoot.resolve("crates")) { include("**/*.rs", "**/*.toml") })
+        inputs.file(fdkAacPrefix.resolve("lib/libfdk-aac.a"))
+        inputs.file(ndkBin.resolve("x86_64-linux-android32-clang"))
+        outputs.file(cargoJniOutput)
+    }
+
 android {
     namespace = "com.carlink"
     compileSdk = 37
+
+    sourceSets.getByName("main").assets.srcDir(
+        gmCcpaRoot.resolve("netprobe_app/app/src/main/assets"),
+    )
+    sourceSets.getByName("main").jniLibs.srcDir(
+        layout.buildDirectory
+            .dir("generated/carplayJni/jniLibs")
+            .get()
+            .asFile,
+    )
 
 // ###############################################
 // ###############################################
@@ -46,10 +106,8 @@ android {
         }
     }
 
-    // Sideload-only (cp-stripped): a single APK installed directly on the head unit, never
-    // uploaded to Play. The cluster-icon ContentProvider authority machinery + the `play`
-    // flavor were removed along with cluster navigation. The single flavor is retained so the
-    // build variant stays `sideloadDebug`/`sideloadRelease`.
+    // Distribution identities: Play updates the existing Carlink application; sideload remains
+    // a distinct OCBM package so it can coexist with the Play-installed app during testing.
     flavorDimensions += "distribution"
 
     productFlavors {
@@ -105,8 +163,12 @@ android {
     }
 }
 
+tasks.named("preBuild").configure { dependsOn(buildCarPlayJni) }
+
 // Kotlin compiler: report deprecations and unchecked casts as warnings
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    source(gmCcpaKotlinSources)
+    dependsOn(buildCarPlayJni)
     compilerOptions {
         freeCompilerArgs.addAll("-opt-in=kotlin.RequiresOptIn")
         allWarningsAsErrors.set(false) // report but don't fail — tighten later
@@ -131,6 +193,7 @@ detekt {
 }
 
 dependencies {
+    implementation(project(":usbbridge"))
     // (Removed: detekt-formatting. Its embedded ktlint (~0.50) disagrees with the
     // standalone ktlint-gradle 14.x engine that now formats AND gates the build —
     // running both baselined ~70 entries of pure engine disagreement. One formatter,

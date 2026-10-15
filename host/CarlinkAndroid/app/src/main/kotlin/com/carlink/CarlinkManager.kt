@@ -129,6 +129,12 @@ class CarlinkManager(
 ) {
     private var config: AdapterConfig = initialConfig
 
+    /** Stable projection-frame dimensions. Unlike Compose content bounds, these do not change when
+     * AAOS exposes the vehicle chrome for CarPlay's compact view area. These match the decoder's
+     * configured frame and therefore remain the coordinate basis for crop and touch mapping. */
+    val panelWidthPx: Int = initialConfig.width
+    val panelHeightPx: Int = initialConfig.height
+
     /** Configured WiFi/Bluetooth name the adapter advertises (shown on the dashboard). */
     val adapterName: String get() = config.boxName
 
@@ -517,6 +523,8 @@ class CarlinkManager(
     /** Loopback ingress from the native AirPlay receiver, started only for an armed media session. */
     @Volatile private var carPlaySocketBridge: CarPlaySocketMediaBridge? = null
     @Volatile private var carPlayReceiver: CarPlayRx? = null
+    @Volatile private var lastTouchRoute: String? = null
+    private var lastTouchContactCount = 0
     @Volatile private var carPlayMicUplink: MicUplink? = null
     @Volatile private var carPlayMulticastLock: WifiManager.MulticastLock? = null
 
@@ -1092,6 +1100,8 @@ class CarlinkManager(
         receiver.onListenerLost = { reason ->
             logError("[CP_RX] receiver listener lost: $reason", tag = Logger.Tags.ADAPTR)
         }
+        lastTouchRoute = null
+        lastTouchContactCount = 0
         carPlayReceiver = receiver
         receiver.start()
         logInfo("[CP_RX] wireless CarPlay receiver started on control port 7011", tag = Logger.Tags.ADAPTR)
@@ -1189,6 +1199,8 @@ class CarlinkManager(
             receiver.stop()
         }
         carPlayReceiver = null
+        lastTouchRoute = null
+        lastTouchContactCount = 0
         carPlayMicUplink?.stop("Carlink session stopping")
         carPlayMicUplink = null
         carPlayMulticastLock?.let { lock -> runCatching { if (lock.isHeld) lock.release() } }
@@ -1521,6 +1533,20 @@ class CarlinkManager(
      * Non-blocking; false when no subscribed session exists. Any thread.
      */
     fun requestSiri(): Boolean {
+        if (carPlayReceiver != null) {
+            // In the wireless receiver architecture, the iPhone's encrypted AirPlay event channel
+            // terminates in this process. Sending through OCBM only reaches the adapter and cannot
+            // invoke Siri on this native session.
+            scope.launch(Dispatchers.IO) {
+                val ok = NativeCore.requestSiriPress()
+                logInfo(
+                    "[SIRI] native AirPlay requestSiri buttondown/buttonup -> ${if (ok) "sent" else "dropped (event channel unavailable)"}",
+                    tag = Logger.Tags.ADAPTR,
+                )
+            }
+            logInfo("[SIRI] native AirPlay press queued", tag = Logger.Tags.ADAPTR)
+            return true
+        }
         val c = client ?: return false
         val ok = c.sendSiriPress()
         logInfo("[SIRI] press -> ${if (ok) "sent" else "dropped (not subscribed)"}", tag = Logger.Tags.ADAPTR)
@@ -1622,36 +1648,51 @@ class CarlinkManager(
      * remapped: `airplayd` would have to evict a live contact to make room, which breaks the
      * gesture already in progress.
      *
-     * Ordering by [MessageSerializer.TouchPoint.id] keeps a given finger on a stable slot for the
-     * life of the gesture. That matters because the box routes by the id we send here, and a
-     * contact that changed slot mid-pinch would read as a jump.
-     *
-     * One `INPUT_TOUCH` frame goes out per pointer; the box coalesces them into the single
-     * two-finger HID report the descriptor requires.
+     * On native wireless CarPlay, both contacts are sent together in one HID report. The report
+     * carries Android's stable pointer IDs as transducer indices; issuing two single-touch reports
+     * would overwrite the first contact. On the adapter path, each contact remains a separate
+     * OCBM INPUT_TOUCH frame, where the box coalesces contacts into its HID report.
      */
     fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>) {
         if (touches.isEmpty()) return
         val receiverActive = carPlayReceiver != null
         val c = if (receiverActive) null else client ?: return
-        for (t in touches.sortedBy { it.id }.take(MAX_CONTACTS)) {
-            val phase =
-                when (t.action) {
-                    MultiTouchAction.DOWN -> Ocbm.TOUCH_DOWN
-                    MultiTouchAction.MOVE -> Ocbm.TOUCH_MOVE
-                    MultiTouchAction.UP -> Ocbm.TOUCH_UP
-                    else -> continue
-                }
-            if (receiverActive) {
-                val nativePhase = when (phase) {
-                    Ocbm.TOUCH_DOWN -> 0
-                    Ocbm.TOUCH_MOVE -> 1
-                    else -> 2
-                }
-                NativeCore.touch(nativePhase, t.x, t.y, config.width, config.height)
-            } else {
-                // Non-blocking by construction (the client queues), preserving touch ordering.
-                c?.sendTouch(phase, t.x, t.y, finger = t.id)
+        val contacts = touches.sortedBy { it.id }.take(MAX_CONTACTS)
+        val route = if (receiverActive) "native-wireless-HID" else "OCBM-USB"
+        if (lastTouchRoute != route) {
+            lastTouchRoute = route
+            lastTouchContactCount = 0
+        }
+        if (contacts.size > lastTouchContactCount) {
+            logInfo("[TOUCH] route=$route active-contact-count=${contacts.size}", tag = Logger.Tags.ADAPTR)
+            lastTouchContactCount = contacts.size
+        }
+        if (receiverActive) {
+            fun active(t: MessageSerializer.TouchPoint?): Boolean = when (t?.action) {
+                MultiTouchAction.DOWN, MultiTouchAction.MOVE -> true
+                else -> false
             }
+            val first = contacts.getOrNull(0)
+            val second = contacts.getOrNull(1)
+            // The inactive second slot still needs an unused transducer index. Pointer IDs are
+            // bounded by Android, but clamp at the JNI boundary as a final defensive measure.
+            val idleId = if (first?.id == 0) 1 else 0
+            NativeCore.touchMulti(
+                first?.id ?: idleId, active(first), first?.x ?: 0f, first?.y ?: 0f,
+                second?.id ?: idleId, active(second), second?.x ?: 0f, second?.y ?: 0f,
+                config.width, config.height,
+            )
+            return
+        }
+        for (t in contacts) {
+            val phase = when (t.action) {
+                MultiTouchAction.DOWN -> Ocbm.TOUCH_DOWN
+                MultiTouchAction.MOVE -> Ocbm.TOUCH_MOVE
+                MultiTouchAction.UP -> Ocbm.TOUCH_UP
+                else -> continue
+            }
+            // Non-blocking by construction (the client queues), preserving touch ordering.
+            c?.sendTouch(phase, t.x, t.y, finger = t.id)
         }
     }
 

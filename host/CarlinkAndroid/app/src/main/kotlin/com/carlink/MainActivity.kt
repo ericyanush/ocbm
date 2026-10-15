@@ -14,6 +14,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
+import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -37,7 +38,6 @@ import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.carlink.logging.Logger
 import com.carlink.logging.logInfo
@@ -646,30 +646,50 @@ class MainActivity : ComponentActivity() {
      * its negotiated compact view area is applied as a SurfaceControl crop independently of bars.
      */
     private fun applyDisplayMode() {
-        val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
         val lp = window.attributes
         // Draw edge-to-edge into the cutout (gminfo3.7 has none, so this is a no-op there).
         lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         window.attributes = lp
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        val hidden = appliedDisplayMode.hiddenBarTypes
-        val shown = appliedDisplayMode.visibleBarTypes
-        if (shown != 0) windowInsetsController.show(shown)
-        if (hidden != 0) windowInsetsController.hide(hidden)
-        windowInsetsController.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        applyCarPlaySystemUi(compact = false)
         logInfo("[DISPLAY] Applied display mode ${appliedDisplayMode.name}", tag = "MAIN")
     }
 
-    /** Keep vehicle system bars visible around the compact CarPlay view area. */
+    /**
+     * Keep a full-panel window/root in panel coordinates and toggle only system-UI visibility,
+     * matching gm_ccpa's proven view-area behavior. The compat controller alone leaves AAOS's
+     * custom bars hidden on some builds even though the video SurfaceControl has been cropped.
+     */
+    @Suppress("DEPRECATION")
+    private fun applyCarPlaySystemUi(compact: Boolean) {
+        val hidden = if (compact) 0 else appliedDisplayMode.hiddenBarTypes
+        val hideStatus = hidden and WindowInsetsCompat.Type.statusBars() != 0
+        val hideNavigation = hidden and WindowInsetsCompat.Type.navigationBars() != 0
+
+        // GM's TopCarSystemBar is independently suppressed by FLAG_FULLSCREEN, so keep this in
+        // sync with the visibility bits rather than relying on decor visibility alone.
+        if (hideStatus) window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+
+        var visibility =
+            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        if (hideStatus || hideNavigation) {
+            visibility = visibility or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            if (hideStatus) visibility = visibility or View.SYSTEM_UI_FLAG_FULLSCREEN
+            if (hideNavigation) visibility = visibility or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+        }
+        window.decorView.systemUiVisibility = visibility
+    }
+
+    /** Reveal vehicle system bars around the cropped CarPlay surface in the compact area. */
     private fun applyCarPlayViewArea(index: Int) {
         if (index == 0) {
             applyDisplayMode()
             return
         }
-        val controller = WindowCompat.getInsetsController(window, window.decorView)
-        controller.show(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        applyCarPlaySystemUi(compact = true)
         logInfo("[DISPLAY] CarPlay compact view area selected; showing vehicle system bars", tag = "MAIN")
     }
 
