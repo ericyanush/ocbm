@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 /**
  * [BinaryPlist] against fixtures produced by APPLE'S OWN ENCODER.
@@ -89,6 +90,51 @@ class BinaryPlistTest {
         assertEquals("Carlink ✓", decoded["label"])
         assertTrue((decoded["payload"] as ByteArray).contentEquals(expected["payload"] as ByteArray))
         assertEquals(listOf(mapOf("width" to 120L), mapOf("width" to 180L)), decoded["items"])
+    }
+
+    @Test
+    fun `CarPlay info exposes the app return icon and preserves the rest of the plist`() {
+        val source = BinaryPlist.encodeDict(
+            mapOf(
+                "deviceID" to "02:00:00:00:00:01",
+                "oemIcons" to listOf(mapOf("imageData" to byteArrayOf(0), "widthPixels" to 1L)),
+                "oemIconVisible" to false,
+                "features" to 1234L,
+            ),
+        )
+        val icons = listOf(120, 180, 256).map { px ->
+            OemIcon.Image(px, px, "iVBORw0KGgo=")
+        }
+
+        val output = CarPlayInfoCustomizer.withReturnIcon(source, icons, "Carlink")
+        val result = BinaryPlist.parseDict(output) ?: error("customized plist did not parse")
+
+        assertEquals("02:00:00:00:00:01", result["deviceID"])
+        assertEquals(1234L, result["features"])
+        assertEquals(true, result["oemIconVisible"])
+        assertEquals("Carlink", result["oemIconLabel"])
+        val entries = result["oemIcons"] as List<*>
+        assertEquals(listOf(120L, 180L, 256L), entries.map { (it as Map<*, *>)["widthPixels"] })
+        val pngHeader = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        assertTrue(entries.all { (it as Map<*, *>)["imageData"] is ByteArray })
+        assertTrue(entries.all { ((it as Map<*, *>)["imageData"] as ByteArray).contentEquals(pngHeader) })
+    }
+
+    @Test
+    fun `customizer accepts the checked-in GM receiver info plist`() {
+        var dir = File(System.getProperty("user.dir"))
+        while (dir.parentFile != null && !File(dir, "host/gm_ccpa/netprobe_app/app/src/main/assets/info.bplist").isFile) {
+            dir = dir.parentFile!!
+        }
+        val asset = File(dir, "host/gm_ccpa/netprobe_app/app/src/main/assets/info.bplist")
+        assertTrue("could not find shared receiver info.bplist from ${System.getProperty("user.dir")}", asset.isFile)
+        val source = asset.readBytes()
+        val icons = listOf(120, 180, 256).map { px -> OemIcon.Image(px, px, "iVBORw0KGgo=") }
+
+        val output = CarPlayInfoCustomizer.withReturnIcon(source, icons, "Carlink")
+        val result = BinaryPlist.parseDict(output) ?: error("customized shared plist did not parse")
+        assertEquals(true, result["oemIconVisible"])
+        assertEquals("Carlink", result["oemIconLabel"])
     }
 
     // ---- hostile / malformed input: null, never an exception --------------------------------------

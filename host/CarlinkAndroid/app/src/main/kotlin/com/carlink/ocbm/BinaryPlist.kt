@@ -22,6 +22,10 @@ package com.carlink.ocbm
 object BinaryPlist {
     private val MAGIC = "bplist00".toByteArray(Charsets.US_ASCII)
     private const val TRAILER_LEN = 32
+    // Keep every container's object references at one fixed width. The plist trailer has a single
+    // objectRefSize for the whole file; choosing a width as objects are appended can leave early
+    // containers narrower than the final trailer says (especially after adding the three icon PNGs).
+    private const val OBJECT_REF_SIZE = 4 // Reader caps object count at 2^24, so 4 bytes is sufficient.
 
     /** Deep enough for `{type, params:{...}}` and then some; cheap insurance against a cyclic table. */
     private const val MAX_DEPTH = 16
@@ -31,6 +35,9 @@ object BinaryPlist {
      * `bplist00` whose root is a dictionary.
      */
     fun parseDict(bytes: ByteArray): Map<String, Any?>? = runCatching { Reader(bytes).topDict() }.getOrNull()
+
+    /** Strict counterpart for validating plists produced locally; unlike wire parsing, keep errors. */
+    internal fun parseDictOrThrow(bytes: ByteArray): Map<String, Any?>? = Reader(bytes).topDict()
 
     /** Encode the value types used by the receiver's `/info` document as a binary plist. */
     fun encodeDict(value: Map<String, Any?>): ByteArray = Writer().encode(value)
@@ -52,7 +59,7 @@ object BinaryPlist {
             for (offset in offsets) writeUnsigned(objectData, offset, offsetSize)
             objectData.write(ByteArray(6))
             objectData.write(offsetSize)
-            objectData.write(bytesFor((objects.size - 1).toLong()))
+            objectData.write(OBJECT_REF_SIZE)
             writeUnsigned(objectData, objects.size.toLong(), 8)
             writeUnsigned(objectData, top.toLong(), 8)
             writeUnsigned(objectData, tableOffset, 8)
@@ -81,11 +88,10 @@ object BinaryPlist {
                         require(key is String) { "binary plist dictionary keys must be strings" }
                         add(key) to add(item)
                     }
-                    val refSize = bytesFor((objects.size - 1).toLong())
                     val out = java.io.ByteArrayOutputStream()
                     writeCount(out, 0xD0, entries.size)
-                    entries.forEach { (key, _) -> writeUnsigned(out, key.toLong(), refSize) }
-                    entries.forEach { (_, item) -> writeUnsigned(out, item.toLong(), refSize) }
+                    entries.forEach { (key, _) -> writeUnsigned(out, key.toLong(), OBJECT_REF_SIZE) }
+                    entries.forEach { (_, item) -> writeUnsigned(out, item.toLong(), OBJECT_REF_SIZE) }
                     out.toByteArray()
                 }
                 else -> error("unsupported binary plist value ${value::class.java.name}")
@@ -97,8 +103,7 @@ object BinaryPlist {
         private fun container(marker: Int, refs: List<Int>): ByteArray {
             val out = java.io.ByteArrayOutputStream()
             writeCount(out, marker, refs.size)
-            val width = bytesFor((objects.size - 1).toLong())
-            refs.forEach { writeUnsigned(out, it.toLong(), width) }
+            refs.forEach { writeUnsigned(out, it.toLong(), OBJECT_REF_SIZE) }
             return out.toByteArray()
         }
 

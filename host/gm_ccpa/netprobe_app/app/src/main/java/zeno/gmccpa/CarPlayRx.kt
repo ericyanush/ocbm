@@ -1543,8 +1543,12 @@ class CarPlayRx(
     private fun infoBlob(): ByteArray? = infoCache ?: try {
         val source = ctx.assets.open("info.bplist").use { it.readBytes() }
         val result = infoTransformer?.let { transform ->
-            runCatching { transform(source) }.getOrElse {
-                log.e("app-specific /info transform failed; serving the bundled plist: ${it.message}")
+            try {
+                transform(source).also { transformed ->
+                    log.i("app-specific /info transform applied (${source.size} -> ${transformed.size} B)")
+                }
+            } catch (t: Throwable) {
+                log.e("app-specific /info transform failed; serving the bundled plist: ${t.message}")
                 source
             }
         } ?: source

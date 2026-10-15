@@ -33,6 +33,7 @@ import com.carlink.media.CarlinkMediaBrowserService
 import com.carlink.media.MediaSessionManager
 import com.carlink.media.NowPlayingInfo
 import com.carlink.ocbm.BinaryPlist
+import com.carlink.ocbm.CarPlayInfoCustomizer
 import com.carlink.ocbm.HostInstanceNonce
 import com.carlink.ocbm.Ocbm
 import com.carlink.ocbm.OcbmAvLanes
@@ -1067,12 +1068,17 @@ class CarlinkManager(
                 return response.payload
             }
         }
+        val returnIconImages = oemIconImages
+        val returnIconLabel = context.getString(R.string.app_name)
         val receiver = CarPlayRx(
             context,
             mfiRelay = relay,
             peerFile = java.io.File(context.filesDir, "carplay_peers.bin").absolutePath,
+            infoTransformer = { source ->
+                CarPlayInfoCustomizer.withReturnIcon(source, returnIconImages, returnIconLabel)
+            },
         )
-        logInfo("[CP_RX] using shared gm_ccpa /info plist unchanged (no Carlink OEM icon overrides)", tag = Logger.Tags.ADAPTR)
+        logInfo("[CP_RX] using shared GM /info with Carlink return-icon customization", tag = Logger.Tags.ADAPTR)
         receiver.onSessionUp = {
             logInfo("[CP_RX] native receiver accepted a phone control session", tag = Logger.Tags.ADAPTR)
             scope.launch {
