@@ -156,6 +156,9 @@ class OcbmClient(
     /** Box reported it discarded [lines] log lines from [source] — its 64 KiB queue overflowed. */
     var onBoxLogDropped: ((source: Int, lines: Long) -> Unit)? = null
 
+    /** A failed write invalidates the transport generation; it is not a protocol-level refusal. */
+    @Volatile var onWriteFailure: ((channel: Int, detail: String) -> Unit)? = null
+
     /**
      * Desired CH_LOG state, re-applied after every SUBSCRIBE.
      *
@@ -239,8 +242,16 @@ class OcbmClient(
 
     // ---- wire helpers ---------------------------------------------------------------------------
 
-    private fun send(channel: Int, payload: ByteArray): Boolean =
-        transport.writeBulk(Framing.frame(channel, Ocbm.F_BOTH, seq.getAndIncrement(), payload))
+    private fun send(channel: Int, payload: ByteArray): Boolean {
+        val frame = Framing.frame(channel, Ocbm.F_BOTH, seq.getAndIncrement(), payload)
+        val sent = transport.writeBulk(frame)
+        if (!sent) {
+            val detail = "${Ocbm.channelName(channel)} write failed; adapter transport is no longer trustworthy"
+            log.e("!! $detail")
+            onWriteFailure?.invoke(channel, detail)
+        }
+        return sent
+    }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return

@@ -94,6 +94,8 @@ class UsbBulkTransport(
 
             override fun onInboundData(data: ByteArray) {
                 if (!running.get()) return
+                // Preserve every positive USB read as raw bytes. OcbmClient's Reassembler owns
+                // message framing; a USB transfer can contain a fragment or several OCBM frames.
                 readHandler?.invoke(data, data.size)
             }
         }
@@ -288,66 +290,89 @@ class UsbBulkTransport(
         }
 
     fun open(deviceName: String): Boolean {
-        val remote =
-            bridge ?: run {
+        synchronized(lifecycleLock) {
+            if (stopped) {
+                lastError = "USB helper transport is stopped"
+                return false
+            }
+            val remote = bridge ?: run {
                 lastError = "USB helper is not bound"
                 return false
             }
-        return try {
-            connected.set(remote.open(deviceName))
-            if (!connected.get() && lastError.isNullOrBlank()) {
-                lastError = "USB helper could not claim the adapter; check its USB grant and interface"
+            return try {
+                lastError = null
+                connected.set(remote.open(deviceName))
+                if (!connected.get() && lastError.isNullOrBlank()) {
+                    lastError = "USB helper could not claim the adapter; check its USB grant and interface"
+                    log.e("[USB_HELPER] $lastError")
+                }
+                connected.get()
+            } catch (t: Throwable) {
+                lastError = "USB helper open failed: ${t.message ?: t.javaClass.simpleName}"
+                log.e("[USB_HELPER] $lastError")
+                false
             }
-            connected.get()
-        } catch (t: Throwable) {
-            lastError = "USB helper open failed: ${t.message ?: t.javaClass.simpleName}"
-            log.e("[USB_HELPER] $lastError")
-            false
         }
     }
 
     override fun start() {
-        if (!connected.get() || !running.compareAndSet(false, true)) return
-        try {
-            val remote = bridge ?: error("helper binder disconnected")
-            remote.startReading()
-            log.i("[USB_HELPER] raw OCBM read stream started")
-        } catch (t: Throwable) {
-            running.set(false)
-            lastError = "USB helper could not start reads: ${t.message ?: t.javaClass.simpleName}"
-            signalDead()
+        synchronized(lifecycleLock) {
+            if (stopped || !connected.get() || !running.compareAndSet(false, true)) return
+            try {
+                val remote = bridge ?: error("helper binder disconnected")
+                remote.startReading()
+                log.i("[USB_HELPER] raw OCBM read stream started")
+            } catch (t: Throwable) {
+                lastError = "USB helper could not start reads: ${t.message ?: t.javaClass.simpleName}"
+                log.e("[USB_HELPER] $lastError")
+                signalDead()
+            }
         }
     }
 
     override fun writeBulk(data: ByteArray): Boolean {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            log.e("[USB_MAIN_GUARD] rejected synchronous helper write on main thread")
+            lastError = "synchronous USB helper write rejected on main thread (${data.size}B)"
+            log.e("[USB_MAIN_GUARD] $lastError")
             return false
         }
-        val remote = bridge ?: return false
-        if (!connected.get() || data.size > UsbBridgeConstants.MAX_MESSAGE_SIZE) return false
-        synchronized(writeLock) {
-            val id = transferIds.getAndIncrement()
-            val chunks = maxOf(1, (data.size + UsbBridgeConstants.CHUNK_SIZE - 1) / UsbBridgeConstants.CHUNK_SIZE)
-            for (index in 0 until chunks) {
-                val from = index * UsbBridgeConstants.CHUNK_SIZE
-                val to = minOf(data.size, from + UsbBridgeConstants.CHUNK_SIZE)
-                val bytes = data.copyOfRange(from, to)
-                val accepted =
-                    try {
-                        remote.sendChunk(id, index, chunks, data.size, bytes)
-                    } catch (t: Throwable) {
-                        lastError = "USB helper write failed: ${t.message ?: t.javaClass.simpleName}"
-                        log.e("[USB_HELPER] $lastError")
-                        false
+        synchronized(lifecycleLock) {
+            lastError = null
+            if (stopped) return writeFailure("transport is stopped")
+            val remote = bridge ?: return writeFailure("service binder unavailable")
+            if (!connected.get()) return writeFailure("USB interface is not open")
+            if (data.size > UsbBridgeConstants.MAX_MESSAGE_SIZE) {
+                return writeFailure("transfer ${data.size}B exceeds limit ${UsbBridgeConstants.MAX_MESSAGE_SIZE}B")
+            }
+            synchronized(writeLock) {
+                val id = transferIds.getAndIncrement()
+                val chunks = maxOf(1, (data.size + UsbBridgeConstants.CHUNK_SIZE - 1) / UsbBridgeConstants.CHUNK_SIZE)
+                for (index in 0 until chunks) {
+                    val from = index * UsbBridgeConstants.CHUNK_SIZE
+                    val to = minOf(data.size, from + UsbBridgeConstants.CHUNK_SIZE)
+                    val bytes = data.copyOfRange(from, to)
+                    val failure =
+                        try {
+                            remote.sendChunk(id, index, chunks, data.size, bytes)
+                        } catch (t: Throwable) {
+                            "AIDL sendChunk threw ${t.javaClass.simpleName}: ${t.message ?: "no message"}"
+                        }
+                    if (!failure.isNullOrEmpty()) {
+                        val error = "OUT transfer=$id chunk=${index + 1}/$chunks payload=${data.size}B: $failure"
+                        val failed = writeFailure(error)
+                        signalDead()
+                        return failed
                     }
-                if (!accepted) {
-                    lastError = lastError ?: "USB helper rejected OUT transfer $id chunk $index/$chunks"
-                    return false
                 }
             }
+            return true
         }
-        return true
+    }
+
+    private fun writeFailure(reason: String): Boolean {
+        lastError = "USB helper OUT failed: $reason"
+        log.e("[USB_HELPER] $lastError")
+        return false
     }
 
     override fun stop() {
@@ -371,12 +396,14 @@ class UsbBulkTransport(
             )
         }
         val plan = cleanup.first
-        if (plan.remote != null && plan.unregisterCallback) {
-            runCatching { plan.remote.unregisterCallback(callback) }
-        }
-        if (plan.remote != null && plan.closeDevice) runCatching { plan.remote.close() }
-        if (plan.connection != null && plan.unbindService) {
-            runCatching { appContext.unbindService(plan.connection) }
+        synchronized(writeLock) {
+            if (plan.remote != null && plan.unregisterCallback) {
+                runCatching { plan.remote.unregisterCallback(callback) }
+            }
+            if (plan.remote != null && plan.closeDevice) runCatching { plan.remote.close() }
+            if (plan.connection != null && plan.unbindService) {
+                runCatching { appContext.unbindService(plan.connection) }
+            }
         }
         if (cleanup.second) log.i("[USB_HELPER] transport stopped and helper unbound")
     }

@@ -49,6 +49,40 @@ class OcbmProbe(context: Context) {
         private set
     private var usb: UsbBulkTransport? = null
 
+    /** Each claimed transport/client pair is an epoch; MFi work may not cross an epoch change. */
+    @Volatile private var linkGeneration = 0L
+    @Volatile private var mfiReadyGeneration = 0L
+    @Volatile private var invalidatedGeneration = 0L
+    @Volatile var onTransportLost: ((generation: Long, reason: String) -> Unit)? = null
+
+    @Synchronized private fun invalidateGeneration(generation: Long, reason: String) {
+        if (linkGeneration != generation || invalidatedGeneration == generation) return
+        invalidatedGeneration = generation
+        mfiReadyGeneration = 0L
+        log.e("!! adapter generation=$generation invalidated: $reason")
+        onTransportLost?.invoke(generation, reason)
+    }
+
+    private fun readyMfiClient(): Pair<OcbmClient, Long> {
+        val c = client
+        val generation = linkGeneration
+        if (c == null || mfiReadyGeneration != generation || !c.helloAcked || c.stopped) {
+            throw java.io.IOException("MFi adapter link is not ready (generation=$generation, ready=$mfiReadyGeneration)")
+        }
+        return c to generation
+    }
+
+    private fun <T> relayMfi(operation: String, call: (OcbmClient) -> T?): T {
+        val (c, generation) = readyMfiClient()
+        log.i("relay $operation start generation=$generation")
+        val result = call(c) ?: throw java.io.IOException("CH_MFI $operation failed (generation=$generation)")
+        if (client !== c || linkGeneration != generation || mfiReadyGeneration != generation || c.stopped) {
+            throw java.io.IOException("CH_MFI $operation crossed adapter generation boundary (generation=$generation)")
+        }
+        log.i("relay $operation complete generation=$generation")
+        return result
+    }
+
     /**
      * The CT_HELLO nonce every client this probe builds identifies itself with. Minted ONCE per
      * probe: a USB re-attach reuses the probe (`MainActivity.ocbm()`), so the box sees the same host
@@ -469,6 +503,7 @@ class OcbmProbe(context: Context) {
 
     private fun runAllLocked(subscribe: Boolean = true): LinkResult {
         var r = LinkResult()
+        mfiReadyGeneration = 0L
         sink("")
         sink("==================== OCBM LINK (real adapter) ====================")
         // Armed by UsbAttachActivity when it forwards an attach; a launcher-tap or scripted run
@@ -482,11 +517,15 @@ class OcbmProbe(context: Context) {
             log.w("a session is already live — stopping it before re-claiming the device")
             stopLocked()
         }
+        val generation = ++linkGeneration
+        invalidatedGeneration = 0L
+        log.i("starting adapter generation=$generation subscribe=$subscribe")
         val t = UsbBulkTransport(ctx, zeno.gmccpa.ProbeLog.sub("usb"))
         usb = t
         // If the read loop dies while we still think we are running, the device is gone.
         t.onTransportDead = {
-            log.e("!! transport died — the adapter is gone or the gadget stalled")
+            val reason = t.lastError ?: "USB read loop ended (adapter detached or gadget stalled)"
+            invalidateGeneration(generation, reason)
             SessionTrace.Board.failed(OcbmBoard.LINK, "transport died — adapter gone or gadget stalled; the heartbeat will declare the link dead within 5 s")
         }
 
@@ -522,11 +561,14 @@ class OcbmProbe(context: Context) {
             }
             return r
         }
-        sink("found ${dev.deviceName} vid=0x%04x pid=0x%04x".format(dev.vendorId, dev.productId))
+        sink("adapter generation=$generation found ${dev.deviceName} vid=0x%04x pid=0x%04x".format(dev.vendorId, dev.productId))
         if (!t.open(dev)) { abort("claim failed (${t.lastError})"); return r }
         r = r.copy(claimed = true)
 
         val c = OcbmClient(t, log, hostInstance)
+        c.onWriteFailure = { _, detail ->
+            invalidateGeneration(generation, "$detail; ${t.lastError ?: "no transport detail available"}")
+        }
         // Re-attach the UI observers to every new client (see their declaration above).
         c.onSessionEvent = { sev -> onSessionEvent?.invoke(sev) }
         c.onPairingCode = { code -> onPairingCode?.invoke(code) }
@@ -653,6 +695,10 @@ class OcbmProbe(context: Context) {
                 mfiLog.i("sign: ${sig.payload.size} bytes  ${if (sig.payload.size == Mfi.SIG_LEN) "(matches RSA-1024)" else "(expected 128)"}")
                 mfiLog.i("   first 16: ${hex(sig.payload, 16)}")
                 r = r.copy(mfiProven = sig.payload.size == Mfi.SIG_LEN)
+                if (r.mfiProven && client === c && linkGeneration == generation && !c.stopped) {
+                    mfiReadyGeneration = generation
+                    log.i("adapter generation=$generation MFi relay READY")
+                }
                 sink("STEP 2 OK — the MFi relay works. This is the keystone of the whole architecture.")
             }
         } else {
@@ -667,6 +713,11 @@ class OcbmProbe(context: Context) {
         // Degraded, not fatal: bring-up continues, but the session summary loses its bonded-device
         // diff and the box was slow on CH_MGMT for 5 s — worth a WARN, not a silent INFO.
         else log.w("MGMT_INFO: no response within 5 s — box busy on its dispatch loop? continuing without the bonded-device snapshot")
+
+        if (client !== c || linkGeneration != generation || mfiReadyGeneration != generation || c.stopped) {
+            abort("adapter generation=$generation was lost during bring-up; refusing to continue with a stale client")
+            return r
+        }
 
         // The radio-wake edge. Everything above is passive; this is what starts the box's radios.
         //
@@ -704,7 +755,11 @@ class OcbmProbe(context: Context) {
             throw IllegalStateException("refusing credential-less CT_SUBSCRIBE ($missing missing) " +
                 "— would pin 0x5703 to the box's stock credentials for the whole session")
         }
-        c.subscribe(btOnlyConfig())
+        if (!c.subscribe(btOnlyConfig())) {
+            mfiReadyGeneration = 0L
+            abort("CT_SUBSCRIBE write failed on adapter generation=$generation — radios were not reliably started")
+            return r
+        }
         c.startHeartbeat()
         r = r.copy(subscribed = true)
         // From here the box narrates its own bring-up. Follow it, so both halves of any failure land
@@ -833,10 +888,9 @@ class OcbmProbe(context: Context) {
             throw java.io.IOException("CH_MFI $what")
         }
         override fun copyCertificate(): ByteArray {
-            val c = client ?: run { mfiLog.e("relay cert requested with no OCBM link"); throw java.io.IOException("no OCBM link") }
-            val r = c.mfiCertificate() ?: run {
-                zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay cert: timeout")
-                relayFail("cert timeout (${OcbmClient.MFI_CERT_TIMEOUT_MS}ms)")
+            val r = runCatching { relayMfi("copy_certificate") { it.mfiCertificate() } }.getOrElse {
+                zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay cert: transport/readiness failure")
+                relayFail(it.message ?: "cert transport failure")
             }
             if (!r.ok) {
                 zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("cert: ${r.statusName()}")
@@ -845,10 +899,9 @@ class OcbmProbe(context: Context) {
             return r.payload
         }
         override fun createSignature(digest: ByteArray): ByteArray {
-            val c = client ?: run { mfiLog.e("relay sign requested with no OCBM link"); throw java.io.IOException("no OCBM link") }
-            val r = c.mfiSign(digest) ?: run {
-                zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay sign: timeout")
-                relayFail("sign timeout (${OcbmClient.MFI_SIGN_TIMEOUT_MS}ms)")
+            val r = runCatching { relayMfi("create_signature") { it.mfiSign(digest) } }.getOrElse {
+                zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay sign: transport/readiness failure")
+                relayFail(it.message ?: "sign transport failure")
             }
             if (!r.ok) {
                 zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("sign: ${r.statusName()}")
@@ -861,10 +914,9 @@ class OcbmProbe(context: Context) {
         // behind another. The phone-side request timeout it has to fit inside is unmeasured (nearest
         // sourced figure is CarKit's disassembly-confirmed 30 s — see audit 4.8 verdict).
         override fun copyCertificateFast(): ByteArray {
-            val c = client ?: run { mfiLog.e("relay cert (fast) requested with no OCBM link"); throw java.io.IOException("no OCBM link") }
-            val r = c.mfiCertificate(4_000) ?: run {
-                zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay cert (fast): timeout")
-                relayFail("cert timeout (fast, 4000ms)")
+            val r = runCatching { relayMfi("copy_certificate_fast") { it.mfiCertificate(4_000) } }.getOrElse {
+                zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay cert (fast): transport/readiness failure")
+                relayFail(it.message ?: "fast cert transport failure")
             }
             if (!r.ok) {
                 zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay cert (fast): ${r.statusName()}")
@@ -873,10 +925,9 @@ class OcbmProbe(context: Context) {
             return r.payload
         }
         override fun createSignatureFast(digest: ByteArray): ByteArray {
-            val c = client ?: run { mfiLog.e("relay sign (fast) requested with no OCBM link"); throw java.io.IOException("no OCBM link") }
-            val r = c.mfiSign(digest, 4_000) ?: run {
-                zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay sign (fast): timeout")
-                relayFail("sign timeout (fast, 4000ms)")
+            val r = runCatching { relayMfi("create_signature_fast") { it.mfiSign(digest, 4_000) } }.getOrElse {
+                zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay sign (fast): transport/readiness failure")
+                relayFail(it.message ?: "fast sign transport failure")
             }
             if (!r.ok) {
                 zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay sign (fast): ${r.statusName()}")
@@ -983,6 +1034,9 @@ class OcbmProbe(context: Context) {
     }
 
     private fun stopLocked(quick: Boolean = false) {
+        // Fence in-flight relay calls before releasing the USB interface.
+        mfiReadyGeneration = 0L
+        linkGeneration++
         // Take a final pass FIRST: the most interesting box lines are usually the last ones, and
         // after client.stop() there is no link left to fetch them over. On the quick path the pull is
         // bounded — and skipped outright when the link is not subscribed, which is also how the

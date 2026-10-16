@@ -75,6 +75,8 @@ class CarPlayRx(
      * Runs on the dying pump thread: hand off, do not block.
      */
     var onSessionDown: (() -> Unit)? = null,
+    /** The phone's Bonjour name and Bluetooth address, learned before AirPlay SETUP. */
+    var onPhoneDiscovered: ((name: String, deviceId: String) -> Unit)? = null,
     /**
      * Fired once when [STALL_DIALS] consecutive connect-outs are accepted by the phone without it
      * ever dialling back. Argument is the dial count. See [noteDialAccepted] for what this means.
@@ -676,6 +678,24 @@ class CarPlayRx(
                 val host = withScope(raw)
                 val key = "${host.hostAddress}:${si.port}"
                 log.i("resolved '${si.serviceName}' -> $key")
+                // _carplay-ctrl TXT carries `id=<Bluetooth MAC>` on current iOS releases. Learn
+                // that alongside the Bonjour instance name so the Phones tab can label a bond
+                // before AirPlay SETUP (CT_PHONE_IDENT) completes. This is discovery only: the
+                // manager must not treat it as a connected/last-used phone.
+                val advertisedId =
+                    runCatching { si.attributes["id"] }
+                        .getOrNull()
+                        ?.toString(Charsets.UTF_8)
+                        ?.trim()
+                        .orEmpty()
+                val phoneName = si.serviceName.trim()
+                if (phoneName.isNotEmpty() && advertisedId.isNotEmpty()) {
+                    onPhoneDiscovered?.let { cb ->
+                        fenced("onPhoneDiscovered") { cb(phoneName, advertisedId) }
+                    }
+                } else {
+                    log.i("peer identity TXT incomplete: name='${si.serviceName}' id='${advertisedId.ifEmpty { "<absent>" }}'")
+                }
                 // The one unambiguous "an iPhone is here" line. A phone on br0 is NOT enough on its
                 // own (the hotspot is an ordinary saved network — see SessionSupervisor.onBtPhase);
                 // a resolvable _carplay-ctrl record is the phone saying it is ready for CarPlay.

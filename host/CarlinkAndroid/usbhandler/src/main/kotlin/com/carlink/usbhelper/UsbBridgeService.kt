@@ -1,8 +1,10 @@
 package com.carlink.usbhelper
 
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
@@ -10,11 +12,15 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.IBinder
+import android.os.Build
 import android.os.RemoteException
+import android.os.SystemClock
 import android.util.Log
 import com.carlink.usbbridge.IUsbBridge
 import com.carlink.usbbridge.IUsbBridgeCallback
 import com.carlink.usbbridge.UsbBridgeConstants
+import com.carlink.usbbridge.UsbBulkWriteLoop
+import com.carlink.usbbridge.UsbWriteAssembler
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.RejectedExecutionException
@@ -33,13 +39,32 @@ class UsbBridgeService : Service() {
     private val running = AtomicBoolean(false)
     private val generation = AtomicLong(0)
     private val nextTransferId = AtomicLong(1)
-    private val pendingWrites = ConcurrentHashMap<Long, ChunkAccumulator>()
+    private val pendingWrites = HashMap<Long, UsbWriteAssembler>()
+    private val pendingWritesLock = Any()
     private val writeLock = Any()
     private var connection: UsbDeviceConnection? = null
     private var input: UsbEndpoint? = null
     private var output: UsbEndpoint? = null
     private var claimedInterface: UsbInterface? = null
+    private var openedDeviceName: String? = null
     private var reader: Thread? = null
+    private val deliveryHighWaterLogged = AtomicBoolean(false)
+    private var detachReceiverRegistered = false
+
+    private val detachReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
+            @Suppress("DEPRECATION")
+            val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE) as? UsbDevice ?: return
+            val matches = synchronized(this@UsbBridgeService) { openedDeviceName == device.deviceName }
+            if (matches) {
+                val reason = "USB detach broadcast for ${device.deviceName}"
+                Log.w(TAG, reason)
+                emitState(UsbBridgeConstants.STATE_ERROR, reason)
+                closeDevice(reason)
+            }
+        }
+    }
 
     // USB reading and app-side protocol processing are isolated. The bounded, ordered queue prevents
     // a slow Binder client from stalling bulk IN indefinitely or accumulating unbounded frame data.
@@ -85,42 +110,96 @@ class UsbBridgeService : Service() {
             chunkCount: Int,
             totalLength: Int,
             data: ByteArray,
-        ): Boolean {
+        ): String {
+            val expectedChunks = maxOf(1, (totalLength + UsbBridgeConstants.CHUNK_SIZE - 1) / UsbBridgeConstants.CHUNK_SIZE)
             if (chunkCount !in 1..MAX_CHUNKS || chunkIndex !in 0 until chunkCount ||
-                totalLength !in 0..UsbBridgeConstants.MAX_MESSAGE_SIZE || data.size > UsbBridgeConstants.CHUNK_SIZE
-            ) return false
+                totalLength !in 0..UsbBridgeConstants.MAX_MESSAGE_SIZE || data.size > UsbBridgeConstants.CHUNK_SIZE ||
+                chunkCount != expectedChunks
+            ) return "invalid chunk geometry transfer=$transferId index=$chunkIndex count=$chunkCount total=$totalLength data=${data.size}"
 
-            val accumulator = pendingWrites.getOrPut(transferId) { ChunkAccumulator(chunkCount, totalLength) }
-            if (!accumulator.add(chunkIndex, data)) return false
-            if (!accumulator.complete()) return true
-            pendingWrites.remove(transferId)
-            val bytes = accumulator.join() ?: return false
-            val conn = connection ?: return false
-            val endpoint = output ?: return false
+            val bytes = synchronized(pendingWritesLock) {
+                val now = SystemClock.elapsedRealtime()
+                val expired = pendingWrites.filterValues { now - it.createdAtMs > UsbBridgeConstants.PENDING_WRITE_TTL_MS }.keys
+                expired.forEach { pendingWrites.remove(it) }
+                if (expired.isNotEmpty()) Log.w(TAG, "expired ${expired.size} incomplete OUT transfer(s)")
+
+                var accumulator = pendingWrites[transferId]
+                if (accumulator == null) {
+                    if (pendingWrites.size >= UsbBridgeConstants.MAX_PENDING_WRITES) {
+                        return "too many incomplete OUT transfers (${pendingWrites.size})"
+                    }
+                    accumulator = UsbWriteAssembler(chunkCount, totalLength, now)
+                    pendingWrites[transferId] = accumulator
+                } else if (accumulator.chunkCount != chunkCount || accumulator.totalLength != totalLength) {
+                    pendingWrites.remove(transferId)
+                    return "OUT transfer metadata changed for transfer=$transferId"
+                }
+                val addError = accumulator.add(chunkIndex, data)
+                if (addError != null) {
+                    pendingWrites.remove(transferId)
+                    return "$addError (transfer=$transferId)"
+                }
+                if (!accumulator.complete()) return ""
+                pendingWrites.remove(transferId)
+                accumulator.join() ?: return "assembled OUT length mismatch transfer=$transferId"
+            }
+
+            val token = generation.get()
             return synchronized(writeLock) {
-                if (!running.get()) return@synchronized false
-                var offset = 0
-                while (offset < bytes.size) {
-                    val count = minOf(WRITE_CHUNK, bytes.size - offset)
+                if (!running.get() || token != generation.get()) {
+                    return@synchronized "USB interface is not active (generation=$token current=${generation.get()} reading=${running.get()})"
+                }
+                val conn = connection ?: return@synchronized "USB connection missing (generation=$token)"
+                val endpoint = output ?: return@synchronized "bulk OUT endpoint missing (generation=$token)"
+                val deviceName = openedDeviceName ?: "unknown"
+                val interfaceId = claimedInterface?.id ?: -1
+                var exceptionDetail: String? = null
+                var failureElapsedMs = 0L
+                val failure = UsbBulkWriteLoop.writeAll(bytes.size, WRITE_CHUNK) { offset, count ->
                     val chunk = bytes.copyOfRange(offset, offset + count)
+                    val startedNs = System.nanoTime()
                     val written = try {
                         conn.bulkTransfer(endpoint, chunk, count, WRITE_TIMEOUT_MS)
                     } catch (t: Throwable) {
-                        Log.e(TAG, "bulk OUT threw", t)
+                        failureElapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+                        val reason = "bulk OUT threw ${t.javaClass.simpleName}: ${t.message ?: "no message"}"
+                        exceptionDetail = "$reason transfer=$transferId offset=$offset/${bytes.size} requested=$count generation=$token device=$deviceName interface=$interfaceId endpoint=0x${endpoint.address.toString(16)} elapsed=${failureElapsedMs}ms"
+                        Log.e(TAG, exceptionDetail, t)
                         -1
                     }
-                    if (written <= 0) {
-                        Log.e(TAG, "bulk OUT failed offset=$offset result=$written")
-                        return@synchronized false
+                    if (exceptionDetail == null) failureElapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+                    if (exceptionDetail == null && written in 1 until count) {
+                        Log.w(
+                            TAG,
+                            "bulk OUT partial progress transfer=$transferId offset=$offset/${bytes.size} requested=$count result=$written generation=$token device=$deviceName endpoint=0x${endpoint.address.toString(16)}",
+                        )
                     }
-                    offset += written
+                    written
                 }
-                true
+                if (failure != null) {
+                    if (exceptionDetail != null) return@synchronized exceptionDetail
+                    val reason = "bulk OUT ${failure.reason} transfer=$transferId offset=${failure.offset}/${bytes.size} requested=${failure.requested} result=${failure.result} generation=$token device=$deviceName interface=$interfaceId endpoint=0x${endpoint.address.toString(16)} elapsed=${failureElapsedMs}ms"
+                    Log.e(TAG, reason)
+                    return@synchronized reason
+                }
+                ""
             }
         }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onCreate() {
+        super.onCreate()
+        val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(detachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(detachReceiver, filter)
+        }
+        detachReceiverRegistered = true
+    }
 
     override fun onUnbind(intent: Intent?): Boolean {
         closeDevice("last client unbound")
@@ -129,13 +208,20 @@ class UsbBridgeService : Service() {
 
     override fun onDestroy() {
         closeDevice("service destroyed")
+        if (detachReceiverRegistered) {
+            runCatching { unregisterReceiver(detachReceiver) }
+            detachReceiverRegistered = false
+        }
         delivery.shutdownNow()
         super.onDestroy()
     }
 
     @Synchronized
     private fun openDevice(deviceName: String): Boolean {
-        if (running.get()) return connection != null && usb.deviceList.containsKey(deviceName)
+        if (connection != null) {
+            if (openedDeviceName == deviceName && usb.deviceList.containsKey(deviceName)) return true
+            closeDevice("replacing open USB device")
+        }
         val device = usb.deviceList[deviceName]
         if (device == null || !isAdapter(device)) {
             emitState(UsbBridgeConstants.STATE_ERROR, "OCBM adapter not found: $deviceName; devices=${describeDevices()}")
@@ -164,6 +250,7 @@ class UsbBridgeService : Service() {
         claimedInterface = endpoints.first
         input = endpoints.second
         output = endpoints.third
+        openedDeviceName = deviceName
         generation.incrementAndGet()
         emitState(UsbBridgeConstants.STATE_CONNECTED, "${device.vendorId.toString(16)}:${device.productId.toString(16)} ${device.deviceName}")
         return true
@@ -206,9 +293,13 @@ class UsbBridgeService : Service() {
                 if (count > 0) {
                     rapidFailures = 0
                     val data = buffer.copyOf(count)
+                    // Do not interpret a USB read as an OCBM message boundary. The app-side
+                    // Reassembler consumes this raw byte stream and handles split headers,
+                    // split payloads, and multiple frames coalesced across reads.
                     try {
                         delivery.execute {
                             if (running.get() && token == generation.get()) {
+                                val deliveredAt = System.nanoTime()
                                 callbacks.forEach { callback ->
                                     try {
                                         callback.onInboundData(data)
@@ -216,11 +307,25 @@ class UsbBridgeService : Service() {
                                         callbacks -= callback
                                     }
                                 }
+                                val callbackMs = (System.nanoTime() - deliveredAt) / 1_000_000
+                                if (callbackMs >= SLOW_DELIVERY_MS) {
+                                    val detail = "slow Binder delivery ${callbackMs}ms bytes=$count generation=$token"
+                                    Log.w(TAG, detail)
+                                    emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, detail)
+                                }
+                                if (delivery.queue.size < DELIVERY_HIGH_WATER) deliveryHighWaterLogged.set(false)
                             }
                         }
                     } catch (_: RejectedExecutionException) {
-                        reason = "USB-to-app delivery queue full"
+                        reason = "USB-to-app delivery queue full depth=${delivery.queue.size} capacity=${DELIVERY_QUEUE_CAPACITY} generation=$token"
+                        Log.e(TAG, reason)
                         break
+                    }
+                    val depth = delivery.queue.size
+                    if (depth >= DELIVERY_HIGH_WATER && deliveryHighWaterLogged.compareAndSet(false, true)) {
+                        val detail = "USB-to-app delivery queue high-water depth=$depth capacity=$DELIVERY_QUEUE_CAPACITY generation=$token"
+                        Log.w(TAG, detail)
+                        emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, detail)
                     }
                 } else {
                     val elapsedMs = (System.nanoTime() - started) / 1_000_000
@@ -266,8 +371,9 @@ class UsbBridgeService : Service() {
             claimedInterface = null
             input = null
             output = null
+            openedDeviceName = null
         }
-        pendingWrites.clear()
+        synchronized(pendingWritesLock) { pendingWrites.clear() }
         delivery.queue.clear()
         if (wasOpen) emitState(UsbBridgeConstants.STATE_DISCONNECTED, reason)
     }
@@ -305,28 +411,6 @@ class UsbBridgeService : Service() {
         return null
     }
 
-    private class ChunkAccumulator(private val count: Int, private val totalLength: Int) {
-        private val chunks = arrayOfNulls<ByteArray>(count)
-        fun add(index: Int, data: ByteArray): Boolean {
-            if (index !in chunks.indices || chunks[index] != null) return false
-            chunks[index] = data.copyOf()
-            return true
-        }
-        fun complete(): Boolean = chunks.all { it != null }
-        fun join(): ByteArray? {
-            if (!complete()) return null
-            val result = ByteArray(totalLength)
-            var offset = 0
-            for (chunk in chunks) {
-                val value = chunk ?: return null
-                if (offset + value.size > result.size) return null
-                value.copyInto(result, offset)
-                offset += value.size
-            }
-            return result.takeIf { offset == totalLength }
-        }
-    }
-
     companion object {
         private const val TAG = "UsbBridgeService"
         private const val VID_CARLINKIT = 0x1314
@@ -335,6 +419,9 @@ class UsbBridgeService : Service() {
         private const val READ_TIMEOUT_MS = 250
         private const val WRITE_TIMEOUT_MS = 2_000
         private const val WRITE_CHUNK = 16 * 1024
+        private const val DELIVERY_QUEUE_CAPACITY = 128
+        private const val DELIVERY_HIGH_WATER = 96
+        private const val SLOW_DELIVERY_MS = 100L
         private const val RAPID_FAILURE_MS = 10
         private const val RAPID_FAILURE_LIMIT = 50
         private const val RAPID_FAILURE_BACKOFF_MS = 20L

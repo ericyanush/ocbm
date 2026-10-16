@@ -10,5 +10,6 @@ interface IUsbBridge {
     void close();
     void registerCallback(IUsbBridgeCallback callback);
     void unregisterCallback(IUsbBridgeCallback callback);
-    boolean sendChunk(long transferId, int chunkIndex, int chunkCount, int totalLength, in byte[] data);
+    // Empty string means accepted; otherwise returns a diagnostic suitable for the app's log.
+    String sendChunk(long transferId, int chunkIndex, int chunkCount, int totalLength, in byte[] data);
 }

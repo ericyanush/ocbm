@@ -15,3 +15,8 @@
 # Xcode-bundled agent skills — regenerate with:
 #   xcrun agent skills export --output-dir "$PWD/.claude/skills" --replace-existing
 .claude/skills/
+host/CarlinkAndroid/.idea
+host/CarlinkAndroid/app/play
+host/CarlinkAndroid/car-system-stubs/bin
+host/CarlinkAndroid/usbhandler/debug
+host/CarlinkAndroid/usbhandler/release

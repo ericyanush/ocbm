@@ -196,6 +196,7 @@ class UsbBulkTransport(
                     val elapsedMs = (System.nanoTime() - t0) / 1_000_000
                     if (elapsedMs < 10) {
                         if (++rapidMinusOne >= 50) {
+                            lastError = "bulk IN returned rapid -1 x$rapidMinusOne (device removed or endpoint failed)"
                             log.e("read: rapid -1 x$rapidMinusOne — device gone, stopping")
                             SessionTrace.Board.failed(OcbmBoard.USB_READ, "rapid -1 x$rapidMinusOne — device gone (ENODEV): adapter unplugged, box rebooted, or gadget stalled")
                             break
@@ -207,6 +208,7 @@ class UsbBulkTransport(
                 log.e("read loop error (continuing): ${t.javaClass.simpleName}: ${t.message}")
                 readFailures++
                 if (readFailures >= 20) {
+                    lastError = "$readFailures consecutive read-loop errors: ${t.javaClass.simpleName}: ${t.message}"
                     log.e("read: too many consecutive errors — stopping")
                     SessionTrace.Board.failed(OcbmBoard.USB_READ, "$readFailures consecutive read-loop errors — last: ${t.javaClass.simpleName}: ${t.message}")
                     break

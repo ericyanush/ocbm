@@ -205,6 +205,17 @@ class MainActivity : Activity() {
             it.onBoxHealth = { f -> supervisor.onBoxHealth(f) }
             it.onPhoneIdent = { j -> onBoxPhoneIdent(j) }
             it.onProjMode = { m -> onBoxProjMode(m) }
+            it.onTransportLost = { generation, reason ->
+                emit("adapter generation=$generation lost: $reason; MFi relay fenced")
+                // Do not tear down an already-streaming Wi-Fi CarPlay session just because its
+                // side-channel USB link blinked. Before session-up, however, stop discovery/nudges
+                // until a fresh HELLO + MFi proof + HCI-ready attach completes.
+                runAsync {
+                    if (ocbmProbe !== it) return@runAsync
+                    if (cpRx?.sessionLive != true) cpRx?.pauseDiscovery()
+                    supervisor.onBoxLost()
+                }
+            }
             ocbmProbe = it
         }
 
@@ -632,6 +643,12 @@ class MainActivity : Activity() {
                 setStatus(LinkState.FAILED, "adapter linked, but radio subscription did not start")
                 return r
             }
+            if (!r.mfiProven) {
+                val why = "adapter subscribed, but MFi authentication was not proven; phone discovery remains paused"
+                emit("!! $why — refusing to nudge the phone into a receiver that cannot complete auth-setup")
+                setStatus(LinkState.FAILED, why)
+                return r
+            }
             val probe = ocbm()
             var hciReady = probe.awaitHciPresent(HCI_READY_WAIT_MS)
             if (!hciReady && !probe.hasSeenHci()) {
@@ -930,7 +947,7 @@ class MainActivity : Activity() {
             // launch path (it is the one carrying the implicit USB grant), that was the DEFAULT
             // cold-start behaviour. Device-observed 2026-08-27.
             ocbm()
-            if (cpRx == null) toggleCarPlayRx()
+            if (cpRx == null) toggleCarPlayRx(pauseDiscoveryInitially = true)
             // A re-attach while CarPlay is streaming must not re-take the radio-wake edge. runAll()
             // sends CT_STOP then a fresh CT_SUBSCRIBE, flipping host_present 0->1, which makes the
             // box bring its BT stack up underneath a live session. CarPlay does not depend on BT once
@@ -950,7 +967,16 @@ class MainActivity : Activity() {
                 supervisor.onBoxRelinked()
             } else {
                 val r = ocbm().runAll()
-                if (r.helloOk) supervisor.onBoxLinked(r.mfiProven)
+                if (r.helloOk) {
+                    if (r.mfiProven) {
+                        val ready = ocbm().awaitHciPresent(HCI_READY_WAIT_MS)
+                        if (ready) {
+                            cpRx?.resumeDiscovery()
+                            emit("adapter generation re-established; HCI ready and phone discovery resumed")
+                        } else emit("adapter link restored, but HCI readiness timed out; phone discovery remains paused")
+                    } else emit("adapter link returned without MFi proof; phone discovery remains paused")
+                    supervisor.onBoxLinked(r.mfiProven)
+                }
                 else emit("USB attach: link NOT established — ${r.failureDetail()}")
             }
         }

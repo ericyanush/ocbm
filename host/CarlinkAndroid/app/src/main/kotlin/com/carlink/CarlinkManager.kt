@@ -157,6 +157,8 @@ class CarlinkManager(
 
         private const val USB_WAIT_PERIOD_MS = 3000L
 
+        private val BLUETOOTH_MAC = Regex("^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
         private const val MAX_RECONNECT_ATTEMPTS = 5
 
         // Wake lock: safety timeout per acquire, and how often the refresh job renews it.
@@ -1084,6 +1086,9 @@ class CarlinkManager(
                 CarPlayInfoCustomizer.withReturnIcon(source, returnIconImages, returnIconLabel)
             },
         )
+        receiver.onPhoneDiscovered = { name, deviceId ->
+            scope.launch { rememberDiscoveredPhone(name, deviceId) }
+        }
         logInfo("[CP_RX] using shared GM /info with Carlink return-icon customization", tag = Logger.Tags.ADAPTR)
         receiver.onSessionUp = {
             carPlaySessionGeneration.incrementAndGet()
@@ -2406,6 +2411,46 @@ class CarlinkManager(
     // ==================== Metadata ====================
 
     /**
+     * Learn a paired phone's display name from its `_carplay-ctrl` Bonjour TXT record.
+     *
+     * This arrives before the AirPlay SETUP identity (`CT_PHONE_IDENT`) and therefore also covers
+     * phones that have paired and reached the Wi-Fi handoff but have not completed projection yet.
+     * It is only a name update: discovery must not mark the phone connected or change last-connected
+     * ordering. The TXT `id` is the phone's Bluetooth address, which joins it to the bond list.
+     */
+    private fun rememberDiscoveredPhone(name: String, deviceId: String) {
+        val cleanName = name.trim()
+        val mac = deviceId.trim().lowercase()
+        if (cleanName.isEmpty() || !BLUETOOTH_MAC.matches(mac)) {
+            logInfo("[PHONE] ignored incomplete Bonjour identity name='$cleanName' id='$deviceId'", tag = Logger.Tags.PHONE)
+            return
+        }
+        phoneNames[mac] = cleanName
+        val now = System.currentTimeMillis()
+        knownStore?.update { snap ->
+            val prev = snap.devices[mac]
+            snap.copy(
+                devices =
+                    snap.devices +
+                        (
+                            mac to
+                                KnownDevice(
+                                    mac = mac,
+                                    name = cleanName,
+                                    model = prev?.model,
+                                    osName = prev?.osName,
+                                    osVersion = prev?.osVersion,
+                                    firstSeenMs = prev?.firstSeenMs ?: now,
+                                    lastConnectedMs = prev?.lastConnectedMs,
+                                )
+                        ),
+            )
+        }
+        logInfo("[PHONE] Bonjour identity: $cleanName ($mac)", tag = Logger.Tags.PHONE)
+        rebuildDeviceList()
+    }
+
+    /**
      * `CT_PHONE_IDENT` — the connected phone's own description of itself.
      *
      * Both fields earn their place: `name` is what the user set in Settings > General > About > Name,
@@ -2430,10 +2475,9 @@ class CarlinkManager(
         _connectedBtMac = mac
         if (name.isNotEmpty()) phoneNames[mac] = name
 
-        // Remember it. This is the ONLY source of a device name anywhere in the system — the box's
-        // link-key record has no room for one — so without this the list reverts to bare hex after
-        // every app restart. Also lifts any forget-suppression: a user who forgets and re-pairs
-        // inside the window must not stare at an empty list.
+        // Remember it, enriching any earlier name learned from Bonjour with AirPlay model/OS
+        // metadata and a real last-connected timestamp. Also lifts forget-suppression: a user who
+        // forgets and re-pairs inside the window must not stare at an empty list.
         val now = System.currentTimeMillis()
         synchronized(deviceListLock) { recentlyForgotten.remove(mac) }
         knownStore?.update { snap ->
