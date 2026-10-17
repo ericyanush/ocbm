@@ -134,6 +134,8 @@ class OcbmClient(
      * ordering.
      */
     var onBtPhase: ((Byte) -> Unit)? = null
+    /** Accepted Bluetooth/iAP2 peer, available before the later AirPlay phone identity. */
+    var onActiveBtPeer: ((String) -> Unit)? = null
     /** `CT_BOX_HEALTH` — the box's own readiness bitmask, pushed on change. */
     var onBoxHealth: ((Int) -> Unit)? = null
 
@@ -359,6 +361,11 @@ class OcbmClient(
                     noteBoxHealth(prev, f)
                     onBoxHealth?.invoke(f)
                 }
+            }
+            Ocbm.CT_ACTIVE_BT_PEER -> {
+                val mac = if (pl.size > 1) String(pl, 1, pl.size - 1, Charsets.US_ASCII).trim().uppercase() else ""
+                log.i(if (mac.isEmpty()) "<< ACTIVE_BT_PEER unknown/cleared" else "<< ACTIVE_BT_PEER $mac")
+                onActiveBtPeer?.invoke(mac)
             }
             Ocbm.CT_BT_PHASE -> {
                 if (pl.size >= 2) {

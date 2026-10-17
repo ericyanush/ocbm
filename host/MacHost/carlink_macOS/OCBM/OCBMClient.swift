@@ -158,6 +158,8 @@ final class OCBMClient: @unchecked Sendable {
     /// Bluetooth/iAP2 handshake progress (CH_CTRL `ctBtPhase`, one of `OCBM.btp*`). Advisory — never
     /// gate on ordering. Same emission discipline as `onBoxHealth`. Invoked on the transport read queue.
     var onBtPhase: ((UInt8) -> Void)?
+    /// Accepted Bluetooth/iAP2 peer, emitted before the phone's AirPlay identity is available.
+    var onActiveBtPeer: ((String?) -> Void)?
     /// Identity of the connected phone (CH_CTRL `ctPhoneIdent`); `nil` = no identity yet / cleared.
     /// Same emission discipline as `onBoxHealth`. Invoked on the transport read queue.
     var onPhoneIdent: ((PhoneIdent?) -> Void)?
@@ -1003,6 +1005,15 @@ final class OCBMClient: @unchecked Sendable {
             let phase = payload[1]
             log.info("[box] bt phase: \(OCBM.btPhaseName(phase), privacy: .public)")
             onBtPhase?(phase)
+        case OCBM.ctActiveBtPeer:
+            let mac = String(bytes: payload.dropFirst(), encoding: .ascii)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let valid = mac.flatMap {
+                $0.range(of: "^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$", options: .regularExpression) != nil
+                    ? $0.uppercased() : nil
+            }
+            log.info("[box] active Bluetooth peer: \(valid ?? "unknown", privacy: .public)")
+            onActiveBtPeer?(valid)
         case OCBM.ctPhoneIdent:
             // [ctPhoneIdent][utf8 JSON | empty] — who the connected phone is; empty payload = cleared.
             let body = Array(payload.dropFirst())

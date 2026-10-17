@@ -140,6 +140,7 @@ class OcbmProbe(context: Context) {
     var onSessionEvent: ((Byte) -> Unit)? = null
     var onPairingCode: ((String) -> Unit)? = null
     var onBtPhase: ((Byte) -> Unit)? = null
+    var onActiveBtPeer: ((String) -> Unit)? = null
     /** `CT_BOX_HEALTH` — the box's readiness bitmask, pushed on change (not polled). */
     var onBoxHealth: ((Int) -> Unit)? = null
     var onPhoneIdent: ((String) -> Unit)? = null
@@ -577,6 +578,7 @@ class OcbmProbe(context: Context) {
         // a caller wiring them afterwards would miss every phase up to WIFI_HANDOFF — precisely the
         // window the events exist to explain.
         c.onBtPhase = { p -> onBtPhase?.invoke(p) }
+        c.onActiveBtPeer = { mac -> onActiveBtPeer?.invoke(mac) }
         c.onBoxHealth = { f -> onBoxHealth?.invoke(f) }
         c.onPhoneIdent = { j -> onPhoneIdent?.invoke(j) }
         c.onProjMode = { m -> onProjMode?.invoke(m) }

@@ -211,6 +211,10 @@ pub const CT_BOX_HEALTH: u8 = 0x1A; // box->host [CT_BOX_HEALTH][flags u8] -> th
                                     //
                                     // Advisory, like its siblings: an unknown bit means "something the host
                                     // does not model", never a reason to refuse a session.
+pub const CT_ACTIVE_BT_PEER: u8 = 0x1D; // box->host [UTF-8 Bluetooth MAC | empty] -> the phone
+                                        // accepted by the active RFCOMM/iAP2 session. Sent before
+                                        // BTP_WIFI_HANDOFF so a host can pin discovery/nudge to that
+                                        // peer rather than choosing among every advertised iPhone.
 pub const BH_HCI_PRESENT: u8 = 0x01; // hci0 exists AND is UP (HCI_UP in /sys/class/bluetooth/hci0/flags).
                                      // CORRECTED 2026-08-29: this used to test only that the sysfs node
                                      // EXISTED, which survives `hciconfig hci0 down` (wireless_down leaves
@@ -1073,6 +1077,8 @@ mod tests {
         }
         // CT_LOG_CTL extends the CT_* space to 0x1B; docs/carplay/01_OCBM_PROTOCOL.md quotes that range.
         assert_eq!(CT_LOG_CTL, 0x1B);
+        assert_eq!(CT_ACTIVE_BT_PEER, 0x1D);
+        assert_ne!(CT_ACTIVE_BT_PEER, CT_LOG_CTL);
         assert_ne!(CT_LOG_CTL, CT_BOX_HEALTH);
         assert_eq!(LOG_F_DROPPED & LOG_F_TRUNCATED, 0);
     }
@@ -1096,7 +1102,7 @@ mod tests {
 
     #[test]
     fn ct_box_health_does_not_collide_with_the_ctrl_space() {
-        // docs/carplay/01_OCBM_PROTOCOL.md "Self-describing streams" now says the CT_* space is 0x01-0x1A.
+        // docs/carplay/01_OCBM_PROTOCOL.md defines the peer identity through 0x1D.
         assert_eq!(CT_BOX_HEALTH, 0x1A);
         assert_ne!(CT_BOX_HEALTH, CT_PROJ_MODE);
         assert_ne!(CT_BOX_HEALTH, CT_BT_PHASE);

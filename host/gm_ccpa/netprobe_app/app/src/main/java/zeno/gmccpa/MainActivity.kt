@@ -164,6 +164,8 @@ class MainActivity : Activity() {
                 mfiRelay = ocbmProbe?.mfiRelay(),
                 peerFile = java.io.File(filesDir, "carplay_peers.bin").absolutePath
             )
+            SessionHolder.activeBluetoothPeer?.let(rx::setActiveBluetoothPeer)
+            SessionHolder.bluetoothPhase?.let(rx::setBluetoothPhase)
             bindReceiver(rx)
             cpRx = rx; rx.start(pauseDiscoveryInitially)
             // The receiver coming up is the start of the app's session, so the periodic status
@@ -199,6 +201,14 @@ class MainActivity : Activity() {
             it.onSessionEvent = { sev -> onBoxSessionEvent(sev) }
             it.onPairingCode = { code -> onBoxPairingCode(code) }
             it.onBtPhase = { p -> onBoxBtPhase(p) }
+            it.onActiveBtPeer = { mac ->
+                val normalized = mac.trim().uppercase().takeIf { value -> value.isNotEmpty() }
+                if (normalized != null) SessionHolder.activeBluetoothPeer = normalized
+                else if (SessionHolder.bluetoothPhase != Ocbm.BTP_WIFI_HANDOFF.toInt()) {
+                    SessionHolder.activeBluetoothPeer = null
+                }
+                cpRx?.setActiveBluetoothPeer(mac)
+            }
             // The box's own readiness, pushed on change. This is the half of "both sides green" that
             // did not exist before: MGMT_INFO is a snapshot you have to ask for, and nothing asked
             // after bring-up.
@@ -278,6 +288,12 @@ class MainActivity : Activity() {
      * never gate the [LinkState] machine on a particular phase arriving or arriving in order.
      */
     private fun onBoxBtPhase(phase: Byte) {
+        val value = phase.toInt() and 0xFF
+        SessionHolder.bluetoothPhase = value
+        if (value == Ocbm.BTP_IDLE.toInt() || value == Ocbm.BTP_PAIR_REJECTED.toInt()) {
+            SessionHolder.activeBluetoothPeer = null
+        }
+        cpRx?.setBluetoothPhase(value)
         SessionSummary.current()?.onBtPhase(phase)
         ui.setDetail("Bluetooth: ${Ocbm.btpName(phase)}")
         // BTP_WIFI_HANDOFF in particular is the only trustworthy "a CarPlay connect is coming" signal
@@ -1354,6 +1370,8 @@ class MainActivity : Activity() {
 object SessionHolder {
     @Volatile var cpRx: CarPlayRx? = null
     @Volatile var ocbmProbe: zeno.gmccpa.ocbm.OcbmProbe? = null
+    @Volatile var activeBluetoothPeer: String? = null
+    @Volatile var bluetoothPhase: Int? = null
     /**
      * `elapsedRealtime` of the last `OcbmProbe.stop()` this process made, or 0. Process-scoped like the
      * probe it describes, because the settle it feeds (`MainActivity.restartSession`) is about the

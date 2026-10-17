@@ -133,6 +133,7 @@ fn ct_name(op: u8) -> &'static str {
         p::CT_PHONE_IDENT => "PHONE_IDENT",
         p::CT_PROJ_MODE => "PROJ_MODE",
         p::CT_BOX_HEALTH => "BOX_HEALTH",
+        p::CT_ACTIVE_BT_PEER => "ACTIVE_BT_PEER",
         _ => "?",
     }
 }
@@ -275,6 +276,10 @@ fn main() {
                         println!("CTRL BOX_HEALTH 0x{:02x}{rep}", pl[1])
                     }
                     p::CT_BT_PHASE if l >= 2 => println!("CTRL BT_PHASE {}{rep}", pl[1]),
+                    p::CT_ACTIVE_BT_PEER => println!(
+                        "CTRL ACTIVE_BT_PEER {}{rep}",
+                        String::from_utf8_lossy(&pl[1..])
+                    ),
                     p::CT_PROJ_MODE if l >= 2 => println!("CTRL PROJ_MODE {}{rep}", pl[1]),
                     p::CT_SESSION_EVENT if l >= 2 => {
                         println!("CTRL SESSION_EVENT {}{rep}", pl[1])

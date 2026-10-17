@@ -132,7 +132,7 @@ fn rfcomm_connect(
 fn rfcomm_accept(
     channel: u8,
     shutdown: &AtomicBool,
-) -> std::io::Result<Option<std::fs::File>> {
+) -> std::io::Result<Option<(std::fs::File, [u8; 6])>> {
     if rfcomm_uspace::selected() {
         rfcomm_uspace::accept_one(channel, shutdown)
     } else {
@@ -404,7 +404,7 @@ fn run_active_session(
             break;
         }
         match rfcomm_accept(RFCOMM_CHANNEL, &t) {
-            Ok(Some(sock)) => {
+            Ok(Some((sock, peer))) => {
                 log("RFCOMM client connected -- starting iAP2 handshake");
                 // Claim the single-session slot ATOMICALLY (compare_exchange, not a plain store) so the
                 // accept path and the Model-B reconnect path can never run two concurrent bt_driver::run
@@ -417,15 +417,13 @@ fn run_active_session(
                 // NB `_claim`, not `_`: `let _ = ...` drops the guard IMMEDIATELY and would release
                 // the claim before the driver even starts.
                 let Some(_claim) =
-                    control::SessionClaim::try_claim(&accept_active, &accept_ctrl, None)
+                    control::SessionClaim::try_claim(&accept_active, &accept_ctrl, Some(peer))
                 else {
                     log("session already active (reconnect in progress) -- dropping inbound connect");
                     continue;
                 };
-                // The peer bdaddr is not published here: the accept path is handed an already-open
-                // socket. `status.active` is true regardless, which is what the app gates on — and
-                // getting THAT wrong is what made the device screen offer Forget for the phone that
-                // was actively projecting.
+                // `accept_one` captures the remote bdaddr from accept(2), so publish the exact
+                // iAP2 peer before authentication/handoff phases reach the host.
                 bt_driver::run(sock, &rfcomm_name, &t);
                 log("RFCOMM session ended");
             }
@@ -473,9 +471,9 @@ fn run_active_session(
                 break;
             }
             match rfcomm_accept(AA_RFCOMM_CHANNEL, &t) {
-                Ok(Some(mut sock)) => {
+                Ok(Some((mut sock, peer))) => {
                     let Some(_claim) =
-                        control::SessionClaim::try_claim(&aa_active, &aa_ctrl, None)
+                        control::SessionClaim::try_claim(&aa_active, &aa_ctrl, Some(peer))
                     else {
                         log("AA: session already active -- dropping inbound connect");
                         continue;
@@ -555,7 +553,7 @@ fn run_active_session(
                     break;
                 }
                 match rfcomm_accept(channel, &t) {
-                    Ok(Some(mut sock)) => {
+                    Ok(Some((mut sock, _peer))) => {
                         log(&format!(
                             "{}: the phone connected to our headset channel {channel}",
                             path.as_str()

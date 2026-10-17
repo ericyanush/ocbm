@@ -190,6 +190,9 @@ object Ocbm {
     // created, while OCBM, MFi and CT_SUBSCRIBE all still report success.
     const val CT_BOX_HEALTH: Byte = 0x1A
 
+    /** Box→host Bluetooth peer accepted by the active iAP2 RFCOMM session (empty = unknown). */
+    const val CT_ACTIVE_BT_PEER: Byte = 0x1D
+
     const val BH_HCI_PRESENT: Int = 0x01
     const val BH_SSP: Int = 0x02
     const val BH_IAP2D: Int = 0x04

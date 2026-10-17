@@ -107,6 +107,9 @@ class OcbmClient(
      */
     var onPhoneIdentity: ((String) -> Unit)? = null
 
+    /** Exact Bluetooth peer whose iAP2 RFCOMM session the adapter accepted; empty clears it. */
+    var onActiveBtPeer: ((String) -> Unit)? = null
+
     /**
      * Which projection transport OWNS the box right now (CT_PROJ_MODE, one of `PM_*`). Mirrors the
      * box's single-owner arbitration flag; emitted on change and re-emitted to every fresh SUBSCRIBE,
@@ -449,6 +452,11 @@ class OcbmClient(
                 lastPhoneIdentity = json
                 log.i(if (json.isEmpty()) "<< PHONE_IDENT cleared" else "<< PHONE_IDENT $json")
                 onPhoneIdentity?.invoke(json)
+            }
+            Ocbm.CT_ACTIVE_BT_PEER -> {
+                val mac = if (pl.size > 1) String(pl, 1, pl.size - 1, Charsets.US_ASCII).trim().uppercase() else ""
+                log.i(if (mac.isEmpty()) "<< ACTIVE_BT_PEER cleared" else "<< ACTIVE_BT_PEER $mac")
+                onActiveBtPeer?.invoke(mac)
             }
             Ocbm.CT_BT_PHASE -> {
                 if (pl.size >= 2) {

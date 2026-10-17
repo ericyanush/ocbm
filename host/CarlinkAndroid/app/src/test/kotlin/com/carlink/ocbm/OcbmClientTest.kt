@@ -291,6 +291,19 @@ class OcbmClientTest {
         assertEquals(Ocbm.BTP_WIFI_HANDOFF, c.lastBtPhase)
     }
 
+    @Test
+    fun `CT_ACTIVE_BT_PEER delivers the adapter selected phone before AirPlay identity`() {
+        val t = FakeTransport()
+        val c = newClient(t)
+        val seen = ArrayList<String>()
+        c.onActiveBtPeer = { seen.add(it) }
+
+        t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_ACTIVE_BT_PEER) + "04:41:A5:B8:26:B1".toByteArray())
+        t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_ACTIVE_BT_PEER))
+
+        assertEquals(listOf("04:41:A5:B8:26:B1", ""), seen)
+    }
+
     /** An unknown phase must count as progress, never as an error — the box may add values. */
     @Test
     fun `an unknown BT phase is still delivered`() {

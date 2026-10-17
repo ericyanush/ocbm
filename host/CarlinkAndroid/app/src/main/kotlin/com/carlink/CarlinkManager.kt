@@ -404,8 +404,10 @@ class CarlinkManager(
     // One transport + one client PER SESSION, by contract: OcbmClient.stop() is terminal and
     // UsbBulkTransport has no reopen, so reconnecting means constructing a fresh pair. Both are
     // cheap — neither holds a Context or native resources beyond the claimed interface.
-    private var transport: UsbBulkTransport? = null
+    @Volatile private var transport: UsbBulkTransport? = null
     private var client: OcbmClient? = null
+    /** Invalidates delayed detach/error work and MFi callbacks from retired sessions. */
+    private val connectionGeneration = AtomicLong(0)
 
     private val ocbmLog = ProbeLog.sub("ocbm")
     private val usbLog = ProbeLog.sub("usb")
@@ -528,6 +530,11 @@ class CarlinkManager(
     /** Loopback ingress from the native AirPlay receiver, started only for an armed media session. */
     @Volatile private var carPlaySocketBridge: CarPlaySocketMediaBridge? = null
     @Volatile private var carPlayReceiver: CarPlayRx? = null
+    // OCBM can replay the active Bluetooth peer/phase immediately after SUBSCRIBE, before the
+    // Wi-Fi receiver has finished constructing. Retain that snapshot so the receiver starts with
+    // the correct phone instead of falling back to whichever Bonjour result arrives first.
+    @Volatile private var adapterActiveBtPeer: String? = null
+    @Volatile private var adapterBtPhase: Int? = null
     @Volatile private var lastTouchRoute: String? = null
     private var lastTouchContactCount = 0
     @Volatile private var carPlayMicUplink: MicUplink? = null
@@ -941,11 +948,13 @@ class CarlinkManager(
      */
     private suspend fun acquireTransport(): UsbBulkTransport? {
         val t = UsbBulkTransport(context, usbLog)
+        transport = t
 
         if (!t.connect()) {
             val detail = t.lastError ?: "USB helper unavailable"
             logError("USB helper bind failed: $detail", tag = Logger.Tags.USB)
             t.stop()
+            if (transport === t) transport = null
             handleFailedStart("USB helper unavailable: $detail")
             return null
         }
@@ -955,11 +964,14 @@ class CarlinkManager(
             val detail = t.lastError ?: "Adapter not found or helper grant unavailable"
             logError("Failed to find/open the OCBM adapter: $detail", tag = Logger.Tags.USB)
             t.stop()
+            if (transport === t) transport = null
             handleFailedStart(detail)
             return null
         }
         if (released) {
             logWarn("[LIFECYCLE] released during device discovery — abandoning start", tag = Logger.Tags.ADAPTR)
+            t.stop()
+            if (transport === t) transport = null
             return null
         }
 
@@ -968,12 +980,14 @@ class CarlinkManager(
             val detail = t.lastError ?: "USB helper could not claim the adapter"
             logError("Failed to claim the adapter's USB interface: $detail", tag = Logger.Tags.USB)
             t.stop()
+            if (transport === t) transport = null
             handleFailedStart(detail)
             return null
         }
         return if (released) {
             logWarn("[LIFECYCLE] released during USB open — closing and abandoning", tag = Logger.Tags.ADAPTR)
             t.stop()
+            if (transport === t) transport = null
             null
         } else {
             t
@@ -1000,6 +1014,8 @@ class CarlinkManager(
         // CONNECTING isn't immediately stopped by the teardown's DISCONNECTED transition.
         if (client != null) stopImpl()
 
+        val generation = connectionGeneration.incrementAndGet()
+
         setState(State.CONNECTING)
         setStatusText("Searching for adapter...")
 
@@ -1011,14 +1027,14 @@ class CarlinkManager(
         // host and should warm-reuse the box's live session, whereas a new process must force a re-arm.
         c.instanceNonce = instanceNonce
         client = c
-        wireClientCallbacks(c)
+        wireClientCallbacks(c, generation)
         c.start()
 
         // CT_HELLO, retransmitted until ACK. Failure here is Pattern A's trigger — keep the
         // "no initial response" substring, which remote log filters match on.
         setStatusText("Connecting to adapter...")
         if (!c.hello()) {
-            handleError("no initial response — no CT_HELLO_ACK from the adapter")
+            handleError("no initial response — no CT_HELLO_ACK from the adapter", generation)
             return
         }
 
@@ -1030,7 +1046,7 @@ class CarlinkManager(
         // THE APP IS THE IGNITION: this is the presence latch that brings the box's radios up.
         setStatusText("Starting projection...")
         if (!c.subscribe(VehicleConfigYaml.renderBytes(vehicleConfigSpec(hotspot)))) {
-            handleError("usb — CT_SUBSCRIBE write failed")
+            handleError("usb — CT_SUBSCRIBE write failed", generation)
             return
         }
         c.startHeartbeat()
@@ -1038,12 +1054,12 @@ class CarlinkManager(
         // The adapter remains the Bluetooth/MFi coprocessor. The phone's Wi-Fi CarPlay control
         // and A/V sessions terminate in this app, using gm_ccpa's receiver and Carlink's media
         // pipes. SUBSCRIBE first so the serialized CH_MFI relay is available to pair-verify.
-        startCarPlayReceiver(c)
+        startCarPlayReceiver(c, generation)
 
         setStatusText("Waiting for phone...")
     }
 
-    private fun startCarPlayReceiver(owner: OcbmClient) {
+    private fun startCarPlayReceiver(owner: OcbmClient, ownerGeneration: Long) {
         if (carPlayReceiver != null) return
         NetworkDiagnostics.start(context)
         runCatching {
@@ -1055,6 +1071,9 @@ class CarlinkManager(
         }.onFailure { logWarn("[CP_RX] unable to acquire mDNS multicast lock: ${it.message}", tag = Logger.Tags.ADAPTR) }
         val relay = object : MfiRelay {
             override fun copyCertificate(): ByteArray {
+                check(client === owner && connectionGeneration.get() == ownerGeneration) {
+                    "Stale CarPlay receiver requested MFi certificate from a retired session"
+                }
                 val response = owner.mfiCertificate()
                     ?: throw IllegalStateException("OCBM CH_MFI certificate request had no usable reply")
                 if (response.status != Mfi.STATUS_OK) {
@@ -1066,6 +1085,9 @@ class CarlinkManager(
             }
 
             override fun createSignature(digest: ByteArray): ByteArray {
+                check(client === owner && connectionGeneration.get() == ownerGeneration) {
+                    "Stale CarPlay receiver requested MFi signature from a retired session"
+                }
                 val response = owner.mfiSign(digest)
                     ?: throw IllegalStateException("OCBM CH_MFI signature request had no usable reply")
                 if (response.status != Mfi.STATUS_OK) {
@@ -1170,6 +1192,8 @@ class CarlinkManager(
         }
         lastTouchRoute = null
         lastTouchContactCount = 0
+        adapterActiveBtPeer?.let(receiver::setActiveBluetoothPeer)
+        adapterBtPhase?.let(receiver::setBluetoothPhase)
         carPlayReceiver = receiver
         receiver.start()
         logInfo("[CP_RX] wireless CarPlay receiver started on control port 7011", tag = Logger.Tags.ADAPTR)
@@ -1247,6 +1271,9 @@ class CarlinkManager(
         reboot: Boolean = false,
         preserveEscalation: Boolean = false,
     ) {
+        // Invalidate receiver/MFi work before stopping the receiver and USB pipe. Native control
+        // callbacks can already be queued on another thread when teardown begins.
+        connectionGeneration.incrementAndGet()
         logDebug("[LIFECYCLE] stop()", tag = Logger.Tags.VIDEO)
         cancelDelayedKeyframe()
         cancelReconnect()
@@ -1856,13 +1883,25 @@ class CarlinkManager(
      * Handle USB device detachment, for immediate detection of a physical unplug rather than
      * waiting for transfer errors.
      */
-    fun onUsbDeviceDetached() {
-        logWarn("[USB] Device detached broadcast received", tag = Logger.Tags.USB)
+    fun onUsbDeviceDetached(deviceName: String) {
+        val active = transport
+        val selectedPath = active?.activeDeviceName
+        logWarn("[USB] Detach broadcast path=$deviceName selectedPath=$selectedPath", tag = Logger.Tags.USB)
+        if (active == null || selectedPath == null) {
+            // During discovery/open, the scanner will observe the current enumeration itself.
+            // A pathless detach must not abort acquisition of a replacement enumeration.
+            logInfo("[USB] Ignoring detach with no active selected device path", tag = Logger.Tags.USB)
+            return
+        }
+        if (deviceName != selectedPath) {
+            logInfo("[USB] Ignoring stale detach for $deviceName; active adapter is $selectedPath", tag = Logger.Tags.USB)
+            return
+        }
         if (state == State.DISCONNECTED) {
             logInfo("[USB] Already disconnected, ignoring detach", tag = Logger.Tags.USB)
             return
         }
-        handleError("USB device physically disconnected")
+        handleError("USB device physically disconnected ($deviceName)")
     }
 
     // ==================== Video lifecycle ====================
@@ -2112,7 +2151,7 @@ class CarlinkManager(
      * Wire [c]'s callbacks. Every one of them fires on the OCBM read thread or a client-owned
      * thread, never main — so anything touching Android state hops through [scope].
      */
-    private fun wireClientCallbacks(c: OcbmClient) {
+    private fun wireClientCallbacks(c: OcbmClient, ownerGeneration: Long) {
         c.onLanesArmed = { lanes -> onLanesArmed(lanes) }
         c.onLanesRetired = { onLanesRetired() }
 
@@ -2160,8 +2199,23 @@ class CarlinkManager(
         }
 
         c.onBtPhase = { phase ->
+            // Discovery can contain several phones on the truck hotspot. Only allow a connect-out
+            // after Wi-Fi handoff, and keep CarPlayRx synchronized with the adapter's phase.
+            val value = phase.toInt() and 0xFF
+            adapterBtPhase = value
+            if (value == Ocbm.BTP_IDLE.toInt() || value == Ocbm.BTP_PAIR_REJECTED.toInt()) adapterActiveBtPeer = null
+            carPlayReceiver?.setBluetoothPhase(value)
             val text = btPhaseText(phase)
             if (text != null) scope.launch { if (state != State.STREAMING) setStatusText(text) }
+        }
+
+        c.onActiveBtPeer = { mac ->
+            // This identity is captured by the adapter from the accepted iAP2 RFCOMM socket, so it
+            // is the authoritative target for the upcoming Wi-Fi/CarPlay handoff.
+            val normalized = mac.trim().uppercase().takeIf { it.isNotEmpty() }
+            if (normalized != null) adapterActiveBtPeer = normalized
+            else if (adapterBtPhase != Ocbm.BTP_WIFI_HANDOFF.toInt()) adapterActiveBtPeer = null
+            carPlayReceiver?.setActiveBluetoothPeer(mac)
         }
 
         wirePairingCode(c)
@@ -2190,7 +2244,7 @@ class CarlinkManager(
 
         // FATAL only. A box-side SEV_HOST_GONE is recoverable and the client's own backoff
         // re-subscribes; tearing down on it would fight that recovery.
-        c.onLinkDead = { reason -> handleError("usb — link dead: $reason") }
+        c.onLinkDead = { reason -> handleError("usb — link dead: $reason", ownerGeneration) }
     }
 
     private fun onLanesArmed(lanes: OcbmAvLanes) {
@@ -2954,14 +3008,17 @@ class CarlinkManager(
      * a physical unplug fires it from two at once. The public entry posts under [lifecycleMutex]
      * so executions serialize and the blocking teardown runs on IO.
      */
-    private fun handleError(error: String) {
+    private fun handleError(error: String, expectedGeneration: Long = connectionGeneration.get()) {
         // Capture session identity AT POST TIME: the queued impl may run after a new session has
         // come up (fast unplug/replug where a new start() wins the mutex first). Without this, a
         // stale error would tear down a healthy session.
         val erroredClient = client
+        val erroredTransport = transport
         scope.launch {
             lifecycleMutex.withLock {
-                withContext(Dispatchers.IO) { handleErrorImpl(error, erroredClient) }
+                withContext(Dispatchers.IO) {
+                    handleErrorImpl(error, erroredClient, erroredTransport, expectedGeneration)
+                }
             }
         }
     }
@@ -2969,9 +3026,19 @@ class CarlinkManager(
     private fun handleErrorImpl(
         error: String,
         erroredClient: OcbmClient?,
+        erroredTransport: UsbBulkTransport?,
+        expectedGeneration: Long,
     ) {
+        if (expectedGeneration != connectionGeneration.get()) {
+            logDebug("[ERROR] Stale error from connection generation $expectedGeneration, ignoring: $error", tag = Logger.Tags.ADAPTR)
+            return
+        }
         if (erroredClient != null && erroredClient !== client) {
             logDebug("[ERROR] Stale error from a replaced session, ignoring: $error", tag = Logger.Tags.ADAPTR)
+            return
+        }
+        if (erroredTransport !== transport) {
+            logDebug("[ERROR] Stale error from a replaced USB transport, ignoring: $error", tag = Logger.Tags.ADAPTR)
             return
         }
         // Dedup: a second report of the same physical failure arrives with everything already
@@ -2984,6 +3051,7 @@ class CarlinkManager(
         // distinguish "broken after a prior session" from "never connected".
 
         logError("Adapter error: $error", tag = Logger.Tags.ADAPTR)
+        connectionGeneration.incrementAndGet()
 
         cancelDelayedKeyframe()
         currentPhoneType = null

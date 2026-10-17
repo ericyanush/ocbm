@@ -597,6 +597,9 @@ struct Daemon {
     last_phone_ident_check: Option<std::time::Instant>,
     /// Last BT phase forwarded, so only CHANGES go on the wire.
     bt_phase: Option<u8>,
+    /// Accepted Bluetooth/iAP2 phone from btd, mirrored before handoff so hosts can target only it.
+    active_bt_peer: Option<String>,
+    last_active_bt_peer_check: Option<std::time::Instant>,
     /// Last `CT_BOX_HEALTH` bitmask sent. None until the first tick, and reset on a fresh SUBSCRIBE
     /// so a newly attached host is told the current health without waiting for it to change.
     box_health: Option<u8>,
@@ -632,6 +635,17 @@ const HB_UNSUBSCRIBED_NUDGE: Duration = Duration::from_secs(30);
 /// Where carplayd publishes the connected phone's identity (mirrors `receiver::session`'s constant;
 /// ocbmd does not link that crate).
 const PHONE_IDENT_FILE: &str = "/tmp/phone_identity";
+const ACTIVE_BT_PEER_FILE: &str = "/tmp/ocbm_active_bt_peer";
+
+fn valid_bt_mac(s: &str) -> bool {
+    let mut parts = s.split(':');
+    let valid = (0..6).all(|_| {
+        parts
+            .next()
+            .is_some_and(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+    });
+    valid && parts.next().is_none()
+}
 
 /// How long `/tmp/host_present` must read 0 for the supervisor to SEE the re-arm edge.
 ///
@@ -2051,6 +2065,8 @@ impl Daemon {
         }
         self.phone_tick(now);
         self.pairing_code_tick(now);
+        // This must be queued before BTP_WIFI_HANDOFF, which permits host-side discovery/nudging.
+        self.active_bt_peer_tick(now);
         self.bt_phase_tick(now);
         self.proj_mode_tick(now);
         self.phone_ident_tick(now);
@@ -2217,6 +2233,37 @@ impl Daemon {
             a.extend_from_slice(now.as_bytes());
             self.send(p::CH_CTRL, mirror_flags(replay), &a);
             eprintln!("[ocbmd] phone identity -> host: {now}");
+        }
+    }
+
+    /// Mirror the accepted RFCOMM peer before the later AirPlay identity is available.
+    fn active_bt_peer_tick(&mut self, now_t: std::time::Instant) {
+        if !self.subscribed {
+            return;
+        }
+        if self.active_bt_peer.is_some() {
+            if let Some(prev) = self.last_active_bt_peer_check {
+                if now_t.duration_since(prev) < Duration::from_millis(500) {
+                    return;
+                }
+            }
+        }
+        self.last_active_bt_peer_check = Some(now_t);
+        let now = std::fs::read_to_string(ACTIVE_BT_PEER_FILE)
+            .map(|s| s.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        let now = if valid_bt_mac(&now) { now } else { String::new() };
+        if self.active_bt_peer.as_deref() != Some(now.as_str()) {
+            let replay = self.active_bt_peer.is_none();
+            self.active_bt_peer = Some(now.clone());
+            let mut payload = Vec::with_capacity(1 + now.len());
+            payload.push(p::CT_ACTIVE_BT_PEER);
+            payload.extend_from_slice(now.as_bytes());
+            self.send(p::CH_CTRL, mirror_flags(replay), &payload);
+            eprintln!(
+                "[ocbmd] active Bluetooth peer -> host: {}",
+                if now.is_empty() { "unknown" } else { &now }
+            );
         }
     }
 
@@ -3763,6 +3810,8 @@ impl Daemon {
                     self.last_phone_check = None; // ...and read the flag on the very next tick
                     self.pairing_code = None; // re-emit any live pairing code to this (fresh) host
                     self.phone_ident = None; // re-emit who the phone is to this (fresh) host
+                    self.active_bt_peer = None; // replay accepted RFCOMM peer before BT phase
+                    self.last_active_bt_peer_check = None;
                     self.bt_phase = None; // and re-emit the current BT phase, so a host attaching
                                           // mid-handshake is not blind until the next transition
                                           // (which may never come).
@@ -4182,6 +4231,8 @@ fn main() {
         present_cleared_at: None,
         phone_ident: None,
         last_phone_ident_check: None,
+        active_bt_peer: None,
+        last_active_bt_peer_check: None,
         host_replaced: false,
         cfg: Vec::new(),
         input_sock: None,
@@ -4701,6 +4752,8 @@ mod tests {
             present_cleared_at: None,
             phone_ident: None,
             last_phone_ident_check: None,
+            active_bt_peer: None,
+            last_active_bt_peer_check: None,
             host_replaced: false,
             cfg: Vec::new(),
             input_sock: None,
@@ -4720,6 +4773,16 @@ mod tests {
             last_proj_mode_check: None,
             last_health_log: None,
         }
+    }
+
+    #[test]
+    fn active_bt_peer_mac_validation_is_strict() {
+        assert!(valid_bt_mac("04:41:A5:B8:26:B1"));
+        assert!(valid_bt_mac("04:41:a5:b8:26:b1"));
+        assert!(!valid_bt_mac("04:41:A5:B8:26"));
+        assert!(!valid_bt_mac("04:41:A5:B8:26:BZ"));
+        assert!(!valid_bt_mac("04-41-A5-B8-26-B1"));
+        assert!(!valid_bt_mac("04:41:A5:B8:26:B1:00"));
     }
 
     /// Pop everything queued on the priority (CTRL/MFI/RTSP) queue as `(channel, flags, payload)`,

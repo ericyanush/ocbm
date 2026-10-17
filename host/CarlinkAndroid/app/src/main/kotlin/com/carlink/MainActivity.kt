@@ -179,7 +179,7 @@ class MainActivity : ComponentActivity() {
                                 tag = "MAIN",
                             )
                             // Notify CarlinkManager of the detachment (null-safe)
-                            carlinkManager?.onUsbDeviceDetached()
+                            carlinkManager?.onUsbDeviceDetached(it.deviceName)
                         }
                     }
                 }

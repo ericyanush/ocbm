@@ -164,6 +164,7 @@ enum OCBM {
     /// of a missing radio HAL script: no hci0 was ever created, while OCBM, MFi and CT_SUBSCRIBE all
     /// still report success.
     static let ctBoxHealth: UInt8 = 0x1A
+    static let ctActiveBtPeer: UInt8 = 0x1D
     static let bhHciPresent: UInt8 = 0x01
     static let bhSsp: UInt8 = 0x02
     static let bhIap2d: UInt8 = 0x04

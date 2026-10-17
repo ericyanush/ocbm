@@ -335,6 +335,19 @@ impl Control {
         if let Ok(mut w) = self.session_peer.write() {
             *w = addr;
         }
+        // OCBM needs this identity before CT_PHONE_IDENT can arrive from AirPlay SETUP.
+        // The file is volatile session state; missing/empty means no active iAP2 peer.
+        let path = "/tmp/ocbm_active_bt_peer";
+        if let Some(a) = addr {
+            let body = format!("{}\n", fmt_addr(&a));
+            let tmp = format!("{path}.tmp");
+            if std::fs::write(&tmp, body).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        } else {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(format!("{path}.tmp"));
+        }
     }
 
     pub fn session_peer(&self) -> Option<[u8; 6]> {

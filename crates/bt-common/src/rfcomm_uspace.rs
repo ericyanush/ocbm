@@ -1177,24 +1177,33 @@ pub fn connect_to(
 /// Mirrors `rfcomm::accept_one` exactly — including returning `Ok(None)` on a timeout so the caller
 /// can re-check its shutdown flag — so `main.rs` can dispatch between the two without caring which
 /// implementation is live.
-pub fn accept_one(channel: u8, shutdown: &AtomicBool) -> io::Result<Option<std::fs::File>> {
+pub fn accept_one(
+    channel: u8,
+    shutdown: &AtomicBool,
+) -> io::Result<Option<(std::fs::File, [u8; 6])>> {
     let lfd = listener()?;
     // CONTRACT: `Ok(None)` means SHUTDOWN, never "timed out" — `main.rs` breaks its accept loop on
     // it. The 1 s socket timeout exists only so the shutdown flag is polled promptly, so a timeout
     // must loop here rather than return. Returning `Ok(None)` on timeout killed the accept thread
     // one second after every bring-up.
-    let cfd = loop {
+    let (cfd, peer) = loop {
         if shutdown.load(Ordering::Relaxed) {
             return Ok(None);
         }
         // accept4(SOCK_CLOEXEC), not accept(): the accepted connection is live across
         // av::ensure_av_layer()'s fork+exec of the detached daemons, and a leaked L2CAP connection
         // cannot be torn down without a reboot.
+        let mut remote: SockaddrL2 = unsafe { std::mem::zeroed() };
+        let mut remote_len = std::mem::size_of::<SockaddrL2>() as libc::socklen_t;
         let fd = unsafe {
-            crate::cloexec::accept_cloexec(lfd, std::ptr::null_mut(), std::ptr::null_mut())
+            crate::cloexec::accept_cloexec(
+                lfd,
+                &mut remote as *mut SockaddrL2 as *mut libc::sockaddr,
+                &mut remote_len,
+            )
         };
         if fd >= 0 {
-            break fd;
+            break (fd, remote.l2_bdaddr);
         }
         let e = io::Error::last_os_error();
         match e.kind() {
@@ -1278,7 +1287,7 @@ pub fn accept_one(channel: u8, shutdown: &AtomicBool) -> io::Result<Option<std::
         eprintln!("[rfcomm-u] pump thread exited");
     });
 
-    Ok(Some(unsafe { std::fs::File::from_raw_fd(caller_end) }))
+    Ok(Some((unsafe { std::fs::File::from_raw_fd(caller_end) }, peer)))
 }
 
 #[cfg(test)]

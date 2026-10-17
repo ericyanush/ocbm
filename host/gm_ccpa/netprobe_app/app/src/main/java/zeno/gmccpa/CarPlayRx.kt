@@ -20,6 +20,20 @@ import zeno.gmccpa.pair.Tlv8
 import zeno.gmccpa.logging.SessionTrace
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+
+/** Pure selection rule shared by tests and the discovery callback. */
+internal fun isAllowedCarPlayCandidate(
+    handoffReady: Boolean,
+    activeBluetoothPeer: String?,
+    serviceName: String,
+    advertisedBluetoothMac: String,
+    discoveredServiceNames: Set<String>,
+): Boolean {
+    if (!handoffReady) return false
+    if (activeBluetoothPeer != null) return advertisedBluetoothMac.equals(activeBluetoothPeer, ignoreCase = true)
+    return discoveredServiceNames.size == 1 && discoveredServiceNames.contains(serviceName)
+}
 
 /**
  * A **CarPlay-identity** AirPlay receiver — the successor to the feasibility-era `AirPlayRx` probe
@@ -150,9 +164,16 @@ class CarPlayRx(
     private var regListener: NsdManager.RegistrationListener? = null
     /** Our own mDNS responder, publishing a hostname NsdManager will not let us set. See [advertise]. */
     private var selfMdns: MdnsResponder? = null
-    private var discListener: NsdManager.DiscoveryListener? = null
+    @Volatile private var discListener: NsdManager.DiscoveryListener? = null
     private val pool = Executors.newCachedThreadPool()
     private val lastDial = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    /** MAC of the iAP2 peer reported by OCBM. Discovery may contain several phones; only this
+     * identity is eligible to receive a nudge for the current handoff. */
+    private val pinnedPhoneMac = AtomicReference<String?>(null)
+    private val handoffReady = AtomicBoolean(false)
+    private val discoveryRefreshInFlight = AtomicBoolean(false)
+    /** Current Bonjour instances and their TXT Bluetooth identities, used only for safe fallback. */
+    private val peerCandidates = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** The incumbent control connection, for hijack: a new inbound supersedes and closes it. */
     @Volatile private var currentSocket: Socket? = null
@@ -195,6 +216,94 @@ class CarPlayRx(
      */
     fun liveConnectionCount(): Int = liveConnections.get()
 
+    /** Pin outbound discovery to the actual Bluetooth/iAP2 peer, not whichever Bonjour result won
+     * the latest resolve callback. Empty means the adapter has no current peer; retain the last pin
+     * through the Wi-Fi handoff because some adapters close RFCOMM immediately after credentials. */
+    fun setActiveBluetoothPeer(mac: String) {
+        val normalized = mac.trim().uppercase()
+        if (!normalized.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}"))) {
+            if (normalized.isEmpty()) {
+                if (!handoffReady.get()) pinnedPhoneMac.set(null)
+                log.i("active iAP2 peer cleared${if (handoffReady.get()) "; retaining handoff target" else ""}")
+            }
+            else log.w("ignoring malformed active iAP2 peer '$mac'")
+            return
+        }
+        // A newly accepted RFCOMM peer starts a new attempt. Do not let the prior phone's handoff
+        // readiness authorize a nudge before this peer reaches BTP_WIFI_HANDOFF.
+        handoffReady.set(false)
+        val previous = pinnedPhoneMac.getAndSet(normalized)
+        if (previous != normalized) {
+            log.i("handoff target pinned to Bluetooth peer $normalized")
+            refreshDiscoveryForSelection()
+        }
+    }
+
+    /** Only begin nudging after the adapter has sent the Wi-Fi handoff. Before then Bonjour may
+     * contain stale or unrelated phones that happen to be connected to the vehicle hotspot. */
+    fun setBluetoothPhase(phase: Int) {
+        val wasReady = handoffReady.get()
+        if (phase == BT_PHASE_IDLE || phase == BT_PHASE_PAIR_REJECTED) {
+            handoffReady.set(false)
+            val previous = pinnedPhoneMac.getAndSet(null)
+            if (previous != null) log.i("Bluetooth attempt ended; cleared handoff target $previous")
+        } else if (phase == BT_PHASE_WIFI_HANDOFF) {
+            handoffReady.set(true)
+        }
+        val ready = handoffReady.get()
+        val changed = wasReady != ready
+        if (changed) {
+            log.i(if (ready) "Bluetooth handoff ready; selecting only the active phone" else "Bluetooth handoff not ready; suppressing connect-outs")
+            if (ready) refreshDiscoveryForSelection()
+        }
+    }
+
+    private fun refreshDiscoveryForSelection() {
+        if (!running.get() || !discoveryRefreshInFlight.compareAndSet(false, true)) return
+        runCatching {
+            pool.execute {
+                try {
+                    val old = discListener
+                    if (old != null) runCatching { nsd?.stopServiceDiscovery(old) }
+                    discListener = null
+                    Thread.sleep(250)
+                    if (running.get()) browseForPhone()
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } finally {
+                    discoveryRefreshInFlight.set(false)
+                }
+            }
+        }.onFailure {
+            discoveryRefreshInFlight.set(false)
+            log.i("discovery refresh skipped: ${it.message}")
+        }
+    }
+
+    private fun candidateAllowed(serviceName: String, advertisedMac: String): Boolean {
+        val active = pinnedPhoneMac.get()
+        val candidates = peerCandidates.keys.toSet()
+        val allowed = isAllowedCarPlayCandidate(
+            handoffReady = handoffReady.get(),
+            activeBluetoothPeer = active,
+            serviceName = serviceName,
+            advertisedBluetoothMac = advertisedMac,
+            discoveredServiceNames = candidates,
+        )
+        if (active != null) {
+            if (!allowed) log.i("ignoring Bonjour peer '$serviceName' id=${advertisedMac.ifEmpty { "<missing>" }}; active iAP2 peer is $active")
+            return allowed
+        }
+        // Backward compatibility for an older adapter that cannot report its RFCOMM peer: only
+        // dial when discovery is unambiguous. Never guess between two phones.
+        if (allowed) {
+            log.w("no adapter peer identity; using the sole discovered candidate '$serviceName'")
+            return true
+        }
+        log.w("no adapter peer identity and ${candidates.size} Bonjour candidates are present; withholding nudge")
+        return false
+    }
+
     /** When the advert went live. The connect-out must not run until iOS has had time to index it. */
     @Volatile private var advertisedAt = 0L
 
@@ -226,6 +335,9 @@ class CarPlayRx(
     @Volatile private var lastDetectedKey: String? = null
 
     companion object {
+        private const val BT_PHASE_IDLE = 0x00
+        private const val BT_PHASE_WIFI_HANDOFF = 0x06
+        private const val BT_PHASE_PAIR_REJECTED = 0x07
         private const val AV_IDLE_CLOSE_MS = 30_000L
         /**
          * The identity the CCPA derives for itself, which the app's Bonjour advert MUST match — iOS
@@ -647,10 +759,14 @@ class CarPlayRx(
             }
             override fun onServiceFound(s: NsdServiceInfo) {
                 log.i("found _carplay-ctrl peer '${s.serviceName}' — resolving")
+                // Count the instance before its asynchronous resolve completes so a fallback
+                // cannot misclassify the first of two phones as the only candidate.
+                peerCandidates.putIfAbsent(s.serviceName, "")
                 resolve(s)
             }
             override fun onServiceLost(s: NsdServiceInfo) {
                 log.w("lost _carplay-ctrl peer '${s.serviceName}'")
+                peerCandidates.remove(s.serviceName)
                 lastDial.clear()
                 lastDetectedKey = null   // so its return is announced as a fresh DETECTED
                 SessionTrace.Board.down(B_PEER, "'${s.serviceName}' left the link (mDNS goodbye or TTL expiry)")
@@ -688,6 +804,8 @@ class CarPlayRx(
                         ?.toString(Charsets.UTF_8)
                         ?.trim()
                         .orEmpty()
+                val advertisedMac = advertisedId.uppercase()
+                peerCandidates[si.serviceName] = advertisedMac
                 val phoneName = si.serviceName.trim()
                 if (phoneName.isNotEmpty() && advertisedId.isNotEmpty()) {
                     onPhoneDiscovered?.let { cb ->
@@ -719,6 +837,7 @@ class CarPlayRx(
                     log.i("   (control connection already live — not nudging)")
                     return
                 }
+                if (!candidateAllowed(si.serviceName, advertisedMac)) return
                 val now = System.currentTimeMillis()
                 val last = lastDial[key] ?: 0L
                 if (now - last < REDIAL_COOLDOWN_MS) {
@@ -728,7 +847,7 @@ class CarPlayRx(
                 lastDial[key] = now
                 if (!running.get()) return   // stop() has run; the pool is shut down
                 try {
-                    pool.execute { connectOutWithRetry(si.serviceName, host, si.port) }
+                    pool.execute { connectOutWithRetry(si.serviceName, advertisedMac, host, si.port) }
                 } catch (t: java.util.concurrent.RejectedExecutionException) {
                     // stop() raced this resolve. Same guard acceptLoop and reannounce() carry: this
                     // callback runs on NsdManager's own HandlerThread, where an uncaught throw is fatal.
@@ -768,7 +887,7 @@ class CarPlayRx(
      * `HandleControlServerEvent command 'connect'`. We never dial the phone for the control channel
      * itself; the phone opens that inbound afterwards.
      */
-    private fun connectOutWithRetry(serviceName: String, host: InetAddress, peerPort: Int) {
+    private fun connectOutWithRetry(serviceName: String, phoneMac: String, host: InetAddress, peerPort: Int) {
         // SINGLE-FLIGHT. rediscoverLoop restarts discovery every 12 s and each restart re-resolves
         // under a fresh addr:port key, so every cycle used to dispatch its own dialer on top of the
         // ones still running — four concurrent `live lookup` threads were observed in one process,
@@ -777,10 +896,10 @@ class CarPlayRx(
             log.i("   (a connect-out is already in flight — not stacking another)")
             return
         }
-        try { dialOut(serviceName, host, peerPort) } finally { dialInFlight.set(false) }
+        try { dialOut(serviceName, phoneMac, host, peerPort) } finally { dialInFlight.set(false) }
     }
 
-    private fun dialOut(serviceName: String, host: InetAddress, peerPort: Int) {
+    private fun dialOut(serviceName: String, phoneMac: String, host: InetAddress, peerPort: Int) {
         // Hold off until the advert has been up long enough for iOS to have committed it to the
         // endpoint index it is about to search. Dialing early is not merely wasted — the pending
         // autoconnect is consumed and resolved against an index that does not contain us yet.
@@ -847,6 +966,10 @@ class CarPlayRx(
         for (attempt in 1..10) {
             if (!running.get()) return
             if (discoveryPaused.get()) { log.i("connect-out abandoned — discovery was paused"); return }
+            if (!candidateAllowed(serviceName, phoneMac)) {
+                log.i("connect-out abandoned — '$serviceName' is no longer the selected handoff peer")
+                return
+            }
             // Same reason as the guard in onServiceResolved: once the phone has dialed in, further
             // nudges only provoke a hijack of the session we just won. A straggler retry thread that
             // re-queries at attempt 3 or 6 can pick up the phone's NEW ctrl port and nudge mid-session.

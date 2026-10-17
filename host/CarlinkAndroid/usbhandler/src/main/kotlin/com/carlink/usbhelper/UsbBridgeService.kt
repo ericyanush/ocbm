@@ -53,11 +53,18 @@ class UsbBridgeService : Service() {
 
     private val detachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
+            val action = intent?.action ?: return
+            if (action != UsbManager.ACTION_USB_DEVICE_ATTACHED &&
+                action != UsbManager.ACTION_USB_DEVICE_DETACHED
+            ) return
             @Suppress("DEPRECATION")
             val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE) as? UsbDevice ?: return
             val matches = synchronized(this@UsbBridgeService) { openedDeviceName == device.deviceName }
-            if (matches) {
+            val actionName = if (action == UsbManager.ACTION_USB_DEVICE_ATTACHED) "ATTACHED" else "DETACHED"
+            val detail = "USB $actionName broadcast: ${describeDevice(device)}; inventory=${describeDevicesWithPermissions()}"
+            Log.i(TAG, detail)
+            emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, detail)
+            if (action == UsbManager.ACTION_USB_DEVICE_DETACHED && matches) {
                 val reason = "USB detach broadcast for ${device.deviceName}"
                 Log.w(TAG, reason)
                 emitState(UsbBridgeConstants.STATE_ERROR, reason)
@@ -77,13 +84,23 @@ class UsbBridgeService : Service() {
     )
 
     private val binder = object : IUsbBridge.Stub() {
-        override fun listAdapters(): Array<String> = usb.deviceList.values
-            .filter(::isAdapter)
-            .map { it.deviceName }
-            .toTypedArray()
+        override fun listAdapters(): Array<String> {
+            val devices = usb.deviceList.values.toList()
+            val adapters = devices.filter(::isAdapter)
+            val detail = "USB scan: ${describeDevicesWithPermissions(devices)}; OCBM matches=${adapters.joinToString { it.deviceName }.ifEmpty { "none" }}"
+            Log.i(TAG, detail)
+            emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, detail)
+            return adapters.map { it.deviceName }.toTypedArray()
+        }
 
-        override fun hasPermission(deviceName: String): Boolean =
-            usb.deviceList[deviceName]?.let(usb::hasPermission) == true
+        override fun hasPermission(deviceName: String): Boolean {
+            val device = usb.deviceList[deviceName]
+            val granted = device?.let(usb::hasPermission) == true
+            val detail = "USB permission check: path=$deviceName present=${device != null} grant=$granted${device?.let { " descriptor=${describeDevice(it)}" } ?: ""}"
+            Log.i(TAG, detail)
+            emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, detail)
+            return granted
+        }
 
         override fun open(deviceName: String): Boolean = openDevice(deviceName)
 
@@ -98,6 +115,9 @@ class UsbBridgeService : Service() {
         override fun registerCallback(callback: IUsbBridgeCallback) {
             callbacks += callback
             emitState(UsbBridgeConstants.STATE_DISCONNECTED, "USB helper ready")
+            val detail = "USB helper callback registered; inventory=${describeDevicesWithPermissions()}"
+            Log.i(TAG, detail)
+            emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, detail)
         }
 
         override fun unregisterCallback(callback: IUsbBridgeCallback) {
@@ -191,7 +211,10 @@ class UsbBridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(detachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -394,6 +417,14 @@ class UsbBridgeService : Service() {
     private fun describeDevices(): String = usb.deviceList.values.joinToString { device ->
         "${device.deviceName}:${device.vendorId.toString(16)}:${device.productId.toString(16)}"
     }.ifEmpty { "none" }
+
+    private fun describeDevicesWithPermissions(devices: List<UsbDevice> = usb.deviceList.values.toList()): String =
+        devices.joinToString(prefix = "[", postfix = "]") { device ->
+            "${describeDevice(device)} grant=${runCatching { usb.hasPermission(device) }.getOrDefault(false)}"
+        }.ifEmpty { "none" }
+
+    private fun describeDevice(device: UsbDevice): String =
+        "path=${device.deviceName} vid=0x${device.vendorId.toString(16).padStart(4, '0')} pid=0x${device.productId.toString(16).padStart(4, '0')} interfaces=${device.interfaceCount}"
 
     private fun findBulkEndpoints(device: UsbDevice): Triple<UsbInterface, UsbEndpoint, UsbEndpoint>? {
         for (index in 0 until device.interfaceCount) {

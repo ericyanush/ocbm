@@ -67,6 +67,10 @@ class UsbBulkTransport(
     @Volatile var lastError: String? = null
         private set
 
+    /** USB enumeration path selected for this transport (e.g. `/dev/bus/usb/001/012`). */
+    @Volatile var activeDeviceName: String? = null
+        private set
+
     override fun setReadHandler(handler: (ByteArray, Int) -> Unit) {
         readHandler = handler
     }
@@ -301,13 +305,17 @@ class UsbBulkTransport(
             }
             return try {
                 lastError = null
+                // Publish before the Binder call: a detach can race the open operation itself.
+                activeDeviceName = deviceName
                 connected.set(remote.open(deviceName))
                 if (!connected.get() && lastError.isNullOrBlank()) {
+                    activeDeviceName = null
                     lastError = "USB helper could not claim the adapter; check its USB grant and interface"
                     log.e("[USB_HELPER] $lastError")
                 }
                 connected.get()
             } catch (t: Throwable) {
+                activeDeviceName = null
                 lastError = "USB helper open failed: ${t.message ?: t.javaClass.simpleName}"
                 log.e("[USB_HELPER] $lastError")
                 false
