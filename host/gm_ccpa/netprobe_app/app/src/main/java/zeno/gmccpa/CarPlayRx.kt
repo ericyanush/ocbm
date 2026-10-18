@@ -3,6 +3,8 @@ package zeno.gmccpa
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
+import android.os.Build
 import java.io.BufferedInputStream
 import java.io.OutputStream
 import java.net.InetAddress
@@ -162,6 +164,8 @@ class CarPlayRx(
     @Volatile private var server: ServerSocket? = null
     private var nsd: NsdManager? = null
     private var regListener: NsdManager.RegistrationListener? = null
+    /** Held only while this receiver's mDNS advertiser/browser/raw sockets are active. */
+    @Volatile private var mdnsMulticastLock: WifiManager.MulticastLock? = null
     /** Our own mDNS responder, publishing a hostname NsdManager will not let us set. See [advertise]. */
     private var selfMdns: MdnsResponder? = null
     @Volatile private var discListener: NsdManager.DiscoveryListener? = null
@@ -463,6 +467,10 @@ class CarPlayRx(
          */
         private const val ACCEPT_RETRY_MS = 250L
         private const val ACCEPT_FAILURES_FATAL = 40
+        // SDK extension ID is the API level that introduced the extension family; T extension 7
+        // supplies automatic foreground multicast reception per NsdManager's API documentation.
+        private const val TIRAMISU_EXTENSION_ID = 33
+        private const val T_EXTENSION_MULTICAST_AUTO_MANAGEMENT = 7
 
         // ---- SessionTrace.Board entry names, so a capture is greppable per component ---------------
         private const val B_LISTENER = "rx-listener"
@@ -483,6 +491,7 @@ class CarPlayRx(
         if (stopped) { log.e("start() on a stopped receiver — construct a new CarPlayRx instead"); return }
         if (!running.compareAndSet(false, true)) { log.i("already running"); return }
         discoveryPaused.set(discoveryPausedInitially)
+        acquireMdnsMulticastLockIfRequired()
         // Every caller is already off the main thread, and the bind below must stay that way. Say so
         // if that ever stops being true rather than letting it surface as a NetworkOnMainThread.
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper())
@@ -588,8 +597,62 @@ class CarPlayRx(
         val drained = try { pool.awaitTermination(1500, java.util.concurrent.TimeUnit.MILLISECONDS) }
         catch (_: InterruptedException) { Thread.currentThread().interrupt(); false }
         if (!drained) log.w("pumps did not unwind within 1500ms — a pump is parked in NativeCore.feed")
+        releaseMdnsMulticastLock()
         log.i("CarPlay RX stopped")
         return drained
+    }
+
+    /**
+     * Android T extension 7 added automatic multicast reception for foreground apps. Older
+     * releases—including Android 12—need an explicit lock for mDNS receive traffic. Use the SDK
+     * extension level rather than OS/target SDK checks, and hold the lock for the lifetime of
+     * NsdManager discovery and our raw MulticastSocket operations.
+     */
+    private fun acquireMdnsMulticastLockIfRequired() {
+        // SdkExtensions exists from API 30. On older devices there cannot be T extension 7, so the
+        // lock is required and we avoid resolving the class before it exists.
+        val tExtension = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // The shipping compiler is pinned to android-32 to avoid accidentally linking newer
+            // framework APIs into this AAOS 12 app; SdkExtensions is present at runtime from API 30
+            // but omitted from that platform stub. Resolve only this API-30 method reflectively.
+            runCatching {
+                Class.forName("android.os.ext.SdkExtensions")
+                    .getMethod("getExtensionVersion", Int::class.javaPrimitiveType)
+                    .invoke(null, TIRAMISU_EXTENSION_ID) as Int
+            }
+                .getOrElse {
+                    log.w("unable to read T SDK extension version: ${it.message}; assuming multicast lock required")
+                    0
+                }
+        } else {
+            0
+        }
+        if (tExtension >= T_EXTENSION_MULTICAST_AUTO_MANAGEMENT) {
+            log.i("T SDK extension $tExtension: system manages foreground mDNS multicast reception")
+            return
+        }
+
+        try {
+            val wifi = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val lock = wifi.createMulticastLock("gmccpa-carplay-mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            mdnsMulticastLock = lock
+            log.i("acquired Wi-Fi mDNS multicast lock (T SDK extension $tExtension < $T_EXTENSION_MULTICAST_AUTO_MANAGEMENT)")
+        } catch (t: Throwable) {
+            // Keep the receiver alive so NsdManager's platform-managed paths can still work, but
+            // surface the degraded raw-mDNS receive path in diagnostics.
+            log.w("unable to acquire Wi-Fi mDNS multicast lock: ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    private fun releaseMdnsMulticastLock() {
+        val lock = mdnsMulticastLock ?: return
+        mdnsMulticastLock = null
+        runCatching {
+            if (lock.isHeld) lock.release()
+        }.onFailure { log.w("unable to release Wi-Fi mDNS multicast lock: ${it.message}") }
     }
 
     // ---- our advert -------------------------------------------------------------------------------

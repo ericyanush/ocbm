@@ -20,15 +20,15 @@ plugins {
 android {
     // MUST equal the package GM's fixed-handler path grants. The bridge service uses that grant;
     // the configured activity itself is deliberately absent to avoid the GM distraction overlay.
-    namespace = "android.car.usb.handler"
-    compileSdk = 37
+    namespace = "com.carlink.usbhelper"
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "android.car.usb.handler"
-        minSdk = 32 // GM gminfo37 = Android 12L / API 32
+        minSdk = 29
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0-usbbridge"
+        versionCode = 3
+        versionName = "0.3.0-usbbridge"
     }
 
     buildTypes {

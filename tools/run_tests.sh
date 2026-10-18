@@ -30,6 +30,7 @@ run "receiver (box: local-mfi)" cargo test --manifest-path crates/vendor/receive
   --no-default-features --features local-mfi --quiet
 run "ocbm-proto" cargo test -p ocbm-proto --quiet
 run "ocbmd"      cargo test -p ocbmd --quiet
+run "ocbmd liveness" sh tools/tests/ocbmd_liveness_test.sh
 run "iap2d"      cargo test -p iap2d --quiet
 # These are excluded from the workspace too, and were missing from this script until 2026-07-29 —
 # 103 further passing tests, including `btd`, which is one of the four SHIPPED box

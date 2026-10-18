@@ -64,6 +64,50 @@ fn log(m: &str) {
     println!("@{} [bt-driver] {m}", now_ms());
 }
 
+/// Summarize the actual wireless IdentificationInformation payload without dumping opaque TLVs.
+/// In particular, param 17 carries the accessory Bluetooth address; no Wi-Fi MAC/BSSID is in this
+/// message. This runs on the wire-built body, so it also catches accidental builder/config drift.
+fn log_wireless_ident_summary(body: &[u8]) {
+    fn groups(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut out = Vec::new();
+        while bytes.len() >= 4 {
+            let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+            if len < 4 || len > bytes.len() {
+                break;
+            }
+            let id = u16::from_be_bytes([bytes[2], bytes[3]]);
+            out.push((id, &bytes[4..len]));
+            bytes = &bytes[len..];
+        }
+        out
+    }
+    let top = groups(body);
+    let params = top
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let bt_mac = top
+        .iter()
+        .find(|(id, _)| *id == 17)
+        .and_then(|(_, value)| groups(value).into_iter().find(|(id, _)| *id == 3))
+        .map(|(_, bytes)| {
+            if bytes.len() == 6 {
+                bytes
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(":")
+            } else {
+                format!("invalid-length:{}", bytes.len())
+            }
+        })
+        .unwrap_or_else(|| "absent".into());
+    log(&format!(
+        "wireless 0x1D01 identity summary: top_params=[{params}] bluetooth_param17.mac={bt_mac}; no Wi-Fi MAC field in IdentificationInformation"
+    ));
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -424,6 +468,30 @@ fn process_one(
         ));
         publish_bt_phase(ocbm_proto::BTP_WIFI_HANDOFF);
         let body = crate::wifi_handoff::build_accessory_wifi_configuration_information(&cfg);
+        let security_code = cfg.security_type.map(|v| v as u8);
+        // 0x5703 has only SSID, passphrase, security type and channel; it does not carry a
+        // Wi-Fi MAC/BSSID. Log presence/length, never the passphrase itself.
+        let params = [
+            Some("1:ssid"),
+            cfg.passphrase.as_ref().map(|_| "2:passphrase"),
+            cfg.security_type.map(|_| "3:security"),
+            cfg.channel.map(|_| "4:channel"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(",");
+        log(&format!(
+            "TX 0x5703 fields: ssid={:?} passphrase_present={} passphrase_bytes={} security={:?} security_code={:?} channel={:?} params=[{}] body_bytes={}",
+            cfg.ssid,
+            cfg.passphrase.is_some(),
+            cfg.passphrase.as_ref().map(|s| s.as_bytes().len()).unwrap_or(0),
+            cfg.security_type,
+            security_code,
+            cfg.channel,
+            params,
+            body.len(),
+        ));
         let sent = write_interruptible(
             sock,
             &link.build_msg(
@@ -433,6 +501,15 @@ fn process_one(
             ),
             abort,
         );
+        log(&format!(
+            "TX 0x5703 write_result={} body_bytes={}",
+            if sent {
+                "complete"
+            } else {
+                "failed_or_aborted"
+            },
+            body.len()
+        ));
         if sent && !abort() {
             // The iPhone now has the AP credentials and will associate to wlan0, then look for the
             // AirPlay receiver via mDNS. Bring up that layer (carplayd RTSP :5000 + rx-connect
@@ -614,6 +691,7 @@ fn execute(
                 "TX 0x1D01 IdentificationInformation ({} B, wireless transport)",
                 ib.len()
             ));
+            log_wireless_ident_summary(&ib);
             ExecResult::Commit
         }
         Action::RetryIdentify(excluded) => {
@@ -639,6 +717,7 @@ fn execute(
                 "TX 0x1D01 retry, stripped {excluded:?} ({} B, wireless)",
                 ib.len()
             ));
+            log_wireless_ident_summary(&ib);
             ExecResult::Commit
         }
         Action::Note(m) => {

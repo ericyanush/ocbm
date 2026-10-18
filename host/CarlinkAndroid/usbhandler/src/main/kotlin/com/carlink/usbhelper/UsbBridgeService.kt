@@ -31,7 +31,9 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Owns the raw OCBM USB pipe under the fixed-handler UID. The app process receives bytes over AIDL;
- * it never calls UsbManager.openDevice and never requests a USB permission dialog.
+ * it never calls UsbManager.openDevice and never requests a USB permission dialog. The service is
+ * bound to the main app for the duration of a transport session; discovery is initiated through
+ * the bound AIDL interface, and Android owns teardown after the final client unbinds.
  */
 class UsbBridgeService : Service() {
     private val usb by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
@@ -82,7 +84,6 @@ class UsbBridgeService : Service() {
         TimeUnit.MILLISECONDS,
         ArrayBlockingQueue(128),
     )
-
     private val binder = object : IUsbBridge.Stub() {
         override fun listAdapters(): Array<String> {
             val devices = usb.deviceList.values.toList()
@@ -101,6 +102,8 @@ class UsbBridgeService : Service() {
             emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, detail)
             return granted
         }
+
+        override fun openFirstAdapter(): String = findAndOpenAdapter()
 
         override fun open(deviceName: String): Boolean = openDevice(deviceName)
 
@@ -225,7 +228,8 @@ class UsbBridgeService : Service() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
-        closeDevice("last client unbound")
+        // The service is bind-owned. The app closes the USB pipe before unbinding; Android then
+        // destroys this service when the final client disconnects. A later session binds afresh.
         return super.onUnbind(intent)
     }
 
@@ -237,6 +241,32 @@ class UsbBridgeService : Service() {
         }
         delivery.shutdownNow()
         super.onDestroy()
+    }
+
+    /** Legacy-helper-style discovery: poll enumeration and the GM silent grant for a bounded window. */
+    private fun findAndOpenAdapter(): String {
+        val deadline = SystemClock.elapsedRealtime() + DISCOVERY_WINDOW_MS
+        var lastDeviceName: String? = null
+        var deviceSeen = false
+        while (SystemClock.elapsedRealtime() <= deadline) {
+            val device = usb.deviceList.values.firstOrNull(::isAdapter)
+            if (device != null) {
+                lastDeviceName = device.deviceName
+                deviceSeen = true
+                if (runCatching { usb.hasPermission(device) }.getOrDefault(false) && openDevice(device.deviceName)) {
+                    return device.deviceName
+                }
+            }
+            Thread.sleep(DISCOVERY_POLL_MS)
+        }
+        val reason = if (deviceSeen) {
+            "OCBM adapter ${lastDeviceName ?: "unknown"} present but GM USB grant unavailable after ${DISCOVERY_WINDOW_MS}ms"
+        } else {
+            "OCBM adapter absent after ${DISCOVERY_WINDOW_MS}ms discovery window; devices=${describeDevices()}"
+        }
+        Log.w(TAG, reason)
+        emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, reason)
+        return ""
     }
 
     @Synchronized
@@ -447,6 +477,8 @@ class UsbBridgeService : Service() {
         private const val VID_CARLINKIT = 0x1314
         private const val PID_OCBM = 0x2d00
         private const val READ_BUFFER_SIZE = 16 * 1024
+        private const val DISCOVERY_WINDOW_MS = 5_000L
+        private const val DISCOVERY_POLL_MS = 250L
         private const val READ_TIMEOUT_MS = 250
         private const val WRITE_TIMEOUT_MS = 2_000
         private const val WRITE_CHUNK = 16 * 1024

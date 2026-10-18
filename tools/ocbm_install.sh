@@ -173,6 +173,7 @@ manifest() {
     # ladder, so a missing 20 KB binary ends at a self-reboot.
     echo "$REPO/accessory_init/iap_role_switch.armv7|/usr/bin/iap_role_switch|755"
     echo "$REPO/tools/session_supervisor.sh|/script/session_supervisor.sh|755"
+    echo "$REPO/tools/ocbmd_liveness.sh|/script/ocbmd_liveness.sh|755"
     echo "$REPO/tools/projection_up.sh|/script/projection_up.sh|755"
     echo "$REPO/tools/phone_reset.sh|/script/phone_reset.sh|755"
     echo "$REPO/tools/run_supervisor.sh|/script/run_supervisor.sh|755"

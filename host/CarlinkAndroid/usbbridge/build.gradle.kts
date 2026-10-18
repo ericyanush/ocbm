@@ -4,10 +4,10 @@ plugins {
 
 android {
     namespace = "com.carlink.usbbridge"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
-        minSdk = 32
+        minSdk = 29
     }
 
     buildFeatures {

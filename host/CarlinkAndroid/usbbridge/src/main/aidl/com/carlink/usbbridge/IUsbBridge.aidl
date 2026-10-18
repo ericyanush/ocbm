@@ -5,6 +5,9 @@ import com.carlink.usbbridge.IUsbBridgeCallback;
 interface IUsbBridge {
     String[] listAdapters();
     boolean hasPermission(String deviceName);
+    // Find an OCBM device, wait briefly for enumeration/GM's silent grant, and open it.
+    // Returns the opened deviceName, or an empty string if no usable device appeared.
+    String openFirstAdapter();
     boolean open(String deviceName);
     void startReading();
     void close();

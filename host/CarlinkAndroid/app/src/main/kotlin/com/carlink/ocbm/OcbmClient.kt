@@ -5,6 +5,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
+import com.carlink.logging.RollingDiagnosticLog
 
 /**
  * The OCBM host client — the Kotlin equivalent of `ocbm-host`'s `Link` and the macOS
@@ -358,6 +359,7 @@ class OcbmClient(
             Ocbm.CH_CTRL -> handleCtrl(f.payload)
             Ocbm.CH_MFI -> mfiQ.offer(f.payload)
             Ocbm.CH_MGMT -> mgmtQ.offer(f.payload)
+            Ocbm.CH_LOG -> handleLog(f.payload)
             Ocbm.CH_VIDEO -> lanes?.feedVideo(f.payload) ?: dropAv(f)
             Ocbm.CH_MEDIA_AUDIO -> lanes?.feedMedia(f.payload) ?: dropAv(f)
             Ocbm.CH_ALT_AUDIO -> lanes?.feedVoice(f.payload) ?: dropAv(f)
@@ -367,6 +369,83 @@ class OcbmClient(
             Ocbm.CH_ALT_VIDEO -> altVideoFrames++
             else -> dropAv(f)
         }
+    }
+
+    /**
+     * Decode one bounded adapter log record. CH_LOG is diagnostic-only: malformed/oversized records
+     * are dropped rather than allowed to disrupt the USB receive path or the CarPlay lanes.
+     */
+    private fun handleLog(payload: ByteArray) {
+        var offset = 0
+        while (offset < payload.size) {
+            val remaining = payload.size - offset
+            if (remaining < Ocbm.LOG_ENTRY_HDR) {
+                log.w("<< malformed CH_LOG tail ($remaining B after $offset B of entries)")
+                return
+            }
+            val source = payload[offset].toInt() and 0xFF
+            val flags = payload[offset + 1].toInt() and 0xFF
+            val sequence = u16le(payload, offset + 2)
+            val timestampMs = u64le(payload, offset + 4)
+            val textLength = u16le(payload, offset + 12)
+            if (textLength > Ocbm.LOG_MAX_LINE || textLength > remaining - Ocbm.LOG_ENTRY_HDR) {
+                log.w("<< invalid CH_LOG length=$textLength remaining=$remaining seq=$sequence")
+                return
+            }
+            val textOffset = offset + Ocbm.LOG_ENTRY_HDR
+            val text = String(payload, textOffset, textLength, Charsets.UTF_8).trimEnd('\u0000', '\r', '\n')
+            val sourceName = when (source) {
+                Ocbm.LOG_SRC_BOX -> "box"
+                Ocbm.LOG_SRC_AIRPLAYD -> "airplayd"
+                Ocbm.LOG_SRC_AIRPLAYD_WL -> "airplayd-wl"
+                Ocbm.LOG_SRC_IAP2D -> "iap2d"
+                Ocbm.LOG_SRC_AA_BRIDGE -> "aa-bridge"
+                Ocbm.LOG_SRC_RX_CONNECT -> "rx-connect"
+                Ocbm.LOG_SRC_BT -> "bt"
+                Ocbm.LOG_SRC_RADIO_AP_DHCP -> "radio-ap-dhcp"
+                Ocbm.LOG_SRC_RADIO_BT_ATTACH -> "radio-bt-attach"
+                Ocbm.LOG_SRC_RX_CONNECT_WL -> "rx-connect-wl"
+                Ocbm.LOG_SRC_CARPLAY_WIRELESS -> "carplay-wireless"
+                Ocbm.LOG_SRC_INTERNAL -> "internal"
+                else -> "source-$source"
+            }
+            val flagsText = buildList {
+                if (flags and Ocbm.LOG_F_BACKFILL != 0) add("backfill")
+                if (flags and Ocbm.LOG_F_DROPPED != 0) add("dropped")
+                if (flags and Ocbm.LOG_F_TRUNCATED != 0) add("truncated")
+            }.joinToString(",").ifEmpty { "-" }
+            val adapterTime = runCatching {
+                java.time.Instant.ofEpochMilli(timestampMs).toString()
+            }.getOrDefault("unknown-time")
+            RollingDiagnosticLog.getInitializedInstance()?.appendAdapterLog(
+                "[$adapterTime] [$sourceName] seq=$sequence flags=$flagsText $text",
+            )
+            offset = textOffset + textLength
+        }
+    }
+
+    private fun u16le(data: ByteArray, offset: Int): Int =
+        (data[offset].toInt() and 0xFF) or ((data[offset + 1].toInt() and 0xFF) shl 8)
+
+    private fun u64le(data: ByteArray, offset: Int): Long {
+        var value = 0L
+        for (index in 0 until 8) value = value or ((data[offset + index].toLong() and 0xFFL) shl (index * 8))
+        return value
+    }
+
+    /** Arm the box's bounded log stream; failure is non-fatal to projection. */
+    fun enableAdapterLogs(capKb: Int = Ocbm.LOG_CAP_DEFAULT_KB): Boolean {
+        val safeCap = capKb.coerceIn(1, 0xFFFF)
+        val payload = byteArrayOf(
+            Ocbm.CT_LOG_CTL,
+            1,
+            (safeCap and 0xFF).toByte(),
+            ((safeCap ushr 8) and 0xFF).toByte(),
+        )
+        val sent = send(Ocbm.CH_CTRL, payload)
+        if (sent) log.i(">> CT_LOG_CTL enabled (cap=${safeCap}KiB)")
+        else log.w(">> CT_LOG_CTL write failed; adapter logs unavailable for this session")
+        return sent
     }
 
     @Volatile var altVideoFrames = 0L

@@ -79,6 +79,11 @@ class RollingDiagnosticLog private constructor(
         enqueue("${timestamp.format(Instant.now())} $severity [NETPROBE] $line")
     }
 
+    /** Adapter records retain their own timestamp and source while sharing the bounded export log. */
+    fun appendAdapterLog(line: String) {
+        enqueue("${timestamp.format(Instant.now())} I [ADAPTER] $line")
+    }
+
     private fun enqueue(line: String) {
         if (!enabled.get()) return
         // Bound memory in case a faulty hot path floods diagnostics faster than storage can flush.

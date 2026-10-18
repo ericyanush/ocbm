@@ -21,7 +21,7 @@ if [ -f /tmp/iap_role_switch ]; then cp /tmp/iap_role_switch /usr/bin/iap_role_s
 echo "[install] scripts -> /script"
 # ocbm_boot.sh ships already pointing at /usr/sbin/ocbmd + launching the supervisor, so we install it
 # fresh (chmod +x) rather than sed-patching a live boot hook (a sed that drops +x half-bricks the boot).
-for s in ocbm_boot.sh session_supervisor.sh projection_up.sh phone_reset.sh peer_store.sh carplay-status.sh run_ocbmd.sh run_supervisor.sh; do
+for s in ocbm_boot.sh session_supervisor.sh ocbmd_liveness.sh projection_up.sh phone_reset.sh peer_store.sh carplay-status.sh run_ocbmd.sh run_supervisor.sh; do
   if [ -f "/tmp/$s" ]; then cp "/tmp/$s" "/script/$s" && chmod 755 "/script/$s" && echo "  /script/$s"; else echo "  MISSING /tmp/$s"; fi
 done
 echo "[install] remove any misplaced/retired files"

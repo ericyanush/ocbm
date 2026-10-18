@@ -30,6 +30,7 @@
 # absent (unknown on the CCPA rootfs) -- see btmon_start()/the "[b]tmon" pkill lines.
 set -u
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+. /script/ocbmd_liveness.sh
 
 # S2 singleton guard: mirrors the mkdir test-and-set + PID-liveness reclaim idiom in
 # ccpa/rootfs/script/radio_hal.sh:84-99 (lock_take), so a second supervisor invocation (e.g. a
@@ -610,26 +611,26 @@ restart_ocbmd_daemon() {
 # ocbmd_wedged — liveness escalation (bench finding: ocbmd stuck in an uninterruptible HCI ioctl
 # during BT line-discipline teardown never exits, so the inittab respawn, the pid-lock singleton
 # and the failover watchdog's first-120s window all do nothing; USB writes to the host stall until
-# a manual power cycle). ocbmd (Rust side) touches /tmp/ocbmd_alive (mtime only) once per second
-# from its dispatch loop. Contract: mtime stale while the ACCESSORY gadget (Mac/host-facing,
+# a manual power cycle). ocbmd (Rust side) writes integer /proc/uptime seconds to /tmp/ocbmd_alive
+# once per second from its dispatch loop. Contract: stamp stale while the ACCESSORY gadget (Mac/host-facing,
 # android_usb_accessory — the OCBM control plane ocbmd owns, NOT the phone-facing android_usb) is
 # CONFIGURED means ocbmd is wedged, not merely idle.
 #
-# Staleness check: BusyBox `find` on this box has no `-newermt`/fractional support (confirmed by
-# the ONLY other stale-marker idiom in this repo, radio_hal.sh:92 / radio_ap_up.sh:64, both of
-# which use integer `-mmin`). There is therefore no portable way to hit the 15s target precisely;
-# `-mmin +0` (>=1 full minute stale) is the finest granularity available and is used here — this
-# under-reacts by up to ~45s versus the 15s contract, traded for portability. Absent
-# /tmp/ocbmd_alive is a no-op (old ocbmd builds never create it).
+# The comparison uses /proc/uptime on both sides, so CT_SETTIME / wall-clock corrections cannot
+# make a fresh daemon appear stale. Invalid/missing stamps are treated as unknown, not wedged;
+# a newly started daemon seeds the stamp immediately, giving it a full stale interval to initialize.
 ACC_STATE=/sys/class/android_usb_accessory/android0/state
+ALIVE_FILE=/tmp/ocbmd_alive
+WEDGE_STALE_AFTER=60  # monotonic seconds; includes startup grace
 WEDGE_RATE_LIMIT=60     # do not re-escalate a wedge within this many seconds of the last one
 wedge_escalate_ts=0     # epoch(uptime) of the last wedge-triggered L2, 0 = never
 ocbmd_wedged() {
-  [ -e /tmp/ocbmd_alive ] || return 1
-  [ -n "$(find /tmp/ocbmd_alive -maxdepth 0 -mmin +0 2>/dev/null)" ] || return 1
+  [ -r "$ALIVE_FILE" ] || return 1
   [ "$(cat "$ACC_STATE" 2>/dev/null)" = "CONFIGURED" ] || return 1
   [ -n "$(pidof ocbmd 2>/dev/null)" ] || return 1
-  return 0
+  _stamp=$(cat "$ALIVE_FILE" 2>/dev/null)
+  _uptime=$(now)
+  ocbmd_heartbeat_is_stale "$_stamp" "$_uptime" "$WEDGE_STALE_AFTER"
 }
 
 # apply_pending — at an idle boundary (present==0), apply any peer-store mutation that peer_store.sh
@@ -1042,12 +1043,12 @@ wireless_down() {
     # an app-less box drops ACLs and answers nothing. SIGTERM first, brief settle, then SIGKILL only the A/V daemons (NOT the BT hci path
     # — heavy -9 on BT bring-up is what wedges the IW416 controller).
     # SELF-MATCH FIX 2026-08-01: the patterns MUST use the `[x]`-char-class form. This block runs as
-    # `setsid sh -c '<this text>'`, so its own argv literally contains "/usr/sbin/btd",
+    # `sh -c '<this text>'`, so its own argv literally contains "/usr/sbin/btd",
     # "carplayd" — a plain `pkill -f /usr/sbin/btd` SIGKILLs THIS subshell
     # before it reaches wlan_off, orphaning the AP (hostapd kept broadcasting → iOS shows the phone still
     # on WiFi with CarPlay inactive). `[/]usr/...` matches the real daemon but NOT this text (verified:
     # busybox pgrep `[h]ostapd` matches, `[z]hostapd` doesn't). Same footgun the wireless_up guard notes.
-    setsid sh -c '
+    sh -c '
       pkill -f "[/]usr/sbin/btd" 2>/dev/null
       pkill -f "[c]arplayd" 2>/dev/null
       pkill -f "[b]tmon" 2>/dev/null   # btmon bench lever (2026-09-03), harmless if never armed
@@ -1065,12 +1066,12 @@ wireless_down() {
       # noscan — an app-less box must not keep the iPhone BT-connected. Through the SEAM bt_off
       # verb, which is exactly this noscan+down and leaves the attach in place (NOT bt_off.sh, whose
       # rmmod path is the wedge-prone one); the next bring_up() does its proven down->up cycle.
-      # NOTE: no apostrophes in this block - it is the body of a single-quoted setsid sh -c.
+      # NOTE: no apostrophes in this block - it is the body of a single-quoted sh -c.
       # Raw `hciconfig hci0 noscan/down` here ran OUTSIDE the radio_hal.sh bt lock, so it could
       # land between a concurrent bt_on attach and its readback and present as a wedged
       # controller; it also hardcoded hci0 instead of the discovered device.
       sh /script/radio_hal.sh bt_off >/tmp/bt_off.log 2>&1
-    ' </dev/null >/dev/null 2>&1 &
+    ' </dev/null >/dev/null 2>&1 || echo "[sup] wireless teardown command failed (complete-stack path)"
     # docs/wireless/00_WIRELESS_CARPLAY.md #1.2/#1.3: this is OUR session ending — clear the health state we own and the transport
     # flag ourselves (value-scoped, so it never fires against a wired session's "wired"/absent value),
     # rather than relying on the (possibly already-dying) child processes to clean up after themselves.
@@ -1085,7 +1086,7 @@ wireless_down() {
     echo "[sup] $_wd_why -> tearing down wireless advertiser + radios only (carplayd are wired-owned, left running)"
     # SELF-MATCH FIX 2026-08-01: `[/]usr/...` so this `sh -c` block doesn't SIGKILL itself before wlan_off
     # (see the COMPLETE-teardown branch above for the full rationale).
-    setsid sh -c '
+    sh -c '
       pkill -f "[/]usr/sbin/btd" 2>/dev/null
       pkill -f "[b]tmon" 2>/dev/null   # btmon bench lever (2026-09-03), harmless if never armed
       sleep 1
@@ -1095,7 +1096,7 @@ wireless_down() {
       # docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating: power BT off here too, through the locked seam bt_off
       # verb (see the COMPLETE-teardown branch rationale).
       sh /script/radio_hal.sh bt_off >/tmp/bt_off.log 2>&1
-    ' </dev/null >/dev/null 2>&1 &
+    ' </dev/null >/dev/null 2>&1 || echo "[sup] wireless teardown command failed (radio-only path)"
   fi
 }
 
@@ -1160,8 +1161,9 @@ while :; do
   fi
 
   # CCPA-tab wireless restart (ocbmd sets the flag for Restart-wireless, Forget-all, Forget-device): tear
-  # btd down now, then re-bring-up a few ticks later (once it's actually gone) if a host is
-  # still present. This is how the app's box controls + a forget (reload with cleared keys) take effect.
+  # btd down now, wait for the teardown commands to finish, then re-bring-up after a short hardware
+  # settle if a host is still present. This is how the app's box controls + a forget (reload with
+  # cleared keys) take effect.
   if [ -f "$WIRELESS_RESTART_FLAG" ]; then
     rm -f "$WIRELESS_RESTART_FLAG"
     echo "[sup] wireless restart requested (CCPA tab)"
@@ -1176,17 +1178,16 @@ while :; do
   # App-commanded radio inhibit edges (CT_RADIO -> /tmp/radio_off, docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating). Flag
   # appeared -> radios down NOW (wireless_down's docs/wireless/00_WIRELESS_CARPLAY.md #1.4 guard protects a wired-owned
   # carplayd). Flag cleared -> bring-up rides the existing 4 s wireless_rebring_at deferral, NOT a
-  # direct wireless_up: (a) a quick off->on toggle must not race the off-edge's detached teardown
-  # (same class the Restart-wireless deferral exists for), and (b) go_idle clears this flag and
-  # host_present in the same instant, so an on-edge can arrive on the very tick the app went away
-  # with last_p still stale — the deferred handler re-checks presence at fire time.
+  # direct wireless_up: (a) it provides a brief hardware settle after teardown has completed, and
+  # (b) go_idle clears this flag and host_present in the same instant, so an on-edge can arrive on
+  # the very tick the app went away with last_p still stale — the deferred handler re-checks presence.
   if radio_off; then r=1; else r=0; fi
   if [ "$r" = 1 ] && [ "$last_r" != 1 ]; then
     echo "[sup] CT_RADIO off -> tearing radios down (app-commanded)"
     wireless_down
   fi
   if [ "$r" = 0 ] && [ "$last_r" = 1 ]; then
-    echo "[sup] CT_RADIO on -> scheduling radio bring-up (deferred past teardown settle)"
+    echo "[sup] CT_RADIO on -> scheduling radio bring-up after teardown completion + settle"
     wireless_rebring_at=$(( $(now) + 4 ))
   fi
   last_r="$r"
@@ -1255,11 +1256,9 @@ while :; do
       #
       # EDGE-TRIGGERED, DELIBERATELY. Every other `wireless_down` caller in this file fires on an edge
       # (host 1->0, CT_RADIO, the restart flag, startup reconciliation). An earlier revision of this
-      # block evaluated a LEVEL every tick, which is unsafe here: `wireless_down` is a detached
-      # `setsid` doing `sleep 1` + `wlan_off.sh` (which `rmmod moal` / `rmmod mlan`), so it stays
-      # in-flight for seconds while `wireless_stack_up` is still true. A level trigger therefore
-      # spawns a new teardown every second and stacks concurrent rmmods on the same module — the
-      # driver-wedge class `wireless_up`'s own `wireless_running && return` guard exists to avoid.
+      # block evaluated a LEVEL every tick, which could stack concurrent rmmods on the same module.
+      # wireless_down now runs its teardown to completion before returning, so the edge remains the
+      # correct boundary and a subsequent restore cannot race an in-flight detach.
       #
       # PREDICATE: `phone_on_bus`, NOT `wired_iphone_on_usb`. The raw probe greps Apple VID 05ac and
       # its own comment says what that means: "once a phone role-switches into projection it stops
@@ -1435,7 +1434,7 @@ while :; do
     if [ $((_now - wedge_escalate_ts)) -ge "$WEDGE_RATE_LIMIT" ]; then
       wedge_escalate_ts=$_now
       _old_pid=$(pidof ocbmd 2>/dev/null)
-      echo "[sup] ocbmd wedged (alive mtime stale >=1min, gadget CONFIGURED, pid=$_old_pid) — L2 restart" >> /tmp/box.log
+      echo "[sup] ocbmd wedged (monotonic heartbeat stale >=${WEDGE_STALE_AFTER}s, gadget CONFIGURED, pid=$_old_pid) — L2 restart" >> /tmp/box.log
       restart_ocbmd_daemon
       _waited=0
       while [ "$_waited" -lt 10 ]; do

@@ -40,9 +40,9 @@ enum Kind {
     Conn(u16),
     Eth,
     Mic,             // the mic-uplink seam to carplayd (readable: `uplink on/off` back-channel)
-    Rtsp,            // the SETUP-relay seam to carplayd (readable: box→host RS_OPEN/RS_REQ/RS_CLOSE bytes)
+    Rtsp, // the SETUP-relay seam to carplayd (readable: box→host RS_OPEN/RS_REQ/RS_CLOSE bytes)
     AvListen(usize), // a local A/V seam listener (index into av_listeners)
-    AvConn(usize),   // an accepted A/V seam connection (index into av_conns)
+    AvConn(usize), // an accepted A/V seam connection (index into av_conns)
 }
 
 /// Raw L2 ethernet bridge for CH_ETH: an AF_PACKET socket on `ncm0` carries the iPhone's
@@ -295,6 +295,11 @@ impl FileState {
 const I2C_M_RD: u16 = 0x0001;
 const I2C_RDWR: libc::c_int = 0x0707;
 
+#[inline]
+fn i2c_transfer_complete(actual: libc::c_int, expected: libc::c_int) -> bool {
+    actual == expected
+}
+
 #[repr(C)]
 struct I2cMsg {
     addr: u16,
@@ -313,6 +318,49 @@ struct Mfi {
     addr: u16,
 }
 
+#[derive(Debug)]
+enum MfiError {
+    LockOpen(i32),
+    LockBusy,
+    DeviceOpen(i32),
+    I2c {
+        op: &'static str,
+        reg: u8,
+        expected: libc::c_int,
+        actual: libc::c_int,
+        errno: i32,
+    },
+    InvalidLength {
+        what: &'static str,
+        length: usize,
+    },
+    SignPollTimeout,
+}
+
+impl std::fmt::Display for MfiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MfiError::LockOpen(errno) => write!(f, "cannot open shared MFi lock (errno {errno})"),
+            MfiError::LockBusy => write!(f, "shared MFi lock busy for 10s"),
+            MfiError::DeviceOpen(errno) => write!(f, "cannot open /dev/i2c-1 (errno {errno})"),
+            MfiError::I2c {
+                op,
+                reg,
+                expected,
+                actual,
+                errno,
+            } => write!(
+                f,
+                "I2C {op} reg 0x{reg:02x}: transferred {actual}/{expected} messages (errno {errno})"
+            ),
+            MfiError::InvalidLength { what, length } => {
+                write!(f, "invalid {what} length {length}")
+            }
+            MfiError::SignPollTimeout => write!(f, "signature completion poll exceeded 2500ms"),
+        }
+    }
+}
+
 /// Bounded `flock` on `/tmp/carplay_mfi.lock`, the same file `carplayd`, `iap2d`,
 /// `btd` and `mfi-i2c-local` use.
 ///
@@ -326,7 +374,7 @@ struct Mfi {
 struct MfiLock(RawFd);
 
 impl MfiLock {
-    fn acquire() -> Option<MfiLock> {
+    fn acquire() -> Result<MfiLock, MfiError> {
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
         let fd = unsafe {
             libc::open(
@@ -336,17 +384,18 @@ impl MfiLock {
             )
         };
         if fd < 0 {
-            return None;
+            return Err(MfiError::LockOpen(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            ));
         }
         let start = std::time::Instant::now();
         loop {
             if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Some(MfiLock(fd));
+                return Ok(MfiLock(fd));
             }
             if start.elapsed() >= DEADLINE {
-                eprintln!("[mfi] lock busy >10s — another chip user is wedged; refusing");
                 unsafe { libc::close(fd) };
-                return None;
+                return Err(MfiError::LockBusy);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -363,16 +412,32 @@ impl Drop for MfiLock {
 }
 
 impl Mfi {
-    fn open() -> Option<Mfi> {
+    fn open() -> Result<Mfi, MfiError> {
         // O_CLOEXEC so the MFi chip handle does not leak into the CONSOLE root shell on execv.
         let fd = unsafe { libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd < 0 {
-            None
+            Err(MfiError::DeviceOpen(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            ))
         } else {
-            Some(Mfi { fd, addr: 0x11 })
+            Ok(Mfi { fd, addr: 0x11 })
         }
     }
-    fn rd(&self, reg: u8, out: &mut [u8]) -> bool {
+
+    fn reopen(&mut self) -> Result<(), MfiError> {
+        let fd = unsafe { libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(MfiError::DeviceOpen(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            ));
+        }
+        unsafe { libc::close(self.fd) };
+        self.fd = fd;
+        eprintln!("[mfi] reopened /dev/i2c-1 after a failed transfer");
+        Ok(())
+    }
+
+    fn rd_once(&self, reg: u8, out: &mut [u8]) -> Result<(), MfiError> {
         let mut r = reg;
         let mut msgs = [
             I2cMsg {
@@ -392,15 +457,25 @@ impl Mfi {
             msgs: msgs.as_mut_ptr(),
             nmsgs: 2,
         };
-        for _ in 0..5 {
-            if unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) } >= 0 {
-                return true;
-            }
-            unsafe { libc::usleep(5000) };
+        let actual = unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) };
+        if i2c_transfer_complete(actual, 2) {
+            Ok(())
+        } else {
+            Err(MfiError::I2c {
+                op: "read",
+                reg,
+                expected: 2,
+                actual,
+                errno: if actual < 0 {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                } else {
+                    0
+                },
+            })
         }
-        false
     }
-    fn wr(&self, reg: u8, data: &[u8]) -> bool {
+
+    fn wr_once(&self, reg: u8, data: &[u8]) -> Result<(), MfiError> {
         let mut b = Vec::with_capacity(1 + data.len());
         b.push(reg);
         b.extend_from_slice(data);
@@ -414,44 +489,92 @@ impl Mfi {
             msgs: &mut msg,
             nmsgs: 1,
         };
-        for _ in 0..5 {
-            if unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) } >= 0 {
-                return true;
-            }
-            unsafe { libc::usleep(5000) };
+        let actual = unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) };
+        if i2c_transfer_complete(actual, 1) {
+            Ok(())
+        } else {
+            Err(MfiError::I2c {
+                op: "write",
+                reg,
+                expected: 1,
+                actual,
+                errno: if actual < 0 {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                } else {
+                    0
+                },
+            })
         }
-        false
+    }
+
+    /// Retry idempotent register reads/writes briefly. After exhausting those attempts, reopen the
+    /// device once and retry; this recovers from a stale fd without an unbounded retry loop.
+    fn transfer_retry<T>(
+        &mut self,
+        op: &'static str,
+        reg: u8,
+        mut transfer: impl FnMut(&Self) -> Result<T, MfiError>,
+    ) -> Result<T, MfiError> {
+        let mut last = None;
+        for pass in 0..2 {
+            for attempt in 0..5 {
+                match transfer(self) {
+                    Ok(value) => return Ok(value),
+                    Err(err) => last = Some(err),
+                }
+                if attempt < 4 {
+                    unsafe { libc::usleep(5000) };
+                }
+            }
+            if pass == 0 {
+                self.reopen()?;
+            }
+        }
+        Err(last.unwrap_or(MfiError::I2c {
+            op,
+            reg,
+            expected: 0,
+            actual: -1,
+            errno: 0,
+        }))
+    }
+
+    fn rd(&mut self, reg: u8, out: &mut [u8]) -> Result<(), MfiError> {
+        self.transfer_retry("read", reg, |m| m.rd_once(reg, out))
+    }
+
+    fn wr(&mut self, reg: u8, data: &[u8]) -> Result<(), MfiError> {
+        self.transfer_retry("write", reg, |m| m.wr_once(reg, data))
+    }
+
+    /// The trigger is stateful: if its ioctl reports an error/short transfer, whether the chip saw
+    /// the trigger is unknown. Never blindly replay it; return a diagnostic instead.
+    fn trigger_sign(&self) -> Result<(), MfiError> {
+        self.wr_once(0x10, &[0x01])
     }
     /// CopyCertificate: reg 0x30 = length (2 BE), reg 0x31 = cert bytes.
-    fn cert(&self) -> Option<Vec<u8>> {
+    fn cert(&mut self) -> Result<Vec<u8>, MfiError> {
         let _lock = MfiLock::acquire()?; // serialize the whole cert read vs the other four users
         let mut lb = [0u8; 2];
-        if !self.rd(0x30, &mut lb) {
-            return None;
-        }
+        self.rd(0x30, &mut lb)?;
         let n = ((lb[0] as usize) << 8) | lb[1] as usize;
         if n == 0 || n > 2048 {
-            return None;
+            return Err(MfiError::InvalidLength {
+                what: "certificate",
+                length: n,
+            });
         }
         let mut o = vec![0u8; n];
-        if !self.rd(0x31, &mut o) {
-            return None;
-        }
-        Some(o)
+        self.rd(0x31, &mut o)?;
+        Ok(o)
     }
     /// CreateSignature: write challenge (0x20 len, 0x21 data), go (0x10=1), poll 0x10 bit4, read 0x11 len / 0x12 sig.
-    fn sign(&self, chal: &[u8]) -> Option<Vec<u8>> {
+    fn sign(&mut self, chal: &[u8]) -> Result<Vec<u8>, MfiError> {
         let _lock = MfiLock::acquire()?; // hold across the ENTIRE stateful challenge/poll/read sequence
         let clen = chal.len();
-        if !self.wr(0x20, &[(clen >> 8) as u8, clen as u8]) {
-            return None;
-        }
-        if !self.wr(0x21, chal) {
-            return None;
-        }
-        if !self.wr(0x10, &[0x01]) {
-            return None;
-        }
+        self.wr(0x20, &[(clen >> 8) as u8, clen as u8])?;
+        self.wr(0x21, chal)?;
+        self.trigger_sign()?;
         unsafe { libc::usleep(100_000) };
         let mut done = false;
         // Bounded by WALL CLOCK, not iteration count — the same defect audit #8 fixed in
@@ -464,28 +587,27 @@ impl Mfi {
         let poll_start = std::time::Instant::now();
         while poll_start.elapsed() < SIGN_POLL_DEADLINE {
             let mut st = [0u8; 1];
-            if self.rd(0x10, &mut st) && (st[0] & 0x10) != 0 {
+            if self.rd(0x10, &mut st).is_ok() && (st[0] & 0x10) != 0 {
                 done = true;
                 break;
             }
             unsafe { libc::usleep(10_000) };
         }
         if !done {
-            return None;
+            return Err(MfiError::SignPollTimeout);
         }
         let mut sl = [0u8; 2];
-        if !self.rd(0x11, &mut sl) {
-            return None;
-        }
+        self.rd(0x11, &mut sl)?;
         let n = ((sl[0] as usize) << 8) | sl[1] as usize;
         if n == 0 || n > 256 {
-            return None;
+            return Err(MfiError::InvalidLength {
+                what: "signature",
+                length: n,
+            });
         }
         let mut sig = vec![0u8; n];
-        if !self.rd(0x12, &mut sig) {
-            return None;
-        }
-        Some(sig)
+        self.rd(0x12, &mut sig)?;
+        Ok(sig)
     }
 }
 
@@ -510,18 +632,18 @@ struct Daemon {
     av_conns: Vec<(TcpStream, u16, bool)>,
     conns: HashMap<u16, Conn>,
     out_hi: OutQueue, // priority output FIFO: CTRL/MFI/RTSP (reliable, latency-sensitive)
-    out_console: OutQueue,                        // CH_CONSOLE — drained AFTER A/V so a console flood can't starve it (audit B3)
+    out_console: OutQueue, // CH_CONSOLE — drained AFTER A/V so a console flood can't starve it (audit B3)
     // LIVE A/V — one queue PER stream so each video seam's read-gate keys on ITS OWN backlog, not a
     // shared one. A single shared FIFO coupled the two video streams + audio: the low-rate cluster
     // (:9005) / audio kept it non-empty, so the main 4K seam was almost never read → ~2fps + stalls
     // (audit 2026-07-12 H1). Separate queues + per-stream gating (see the poll loop) fix that; audio is
     // never gated and drains first so it never waits behind a video frame.
-    out_video: OutQueue,                          // CH_VIDEO (main screen)
-    out_alt_video: OutQueue,                      // CH_ALT_VIDEO (cluster / type-111)
-    out_audio: OutQueue,                          // CH_MEDIA_AUDIO + CH_ALT_AUDIO (never gated)
-    out_log: OutQueue, // CH_LOG — below CONSOLE, above bulk: diagnostics must never delay the
+    out_video: OutQueue,     // CH_VIDEO (main screen)
+    out_alt_video: OutQueue, // CH_ALT_VIDEO (cluster / type-111)
+    out_audio: OutQueue,     // CH_MEDIA_AUDIO + CH_ALT_AUDIO (never gated)
+    out_log: OutQueue,       // CH_LOG — below CONSOLE, above bulk: diagnostics must never delay the
     // control plane, A/V, or an interactive rescue console, but they should still beat a file pull.
-    out_lo: OutQueue,                             // bulk output FIFO: ECHO/IP/FILE/ETH (reliable)
+    out_lo: OutQueue, // bulk output FIFO: ECHO/IP/FILE/ETH (reliable)
     /// Universal-log tailer (`/tmp/box.log` -> CH_LOG). Off until the host sends `CT_LOG_CTL`.
     log: LogTail,
     /// Which queue is resting MID-FRAME on the shared accessory fd, if any. While set, that queue must
@@ -583,7 +705,7 @@ struct Daemon {
     /// consuming mic audio, and without this the app kept a hot mic for 45 min after a hangup
     /// (measured 2026-09-04, first live HFP calls).
     mic_uplink_on: bool,
-    mic_fwd: u64,    // count of mic PCM chunks relayed (observability)
+    mic_fwd: u64, // count of mic PCM chunks relayed (observability)
     // Bidirectional connection to carplayd's SETUP-relay seam (CH_RTSP ↔ :9106). EAGER while a host
     // is subscribed (see ensure_rtsp_seam) — the relay's RS_OPEN fires at pair-verify, BEFORE any
     // host→box bytes could lazily trigger a connect.
@@ -877,7 +999,11 @@ fn split_log_lines(
     for piece in chunk.split_inclusive(|&b| b == b'\n') {
         consumed += piece.len() as u64;
         let complete = piece.last() == Some(&b'\n');
-        let mut body = if complete { &piece[..piece.len() - 1] } else { piece };
+        let mut body = if complete {
+            &piece[..piece.len() - 1]
+        } else {
+            piece
+        };
         // Strip a CRLF's \r so it doesn't become a control character inside every entry.
         if complete && body.last() == Some(&b'\r') {
             body = &body[..body.len() - 1];
@@ -1442,7 +1568,9 @@ const PEER_STORE: &str = "/etc/carplay_peers.bin";
 /// file. Absent is also carplayd's normal cold-start case ("peerstore: none ... (fresh)").
 fn forget_airplay_peers() {
     match std::fs::remove_file(PEER_STORE) {
-        Ok(()) => eprintln!("[ocbmd] mgmt: cleared AirPlay pairings ({PEER_STORE}) — next connect re-pairs"),
+        Ok(()) => eprintln!(
+            "[ocbmd] mgmt: cleared AirPlay pairings ({PEER_STORE}) — next connect re-pairs"
+        ),
         // Already absent is the desired state, not a failure; anything else is worth naming.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => eprintln!("[ocbmd] mgmt: could NOT clear {PEER_STORE}: {e}"),
@@ -1539,7 +1667,10 @@ impl OutQueue {
         // a corrupt frame. Callers already cap their reads; this net stops a future uncapped caller from
         // regressing silently.
         if let Err(e) = p::try_frame_into(&mut self.buf, ch, flags, seq, payload) {
-            eprintln!("[ocbmd] dropping oversized frame on ch {ch}: {} B > {} B max", e.len, e.max);
+            eprintln!(
+                "[ocbmd] dropping oversized frame on ch {ch}: {} B > {} B max",
+                e.len, e.max
+            );
         }
     }
     /// Queue a frame whose first `already` bytes were ALREADY written to the fd by a partial vectored write
@@ -1547,7 +1678,10 @@ impl OutQueue {
     /// the frame lands at buf[0..]; `cursor = already` makes `drain_to` resume exactly where writev stopped.
     /// The re-queued header is byte-identical to what writev sent (both via ocbm-proto's header builder).
     fn push_partial(&mut self, ch: u16, flags: u8, seq: u32, payload: &[u8], already: usize) {
-        debug_assert!(self.is_empty(), "push_partial on a non-empty queue would corrupt frame order");
+        debug_assert!(
+            self.is_empty(),
+            "push_partial on a non-empty queue would corrupt frame order"
+        );
         self.push_frame(ch, flags, seq, payload); // reclaim() empties buf → frame at [0..], cursor 0
         self.cursor = already.min(self.buf.len());
     }
@@ -1645,7 +1779,9 @@ impl Daemon {
                 if self.wire_owner == Some(Wire::Console) {
                     self.wire_owner = None;
                 }
-                eprintln!("[ocbmd] out_console cap hit ({OUT_QUEUE_CAP} B) — cleared (console flood?)");
+                eprintln!(
+                    "[ocbmd] out_console cap hit ({OUT_QUEUE_CAP} B) — cleared (console flood?)"
+                );
             }
         } else if ch == p::CH_LOG {
             // The tailer only frames what it has already checked will fit (it drops the OLDEST
@@ -1689,11 +1825,17 @@ impl Daemon {
                 // used for the cap checks. `total` = the bytes write_vectored actually sends = `n`.
                 p::write_header(&mut hdr, ch, flags, seq, payload.len());
                 let total = n;
-                match self.acc.write_vectored(&[IoSlice::new(&hdr), IoSlice::new(payload)]) {
+                match self
+                    .acc
+                    .write_vectored(&[IoSlice::new(&hdr), IoSlice::new(payload)])
+                {
                     Ok(w) if w >= total => {
                         // Full zero-copy write — nothing queued.
                         if self.av_backpressured {
-                            eprintln!("[ocbmd] live-A/V backpressure cleared ({} dropped total)", self.av_dropped);
+                            eprintln!(
+                                "[ocbmd] live-A/V backpressure cleared ({} dropped total)",
+                                self.av_dropped
+                            );
                             self.av_backpressured = false;
                         }
                         return;
@@ -1702,9 +1844,18 @@ impl Daemon {
                         // Partial: re-queue the whole frame with `w` bytes marked written, own the wire so
                         // drain() resumes THIS queue mid-frame (never interleaves another stream).
                         let wire = match ch {
-                            p::CH_VIDEO => { self.out_video.push_partial(ch, flags, seq, payload, w); Wire::Video }
-                            p::CH_ALT_VIDEO => { self.out_alt_video.push_partial(ch, flags, seq, payload, w); Wire::AltVideo }
-                            _ => { self.out_audio.push_partial(ch, flags, seq, payload, w); Wire::Audio }
+                            p::CH_VIDEO => {
+                                self.out_video.push_partial(ch, flags, seq, payload, w);
+                                Wire::Video
+                            }
+                            p::CH_ALT_VIDEO => {
+                                self.out_alt_video.push_partial(ch, flags, seq, payload, w);
+                                Wire::AltVideo
+                            }
+                            _ => {
+                                self.out_audio.push_partial(ch, flags, seq, payload, w);
+                                Wire::Audio
+                            }
                         };
                         self.wire_owner = Some(wire);
                         self.drain(); // try to push the remainder now (matches the queued path's post-drain)
@@ -1907,7 +2058,9 @@ impl Daemon {
         // The host IS present — only the flag dips, and only long enough to be observable.
         self.present = true;
         self.rearm_deadline = Some(std::time::Instant::now() + REARM_HOLD);
-        eprintln!("[ocbmd] session: presence dipped for the supervisor's re-ARM (host not signalled)");
+        eprintln!(
+            "[ocbmd] session: presence dipped for the supervisor's re-ARM (host not signalled)"
+        );
     }
 
     /// Raise presence for a `CT_SUBSCRIBE` that found the box idle — holding the `/tmp/host_present`
@@ -2252,7 +2405,11 @@ impl Daemon {
         let now = std::fs::read_to_string(ACTIVE_BT_PEER_FILE)
             .map(|s| s.trim().to_ascii_uppercase())
             .unwrap_or_default();
-        let now = if valid_bt_mac(&now) { now } else { String::new() };
+        let now = if valid_bt_mac(&now) {
+            now
+        } else {
+            String::new()
+        };
         if self.active_bt_peer.as_deref() != Some(now.as_str()) {
             let replay = self.active_bt_peer.is_none();
             self.active_bt_peer = Some(now.clone());
@@ -2326,7 +2483,9 @@ impl Daemon {
         let _ = s.set_write_timeout(Some(Duration::from_millis(250)));
         match s.write_all(pair_answer_request(accept).as_bytes()) {
             Ok(()) => eprintln!("[ocbmd] pair confirm: {verb} -> btd"),
-            Err(e) => eprintln!("[ocbmd] pair confirm: {verb} — write failed: {e} (answer dropped)"),
+            Err(e) => {
+                eprintln!("[ocbmd] pair confirm: {verb} — write failed: {e} (answer dropped)")
+            }
         }
     }
 
@@ -2373,7 +2532,11 @@ impl Daemon {
     /// `/tmp` is tmpfs, every box daemon appends to this file from boot, and an idle box with no
     /// host is precisely where it would otherwise grow unwatched.
     fn log_tick(&mut self, now: Instant) {
-        let every = if self.log.enabled { LOG_TICK } else { LOG_IDLE_TICK };
+        let every = if self.log.enabled {
+            LOG_TICK
+        } else {
+            LOG_IDLE_TICK
+        };
         if let Some(prev) = self.log.last_check {
             if now.duration_since(prev) < every {
                 return;
@@ -2434,7 +2597,8 @@ impl Daemon {
             use std::os::unix::fs::MetadataExt;
             use std::os::unix::fs::OpenOptionsExt;
             let mut o = OpenOptions::new();
-            o.read(true).custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+            o.read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
             // Write access on the staged source only, and only so the cap can ftruncate this fd.
             // A tail-only source is opened read-only so a bug here CANNOT touch a file the
             // supervisor parses.
@@ -2476,7 +2640,9 @@ impl Daemon {
         let got = {
             use std::io::{Seek, SeekFrom};
             let off = self.log.srcs[i].off;
-            let Some(f) = self.log.srcs[i].fd.as_mut() else { return 0 };
+            let Some(f) = self.log.srcs[i].fd.as_mut() else {
+                return 0;
+            };
             match f.seek(SeekFrom::Start(off)).and_then(|_| f.read(buf)) {
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -2494,7 +2660,9 @@ impl Daemon {
         let read_ms = now_unix_ms();
         {
             // Disjoint field borrows: the splitter owns the carry, the closure owns the output.
-            let LogTail { srcs, pending, seq, .. } = &mut self.log;
+            let LogTail {
+                srcs, pending, seq, ..
+            } = &mut self.log;
             let s = &mut srcs[i];
             split_log_lines(
                 &buf[..got],
@@ -2565,11 +2733,18 @@ impl Daemon {
             // whatever is at the front of the file right now is history again — re-stamp it,
             // same as a fresh open. Absent fd (the replaced/reaped caller already cleared it)
             // just leaves the value for the next open to set.
-            s.backfill_until = s.fd.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+            s.backfill_until =
+                s.fd.as_ref()
+                    .and_then(|f| f.metadata().ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
             s.partial = Vec::new();
             s.id
         };
-        self.log_internal(&format!("{} {why} — restarting from offset 0", p::log_source_name(id)));
+        self.log_internal(&format!(
+            "{} {why} — restarting from offset 0",
+            p::log_source_name(id)
+        ));
     }
 
     /// Enforce the cap on the STAGED source only. The tail-only sources belong to the supervisor
@@ -2595,7 +2770,9 @@ impl Daemon {
             return;
         }
         let unstreamed = size.saturating_sub(off);
-        let Some(f) = self.log.srcs[i].fd.as_ref() else { return };
+        let Some(f) = self.log.srcs[i].fd.as_ref() else {
+            return;
+        };
         // O_APPEND writers are unaffected: the kernel recomputes their offset per write, so they
         // keep appending at the (now zero) end instead of leaving a hole full of NULs.
         if unsafe { libc::ftruncate(f.as_raw_fd(), 0) } < 0 {
@@ -2609,7 +2786,9 @@ impl Daemon {
         self.log.srcs[i].backfill_until = 0;
         self.log.srcs[i].partial = Vec::new();
         self.log.srcs[i].partial_clipped = false;
-        self.log_internal(&format!("rotated {size} bytes at cap {cap} ({unstreamed} not streamed)"));
+        self.log_internal(&format!(
+            "rotated {size} bytes at cap {cap} ({unstreamed} not streamed)"
+        ));
     }
 
     /// CAP, not-streaming arm: nobody is reading the file, so rotate it and leave one marker line
@@ -2647,7 +2826,14 @@ impl Daemon {
         let seq = self.log.seq;
         self.log.seq = seq.wrapping_add(1);
         let ms = now_unix_ms();
-        p::encode_log_entry(&mut self.log.pending, p::LOG_SRC_INTERNAL, 0, seq, ms, msg.as_bytes());
+        p::encode_log_entry(
+            &mut self.log.pending,
+            p::LOG_SRC_INTERNAL,
+            0,
+            seq,
+            ms,
+            msg.as_bytes(),
+        );
     }
 
     /// Report a source's I/O failure ONCE per failure run — see [`LogSource::err_logged`].
@@ -2682,7 +2868,14 @@ impl Daemon {
         if n > 0 {
             let seq = self.log.seq;
             self.log.seq = seq.wrapping_add(1);
-            p::encode_log_entry(&mut head, p::LOG_SRC_INTERNAL, p::LOG_F_DROPPED, seq, ms, &n.to_le_bytes());
+            p::encode_log_entry(
+                &mut head,
+                p::LOG_SRC_INTERNAL,
+                p::LOG_F_DROPPED,
+                seq,
+                ms,
+                &n.to_le_bytes(),
+            );
         }
         if !head.is_empty() {
             head.append(&mut self.log.pending);
@@ -2822,7 +3015,11 @@ impl Daemon {
             } else {
                 p::SEV_PHONE_ABSENT
             };
-            self.send(p::CH_CTRL, mirror_flags(replay), &[p::CT_SESSION_EVENT, sev]);
+            self.send(
+                p::CH_CTRL,
+                mirror_flags(replay),
+                &[p::CT_SESSION_EVENT, sev],
+            );
             eprintln!(
                 "[ocbmd] session: phone {}",
                 if present {
@@ -2893,6 +3090,14 @@ impl Daemon {
         );
     }
 
+    fn ensure_mfi(&mut self) -> Result<&mut Mfi, MfiError> {
+        if self.mfi.is_none() {
+            self.mfi = Some(Mfi::open()?);
+        }
+        // Set above or already populated.
+        Ok(self.mfi.as_mut().expect("MFi initialized"))
+    }
+
     fn handle_mfi(&mut self, pl: &[u8]) {
         if pl.len() < 3 {
             return;
@@ -2907,16 +3112,19 @@ impl Daemon {
         //
         // Additive in both directions: we already ignored bytes past `3 + ilen`, and a host that does
         // not send one simply gets no tag back and keeps its old length-correlation behaviour.
-        let tag: Option<u8> =
-            if pl.len() == 3 + ilen + p::MFI_TAG_LEN { Some(pl[3 + ilen]) } else { None };
+        let tag: Option<u8> = if pl.len() == 3 + ilen + p::MFI_TAG_LEN {
+            Some(pl[3 + ilen])
+        } else {
+            None
+        };
         let start = Instant::now();
-        let result: Option<Vec<u8>> = match op {
-            0x01 => self.mfi.as_ref().and_then(|m| m.cert()),
+        let result: Result<Vec<u8>, MfiError> = match op {
+            0x01 => self.ensure_mfi().and_then(Mfi::cert),
             // Upper bound before the chip is touched: `I2cMsg::len` is a u16, so a 65536-byte
             // challenge would wrap it to 0 and hand the coprocessor a zero-length write plus a "go".
             // MFi 2.0C challenges are 20/32-byte digests; 1024 is generous.
             0x02 if ilen > 0 && ilen <= 1024 && 3 + ilen <= pl.len() => {
-                self.mfi.as_ref().and_then(|m| m.sign(&pl[3..3 + ilen]))
+                self.ensure_mfi().and_then(|m| m.sign(&pl[3..3 + ilen]))
             }
             _ => {
                 let mut resp = vec![0x02, 0, 0];
@@ -2936,7 +3144,7 @@ impl Daemon {
             self.last_hb = Some(Instant::now());
         }
         match result {
-            Some(data) => {
+            Ok(data) => {
                 let mut resp = Vec::with_capacity(3 + data.len() + 1);
                 resp.push(0);
                 resp.push((data.len() >> 8) as u8);
@@ -2949,7 +3157,12 @@ impl Daemon {
             }
             // Errors carry the tag too — a misattributed FAILED is as damaging as a misattributed
             // signature to a caller that does not retry.
-            None => {
+            Err(err) => {
+                let name = if op == 0x01 { "cert" } else { "sign" };
+                eprintln!(
+                    "[mfi] {name} failed after {} ms: {err}",
+                    start.elapsed().as_millis()
+                );
                 let mut resp = vec![0x01, 0, 0];
                 if let Some(t) = tag {
                     resp.push(t);
@@ -3406,14 +3619,16 @@ impl Daemon {
                     d.extend_from_slice(&buf[..n]);
                     self.send(p::CH_FILE, p::F_SOM | p::F_EOM, &d);
                     self.drain(); // flush this frame before reading the next (bounded out_lo)
-                    // Pace the flash read to the host's drain rate (same watermark as the CT_SRC
-                    // bench): without this, `out_lo` hits its 1 MiB cap under USB contention and the
-                    // cap-clear loses a 1 MiB burst — a deterministic host-side CRC failure.
+                                  // Pace the flash read to the host's drain rate (same watermark as the CT_SRC
+                                  // bench): without this, `out_lo` hits its 1 MiB cap under USB contention and the
+                                  // cap-clear loses a 1 MiB burst — a deterministic host-side CRC failure.
                     let stall = Instant::now();
                     while self.out_lo.len() > 262_144 {
                         let elapsed = stall.elapsed();
                         if elapsed >= PULL_STALL_DEADLINE {
-                            eprintln!("[ocbmd] file pull of {path} aborted — host stopped draining");
+                            eprintln!(
+                                "[ocbmd] file pull of {path} aborted — host stopped draining"
+                            );
                             self.send_file_ack(p::FILE_ERR_WRITE, 0, 0);
                             return;
                         }
@@ -3788,11 +4003,11 @@ impl Daemon {
                     self.subscribed = true;
                     self.last_hb = Some(Instant::now());
                     self.hb_unsub_nudged_at = None; // the unsubscribed-heartbeat nudge is spent
-                    // FRESH-SESSION A/V RESYNC (2026-09-03). CT_HELLO clears these already; a SUBSCRIBE
-                    // that did NOT follow a HELLO (a host re-arming over an attach that is still up)
-                    // would otherwise hand the receiver the PREVIOUS session's queued tail — a partial
-                    // seam message that its byte-stream reassembly splices onto the next producer's
-                    // first bytes. Normally a no-op: each A/V stream is gated to one in-flight frame.
+                                                    // FRESH-SESSION A/V RESYNC (2026-09-03). CT_HELLO clears these already; a SUBSCRIBE
+                                                    // that did NOT follow a HELLO (a host re-arming over an attach that is still up)
+                                                    // would otherwise hand the receiver the PREVIOUS session's queued tail — a partial
+                                                    // seam message that its byte-stream reassembly splices onto the next producer's
+                                                    // first bytes. Normally a no-op: each A/V stream is gated to one in-flight frame.
                     self.out_video.clear();
                     self.out_alt_video.clear();
                     self.out_audio.clear();
@@ -3955,7 +4170,9 @@ impl Daemon {
                         }
                         Some(1) => {
                             let _ = std::fs::remove_file(RADIO_OFF_FLAG);
-                            eprintln!("[ocbmd] session: CT_RADIO on (inhibit cleared; cfg governs)");
+                            eprintln!(
+                                "[ocbmd] session: CT_RADIO on (inhibit cleared; cfg governs)"
+                            );
                         }
                         other => eprintln!("[ocbmd] session: CT_RADIO bad arg {other:?} (ignored)"),
                     }
@@ -3989,7 +4206,11 @@ impl Daemon {
                     self.log.last_check = None;
                     eprintln!(
                         "[ocbmd] log stream {} (cap {} KiB{})",
-                        if enable { "ENABLED — from offset 0" } else { "disabled" },
+                        if enable {
+                            "ENABLED — from offset 0"
+                        } else {
+                            "disabled"
+                        },
                         self.log.cap_bytes() / 1024,
                         if was == enable { ", unchanged" } else { "" }
                     );
@@ -4012,7 +4233,7 @@ impl Daemon {
             p::CH_INPUT => self.forward_input(pl), // HID input host -> carplayd -> iPhone (task #20)
             p::CH_MIC => self.forward_mic(pl), // mic PCM host -> carplayd -> iPhone (type-100 uplink)
             p::CH_RTSP => self.forward_rtsp(pl), // SETUP-relay bytes host -> carplayd (RS_RESP/RS_ERR)
-            p::CH_MGMT => self.handle_mgmt(pl), // box management (the app's "CCPA" tab)
+            p::CH_MGMT => self.handle_mgmt(pl),  // box management (the app's "CCPA" tab)
             _ => {}
         }
     }
@@ -4060,27 +4281,32 @@ fn acquire_pid_lock(path: &str) -> std::io::Result<RawFd> {
 
 /// Liveness stamp for the supervisor.
 ///
-/// CONTRACT: mtime older than 15 s while the accessory is configured ⇒ ocbmd is wedged;
-/// `session_supervisor.sh` escalates (a separate change ships that). Absent = ocbmd is not running,
-/// which the supervisor already detects via [`PID_LOCK_FILE`] and handles differently.
+/// CONTRACT: a monotonic uptime stamp at least 60 s old while the accessory is configured
+/// ⇒ ocbmd is wedged; `session_supervisor.sh` escalates. Missing or invalid stamps are treated as
+/// unknown (not stale), providing startup grace and avoiding false positives during writes.
 ///
 /// It exists because the hang this file's [`BtProbe`] fixes had NO outward symptom the supervisor
 /// could see: the process was alive and holding its pid lock, `/tmp/host_present` still read 1, and
 /// it never exited, so nothing respawned it for >5 minutes. A pid is not liveness.
 const ALIVE_FILE: &str = "/tmp/ocbmd_alive";
 
-/// Rate limit on [`touch_alive_file`]: the dispatch loop wakes thousands of times/sec during A/V and
+/// Rate limit on [`write_alive_stamp`]: the dispatch loop wakes thousands of times/sec during A/V and
 /// the supervisor polls at ~1 Hz, so more than 1 Hz here is pure syscall overhead.
 const ALIVE_TOUCH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Set `ALIVE_FILE`'s mtime to now. One `utimensat` with a NULL `times` — no open, no write, no
-/// buffer, and no `time_t` to get wrong on 32-bit musl (the kernel supplies the timestamp).
-fn touch_alive_file() {
-    if let Ok(c) = std::ffi::CString::new(ALIVE_FILE) {
-        unsafe {
-            libc::utimensat(libc::AT_FDCWD, c.as_ptr(), std::ptr::null(), 0);
-        }
-    }
+/// Publish integer monotonic uptime, not filesystem mtime: CT_SETTIME can jump CLOCK_REALTIME
+/// after startup, which made a newly-created stamp look minutes/months old to BusyBox `find`.
+/// This file is tiny and updated once per second; a reader racing the truncate/write sees an
+/// invalid stamp and safely waits for the next tick rather than declaring a false wedge.
+fn write_alive_stamp() -> std::io::Result<()> {
+    let uptime = std::fs::read_to_string("/proc/uptime")?;
+    let seconds = uptime
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|value| value.split('.').next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid /proc/uptime"))?;
+    std::fs::write(ALIVE_FILE, format!("{seconds}\n"))
 }
 
 /// Clear the session state a departed host owns, on the transport-death exit paths.
@@ -4142,16 +4368,24 @@ fn main() {
             eprintln!("open {}: {}", ACC_DEV, e);
             std::process::exit(1);
         });
-    let mfi = Mfi::open();
-    if let Some(ref m) = mfi {
+    let mut mfi = match Mfi::open() {
+        Ok(m) => Some(m),
+        Err(err) => {
+            eprintln!("[mfi] startup open failed: {err:?}; will retry on the first request");
+            None
+        }
+    };
+    if let Some(m) = mfi.as_mut() {
         // Warm-up (DeviceVersion) under /tmp/carplay_mfi.lock, like every other chip access. ocbmd
         // respawns on every `ocbm-host` command, so this runs far more often than "once at boot" —
         // unlocked it can land inside carplayd's HELD write-challenge/trigger/poll/read sequence and
         // corrupt both transactions. Skipped, not forced, if the lock is unavailable: a warm-up read
         // is not worth stepping on a live handshake.
-        if let Some(_lock) = MfiLock::acquire() {
+        if let Ok(_lock) = MfiLock::acquire() {
             let mut v = [0u8; 1];
-            let _ = m.rd(0x00, &mut v);
+            if let Err(err) = m.rd(0x00, &mut v) {
+                eprintln!("[mfi] startup DeviceVersion probe failed: {err:?}");
+            }
         }
     }
     unsafe {
@@ -4268,10 +4502,10 @@ fn main() {
     // Same for a stale CT_RADIO inhibit from a crashed prior ocbmd (tmpfs, but a daemon respawn
     // without a reboot would otherwise inherit it).
     let _ = std::fs::remove_file(RADIO_OFF_FLAG);
-    // Create the liveness stamp (see [`ALIVE_FILE`]) — and note File::create also freshens the mtime
-    // of one left behind by a predecessor, so a new instance never inherits a stale "wedged" reading.
-    if let Err(e) = File::create(ALIVE_FILE) {
-        eprintln!("[ocbmd] cannot create {ALIVE_FILE} ({e}) — supervisor liveness unavailable");
+    // Seed the monotonic liveness stamp immediately. A valid fresh stamp also provides the
+    // supervisor's startup grace even if CT_SETTIME adjusts wall time during initialization.
+    if let Err(e) = write_alive_stamp() {
+        eprintln!("[ocbmd] cannot write {ALIVE_FILE} ({e}) — supervisor liveness unavailable");
     }
     let mut last_alive_touch: Option<Instant> = None;
     // Auto-reap forked children (the CONSOLE root shell) so exited console sessions don't become
@@ -4532,7 +4766,8 @@ fn main() {
                             Err(ref e)
                                 if matches!(
                                     e.kind(),
-                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::Interrupted
                                 ) =>
                             {
                                 (0usize, false)
@@ -4674,7 +4909,7 @@ fn main() {
         let now = Instant::now();
         if last_alive_touch.is_none_or(|t| now.duration_since(t) >= ALIVE_TOUCH_INTERVAL) {
             last_alive_touch = Some(now);
-            touch_alive_file();
+            let _ = write_alive_stamp();
         }
     }
 }
@@ -4702,6 +4937,24 @@ mod tests {
     fn presence_flag_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn i2c_ioctl_must_report_every_message_transferred() {
+        assert!(i2c_transfer_complete(2, 2));
+        assert!(i2c_transfer_complete(1, 1));
+        assert!(
+            !i2c_transfer_complete(1, 2),
+            "a short two-message read is not success"
+        );
+        assert!(
+            !i2c_transfer_complete(0, 1),
+            "zero transferred messages is not success"
+        );
+        assert!(
+            !i2c_transfer_complete(-1, 1),
+            "an ioctl error is not success"
+        );
     }
 
     /// A Daemon with no MFi chip, no listeners and a /dev/null accessory fd.
@@ -4761,7 +5014,7 @@ mod tests {
             input_dropped: 0,
             mic_sock: None,
             mic_rx: Vec::new(),
-        mic_uplink_on: false,
+            mic_uplink_on: false,
             mic_fwd: 0,
             rtsp_sock: None,
             phone_state: None,
@@ -4807,7 +5060,11 @@ mod tests {
         let mut d = td();
         d.on_mic_backchannel_line(line);
         let out = sent(&mut d);
-        assert_eq!(out.len(), 1, "one line must produce exactly one CTRL frame: {out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "one line must produce exactly one CTRL frame: {out:?}"
+        );
         assert_eq!(out[0].0, p::CH_CTRL);
         assert_eq!(out[0].2[0], p::CT_UPLINK);
         out[0].2.clone()
@@ -4845,8 +5102,15 @@ mod tests {
     #[test]
     fn an_unknown_uplink_codec_token_degrades_to_pcm() {
         assert_eq!(uplink_payload("uplink on 16000 1 lc3")[7], 0);
-        assert_eq!(uplink_payload("uplink on 16000 1 MSBC")[7], 0, "the token is lowercase on the wire");
-        assert_eq!(uplink_payload("uplink on 16000 1 msbc extra")[7], p::SEAM_CODEC_MSBC);
+        assert_eq!(
+            uplink_payload("uplink on 16000 1 MSBC")[7],
+            0,
+            "the token is lowercase on the wire"
+        );
+        assert_eq!(
+            uplink_payload("uplink on 16000 1 msbc extra")[7],
+            p::SEAM_CODEC_MSBC
+        );
     }
 
     /// OFF stays the seven-byte all-zero form byte-identically. It is the edge that STOPS a
@@ -4865,7 +5129,13 @@ mod tests {
         // NB "uplink on…" with no space is NOT in this list: `strip_prefix("uplink on")` has always
         // matched it and this change does not touch that. Nothing produces such a line, and
         // tightening the prefix here would be an unrelated behaviour change.
-        for l in ["touch 1 2 3", "cmd whatever", "uplink", "uplink of", "mic 320"] {
+        for l in [
+            "touch 1 2 3",
+            "cmd whatever",
+            "uplink",
+            "uplink of",
+            "mic 320",
+        ] {
             d.on_mic_backchannel_line(l);
         }
         assert!(sent(&mut d).is_empty());
@@ -4940,7 +5210,11 @@ mod tests {
     }
 
     fn append(path: &str, s: &str) {
-        let mut f = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
         f.write_all(s.as_bytes()).unwrap();
     }
 
@@ -4950,11 +5224,12 @@ mod tests {
         // once, whole, and only after its newline — never as two half-lines.
         let (mut partial, mut clipped) = (Vec::new(), false);
         let mut got: Vec<String> = Vec::new();
-        let feed = |chunk: &[u8], partial: &mut Vec<u8>, clipped: &mut bool, got: &mut Vec<String>| {
-            split_log_lines(chunk, 0, partial, clipped, |line, _t, _end| {
-                got.push(String::from_utf8_lossy(line).into_owned())
-            });
-        };
+        let feed =
+            |chunk: &[u8], partial: &mut Vec<u8>, clipped: &mut bool, got: &mut Vec<String>| {
+                split_log_lines(chunk, 0, partial, clipped, |line, _t, _end| {
+                    got.push(String::from_utf8_lossy(line).into_owned())
+                });
+            };
         feed(b"[a] one\n[b] tw", &mut partial, &mut clipped, &mut got);
         assert_eq!(got, ["[a] one"]);
         assert_eq!(partial, b"[b] tw");
@@ -4972,12 +5247,21 @@ mod tests {
         // cost LOG_MAX_LINE of RAM, not a megabyte, and the eventual entry must say it was clipped.
         let (mut partial, mut clipped) = (Vec::new(), false);
         let mut got: Vec<(usize, bool)> = Vec::new();
-        let feed = |chunk: &[u8], partial: &mut Vec<u8>, clipped: &mut bool, got: &mut Vec<(usize, bool)>| {
-            split_log_lines(chunk, 0, partial, clipped, |line, t, _end| got.push((line.len(), t)));
+        let feed = |chunk: &[u8],
+                    partial: &mut Vec<u8>,
+                    clipped: &mut bool,
+                    got: &mut Vec<(usize, bool)>| {
+            split_log_lines(chunk, 0, partial, clipped, |line, t, _end| {
+                got.push((line.len(), t))
+            });
         };
         for _ in 0..128 {
             feed(&vec![b'x'; 8192], &mut partial, &mut clipped, &mut got);
-            assert!(partial.len() <= p::LOG_MAX_LINE, "carry grew to {}", partial.len());
+            assert!(
+                partial.len() <= p::LOG_MAX_LINE,
+                "carry grew to {}",
+                partial.len()
+            );
         }
         assert!(got.is_empty(), "nothing is emitted until a newline arrives");
         feed(b"\ntail\n", &mut partial, &mut clipped, &mut got);
@@ -4994,10 +5278,16 @@ mod tests {
         log_tick_now(&mut d);
         let v = log_sent(&mut d);
         assert_eq!(log_lines(&v), ["[carplayd] boot", "[carplayd] pair ok"]);
-        assert!(v.iter().all(|(s, _, _)| *s == p::LOG_SRC_AIRPLAYD), "entries carry their source id");
+        assert!(
+            v.iter().all(|(s, _, _)| *s == p::LOG_SRC_AIRPLAYD),
+            "entries carry their source id"
+        );
 
         log_tick_now(&mut d);
-        assert!(log_sent(&mut d).is_empty(), "EOF with no new bytes must send nothing");
+        assert!(
+            log_sent(&mut d).is_empty(),
+            "EOF with no new bytes must send nothing"
+        );
 
         append(&path, "[carplayd] RECORD\n");
         log_tick_now(&mut d);
@@ -5015,7 +5305,10 @@ mod tests {
         append(&path, "[carplayd] boot\n[carplayd] pair ok\n");
         log_tick_now(&mut d);
         let v = log_sent(&mut d);
-        let lines: Vec<&(u8, u8, Vec<u8>)> = v.iter().filter(|(s, _, _)| *s == p::LOG_SRC_AIRPLAYD).collect();
+        let lines: Vec<&(u8, u8, Vec<u8>)> = v
+            .iter()
+            .filter(|(s, _, _)| *s == p::LOG_SRC_AIRPLAYD)
+            .collect();
         assert_eq!(lines.len(), 2);
         assert!(
             lines.iter().all(|(_, f, _)| f & p::LOG_F_BACKFILL != 0),
@@ -5025,9 +5318,16 @@ mod tests {
         append(&path, "[carplayd] RECORD\n");
         log_tick_now(&mut d);
         let v2 = log_sent(&mut d);
-        let (_, f, t) = &v2.iter().find(|(s, _, _)| *s == p::LOG_SRC_AIRPLAYD).unwrap();
+        let (_, f, t) = &v2
+            .iter()
+            .find(|(s, _, _)| *s == p::LOG_SRC_AIRPLAYD)
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(t), "[carplayd] RECORD");
-        assert_eq!(f & p::LOG_F_BACKFILL, 0, "a line appended after open time is live");
+        assert_eq!(
+            f & p::LOG_F_BACKFILL,
+            0,
+            "a line appended after open time is live"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5037,12 +5337,21 @@ mod tests {
         // when a burst happened must be able to say so, rather than every line in the burst
         // landing on the one millisecond the tailer happened to read it.
         let (mut d, path) = td_log(p::LOG_SRC_IAP2D, "stamped");
-        append(&path, "@1234567890123 [iap2d] numeric-comparison code = 874736\n[iap2d] unstamped\n");
+        append(
+            &path,
+            "@1234567890123 [iap2d] numeric-comparison code = 874736\n[iap2d] unstamped\n",
+        );
         log_tick_now(&mut d);
         let v = log_sent(&mut d);
-        let lines: Vec<&(u8, u8, Vec<u8>)> = v.iter().filter(|(s, _, _)| *s == p::LOG_SRC_IAP2D).collect();
+        let lines: Vec<&(u8, u8, Vec<u8>)> = v
+            .iter()
+            .filter(|(s, _, _)| *s == p::LOG_SRC_IAP2D)
+            .collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(String::from_utf8_lossy(&lines[0].2), "[iap2d] numeric-comparison code = 874736");
+        assert_eq!(
+            String::from_utf8_lossy(&lines[0].2),
+            "[iap2d] numeric-comparison code = 874736"
+        );
         assert_eq!(String::from_utf8_lossy(&lines[1].2), "[iap2d] unstamped");
         let _ = std::fs::remove_file(&path);
     }
@@ -5070,7 +5379,9 @@ mod tests {
         log_tick_now(&mut d);
         let v = log_sent(&mut d);
         assert_eq!(log_lines(&v), ["[iap2d] c"]);
-        assert!(notes(&v).iter().any(|n| n.contains("iap2d") && n.contains("truncated externally")));
+        assert!(notes(&v)
+            .iter()
+            .any(|n| n.contains("iap2d") && n.contains("truncated externally")));
         assert_eq!(d.log.srcs[0].off, "[iap2d] c\n".len() as u64);
         let _ = std::fs::remove_file(&path);
     }
@@ -5111,9 +5422,19 @@ mod tests {
         append(&path, &"[x] 0123456789\n".repeat(8)); // 120 B > cap
         log_tick_now(&mut d);
         let v = log_sent(&mut d);
-        assert_eq!(log_lines(&v).len(), 8, "every line is streamed BEFORE the rotation");
-        assert!(notes(&v).iter().any(|n| n.contains("rotated 120 bytes") && n.contains("(0 not streamed)")));
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "the file must be emptied");
+        assert_eq!(
+            log_lines(&v).len(),
+            8,
+            "every line is streamed BEFORE the rotation"
+        );
+        assert!(notes(&v)
+            .iter()
+            .any(|n| n.contains("rotated 120 bytes") && n.contains("(0 not streamed)")));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "the file must be emptied"
+        );
         assert_eq!(d.log.srcs[0].off, 0);
 
         // O_APPEND writers keep working across the ftruncate, and the tailer picks up where they
@@ -5133,7 +5454,11 @@ mod tests {
         append(&path, &"[carplayd] line\n".repeat(20)); // 320 B, way over
         log_tick_now(&mut d);
         assert_eq!(log_lines(&log_sent(&mut d)).len(), 20);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 320, "must be left alone");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            320,
+            "must be left alone"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5145,11 +5470,14 @@ mod tests {
         d.log.enabled = false;
         d.log.cap = 32;
         append(&path, &"[x] 0123456789\n".repeat(4)); // 60 B > cap
-        // The rotate path opens LOG_FILE itself, so point the test at it only if that is safe:
-        // instead assert the decision, which is what this test owns.
+                                                      // The rotate path opens LOG_FILE itself, so point the test at it only if that is safe:
+                                                      // instead assert the decision, which is what this test owns.
         assert!(std::fs::metadata(&path).unwrap().len() > d.log.cap_bytes());
         log_tick_now(&mut d);
-        assert!(log_sent(&mut d).is_empty(), "disabled means NOTHING goes on the wire");
+        assert!(
+            log_sent(&mut d).is_empty(),
+            "disabled means NOTHING goes on the wire"
+        );
         assert!(d.log.srcs[0].fd.is_none(), "and no fd is held open");
         let _ = std::fs::remove_file(&path);
     }
@@ -5180,7 +5508,9 @@ mod tests {
             .map(|(s, _, t)| (*s, u32::from_le_bytes(t.as_slice().try_into().unwrap())))
             .collect();
         assert!(!reports.is_empty(), "lines were dropped and never reported");
-        assert!(reports.iter().all(|(s, n)| *s == p::LOG_SRC_IAP2D && *n > 0));
+        assert!(reports
+            .iter()
+            .all(|(s, n)| *s == p::LOG_SRC_IAP2D && *n > 0));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5229,8 +5559,8 @@ mod tests {
     #[test]
     fn ct_log_ctl_arms_the_stream_and_ct_stop_disarms_it() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // Default OFF, and per-session like the cfg: a host that leaves must not leave a stream
-        // running, and one that comes back re-arms and gets offset 0 again.
+                                          // Default OFF, and per-session like the cfg: a host that leaves must not leave a stream
+                                          // running, and one that comes back re-arms and gets offset 0 again.
         let mut d = td();
         assert!(!d.log.enabled, "the default is off");
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE]);
@@ -5271,8 +5601,15 @@ mod tests {
         let mut frames = 0;
         while let Some((ch, fl, n)) = r.next(&mut out) {
             assert_eq!(ch, p::CH_LOG);
-            assert_eq!(fl, p::F_SOM | p::F_EOM, "every log frame is a whole message");
-            assert!(n <= p::LOG_MAX_FRAME, "frame payload {n} over LOG_MAX_FRAME");
+            assert_eq!(
+                fl,
+                p::F_SOM | p::F_EOM,
+                "every log frame is a whole message"
+            );
+            assert!(
+                n <= p::LOG_MAX_FRAME,
+                "frame payload {n} over LOG_MAX_FRAME"
+            );
             frames += 1;
         }
         assert!(frames > 1, "8 KB of lines must pack into several frames");
@@ -5299,7 +5636,11 @@ mod tests {
         let f = sent(&mut d);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].0, p::CH_MFI);
-        assert_eq!(f[0].2, vec![0x01, 0, 0, 0x5A], "FAILED reply must carry the tag");
+        assert_eq!(
+            f[0].2,
+            vec![0x01, 0, 0, 0x5A],
+            "FAILED reply must carry the tag"
+        );
     }
 
     #[test]
@@ -5318,7 +5659,11 @@ mod tests {
         let mut d = td();
         d.handle_mfi(&[0x77, 0, 0, 0x33]);
         let f = sent(&mut d);
-        assert_eq!(f[0].2, vec![0x02, 0, 0, 0x33], "unknown-op reply must carry the tag");
+        assert_eq!(
+            f[0].2,
+            vec![0x02, 0, 0, 0x33],
+            "unknown-op reply must carry the tag"
+        );
     }
 
     #[test]
@@ -5364,7 +5709,11 @@ mod tests {
     #[test]
     fn hello_records_the_optional_host_label() {
         let mut d = td();
-        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x1234_5678, b"gm-ccpa head unit"));
+        d.handle(
+            p::CH_CTRL,
+            p::F_SOM | p::F_EOM,
+            &hello(0x1234_5678, b"gm-ccpa head unit"),
+        );
         assert_eq!(d.host_name.as_deref(), Some("gm-ccpa head unit"));
         assert_eq!(d.host_instance, Some(0x1234_5678));
     }
@@ -5383,8 +5732,15 @@ mod tests {
         label.extend(std::iter::repeat_n(b'x', 200));
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(9, &label));
         let n = d.host_name.clone().unwrap();
-        assert!(!n.chars().any(|c| c.is_control()), "control chars must be stripped: {n:?}");
-        assert!(n.chars().count() <= 64, "label must be bounded, got {}", n.chars().count());
+        assert!(
+            !n.chars().any(|c| c.is_control()),
+            "control chars must be stripped: {n:?}"
+        );
+        assert!(
+            n.chars().count() <= 64,
+            "label must be bounded, got {}",
+            n.chars().count()
+        );
     }
 
     #[test]
@@ -5404,14 +5760,24 @@ mod tests {
         assert!(!d.subscribed);
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT]);
         let out = sent(&mut d);
-        assert_eq!(out.len(), 1, "first unsubscribed beat → exactly one nudge: {out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "first unsubscribed beat → exactly one nudge: {out:?}"
+        );
         assert_eq!(out[0].0, p::CH_CTRL);
         assert_eq!(out[0].2, vec![p::CT_SESSION_EVENT, p::SEV_HOST_GONE]);
-        assert!(!d.present, "a nudge must not touch presence — it never rose");
+        assert!(
+            !d.present,
+            "a nudge must not touch presence — it never rose"
+        );
         // Subsequent beats inside the window are silent (1 Hz beats must not become 1 Hz nudges).
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT]);
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT]);
-        assert!(sent(&mut d).is_empty(), "beats inside the nudge window are silent");
+        assert!(
+            sent(&mut d).is_empty(),
+            "beats inside the nudge window are silent"
+        );
         // Past the window, the host is nudged again.
         d.hb_unsub_nudged_at = Some(Instant::now() - HB_UNSUBSCRIBED_NUDGE);
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT]);
@@ -5436,7 +5802,9 @@ mod tests {
         let _ = sent(&mut d); // drain whatever SUBSCRIBE emitted; this test is about the nudge
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT]);
         assert!(
-            sent(&mut d).iter().all(|f| f.2 != vec![p::CT_SESSION_EVENT, p::SEV_HOST_GONE]),
+            sent(&mut d)
+                .iter()
+                .all(|f| f.2 != vec![p::CT_SESSION_EVENT, p::SEV_HOST_GONE]),
             "a subscribed host must never be told GONE for a heartbeat"
         );
 
@@ -5456,31 +5824,37 @@ mod tests {
     #[test]
     fn hello_after_a_clean_stop_is_not_a_replacement() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // A clean CT_STOP ends the session outright, so the next host's HELLO meets an IDLE box.
-        // It must not be classified as a REPLACEMENT: that latches `host_replaced`, and the
-        // SUBSCRIBE after it would answer with a silent presence re-arm (wireless_down/up) on top
-        // of the teardown CT_STOP already performed.
+                                          // A clean CT_STOP ends the session outright, so the next host's HELLO meets an IDLE box.
+                                          // It must not be classified as a REPLACEMENT: that latches `host_replaced`, and the
+                                          // SUBSCRIBE after it would answer with a silent presence re-arm (wireless_down/up) on top
+                                          // of the teardown CT_STOP already performed.
         let mut d = td();
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xAAAA_AAAA, b""));
         // Presence is established by CT_SUBSCRIBE, not CT_HELLO; short-circuit to a live session.
         d.present = true;
         d.subscribed = true;
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
-        assert!(!d.present, "CT_STOP must drop presence immediately — no grace");
+        assert!(
+            !d.present,
+            "CT_STOP must drop presence immediately — no grace"
+        );
         assert!(!d.subscribed);
 
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xBBBB_BBBB, b""));
-        assert!(!d.host_replaced, "a relaunch after a clean STOP is a fresh attach, not a replacement");
+        assert!(
+            !d.host_replaced,
+            "a relaunch after a clean STOP is a fresh attach, not a replacement"
+        );
         assert_eq!(d.host_instance, Some(0xBBBB_BBBB));
     }
 
     #[test]
     fn ct_stop_takes_the_same_teardown_path_as_a_lost_heartbeat() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // The behaviour this locks: a clean host close and a heartbeat-loss host-gone must leave the
-        // daemon in the SAME state, because the supervisor's complete wireless teardown is driven off
-        // the /tmp/host_present 1->0 edge both of them write. The only sanctioned difference is the
-        // CH_CTRL SEV_HOST_GONE, which CT_STOP suppresses (the host has already detached — go_idle).
+                                          // The behaviour this locks: a clean host close and a heartbeat-loss host-gone must leave the
+                                          // daemon in the SAME state, because the supervisor's complete wireless teardown is driven off
+                                          // the /tmp/host_present 1->0 edge both of them write. The only sanctioned difference is the
+                                          // CH_CTRL SEV_HOST_GONE, which CT_STOP suppresses (the host has already detached — go_idle).
         let live = |d: &mut Daemon| {
             d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
             d.host_replaced = true; // latched state a teardown must not leave behind
@@ -5500,7 +5874,10 @@ mod tests {
             assert!(!d.present, "presence must be down");
             assert!(!d.subscribed, "the subscription must be down");
             assert!(d.cfg.is_empty(), "the ephemeral cfg must be gone");
-            assert!(!d.host_replaced, "a latched replacement must not outlive the session");
+            assert!(
+                !d.host_replaced,
+                "a latched replacement must not outlive the session"
+            );
             assert!(d.rearm_deadline.is_none());
             assert!(!d.log.enabled, "the log stream must be disarmed");
             assert!(d.conns.is_empty(), "orphaned CH_IP relays must be closed");
@@ -5509,31 +5886,43 @@ mod tests {
         }
         // ...and the flag the supervisor actually reads says GONE. Safe to assert on the shared path
         // because `presence_flag_lock` is held: `lost` wrote it last, and it wrote 0.
-        assert_eq!(std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim(), "0");
+        assert_eq!(
+            std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim(),
+            "0"
+        );
     }
 
     #[test]
     fn a_subscribe_racing_its_own_gone_edge_holds_the_flag_down_for_rearm_hold() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // THE REGRESSION THIS GUARDS: the supervisor samples /tmp/host_present at 1 Hz and acts on
-        // EDGES. Now that CT_STOP tears down immediately, a scripted quit->relaunch writes 0 then 1
-        // between two samples; the supervisor reads 1 -> 1, runs no teardown and no bring-up, and the
-        // new host ends up subscribed against the dead session's carplayd. So a raise that lands
-        // inside REARM_HOLD of the GONE edge must leave the flag at 0 and let presence_tick raise it.
+                                          // THE REGRESSION THIS GUARDS: the supervisor samples /tmp/host_present at 1 Hz and acts on
+                                          // EDGES. Now that CT_STOP tears down immediately, a scripted quit->relaunch writes 0 then 1
+                                          // between two samples; the supervisor reads 1 -> 1, runs no teardown and no bring-up, and the
+                                          // new host ends up subscribed against the dead session's carplayd. So a raise that lands
+                                          // inside REARM_HOLD of the GONE edge must leave the flag at 0 and let presence_tick raise it.
         let mut d = td();
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
-        let gone_at = d.present_cleared_at.expect("CT_STOP must stamp the GONE edge");
+        let gone_at = d
+            .present_cleared_at
+            .expect("CT_STOP must stamp the GONE edge");
 
         // Relaunch 100 ms later: present + signalled at once, but the FLAG write is deferred to
         // exactly REARM_HOLD after the edge — not after the SUBSCRIBE.
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
-        assert!(d.present, "the host is present immediately — only the flag waits");
+        assert!(
+            d.present,
+            "the host is present immediately — only the flag waits"
+        );
         assert_eq!(d.rearm_deadline, Some(gone_at + REARM_HOLD));
 
         // A second SUBSCRIBE inside the hold must not re-arm: one 0->1 edge, one bring-up.
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
-        assert_eq!(d.rearm_deadline, Some(gone_at + REARM_HOLD), "no double bring-up");
+        assert_eq!(
+            d.rearm_deadline,
+            Some(gone_at + REARM_HOLD),
+            "no double bring-up"
+        );
 
         // At the deadline presence_tick performs the single raise and disarms.
         d.presence_tick(gone_at + REARM_HOLD);
@@ -5544,8 +5933,8 @@ mod tests {
     #[test]
     fn a_subscribe_long_after_the_gone_edge_raises_presence_immediately() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // The mirror case: the supervisor has certainly sampled the 0, so holding the flag down any
-        // longer would just delay the session for nothing.
+                                          // The mirror case: the supervisor has certainly sampled the 0, so holding the flag down any
+                                          // longer would just delay the session for nothing.
         let mut d = td();
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
@@ -5553,7 +5942,10 @@ mod tests {
 
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
         assert!(d.present);
-        assert!(d.rearm_deadline.is_none(), "an already-visible GONE edge needs no hold");
+        assert!(
+            d.rearm_deadline.is_none(),
+            "an already-visible GONE edge needs no hold"
+        );
     }
 
     #[test]
@@ -5563,7 +5955,10 @@ mod tests {
         d.present = true;
         d.subscribed = true; // never STOPped: the predecessor died
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xBBBB_BBBB, b""));
-        assert!(d.host_replaced, "a died-without-STOP predecessor must still be detected");
+        assert!(
+            d.host_replaced,
+            "a died-without-STOP predecessor must still be detected"
+        );
     }
 
     #[test]
@@ -5575,21 +5970,28 @@ mod tests {
         d.subscribed = true;
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0, b""));
         assert!(!d.host_replaced);
-        assert_eq!(d.host_instance, Some(0xAAAA_AAAA), "0 must not overwrite a real nonce");
+        assert_eq!(
+            d.host_instance,
+            Some(0xAAAA_AAAA),
+            "0 must not overwrite a real nonce"
+        );
     }
 
     #[test]
     fn hello_clears_the_console_queue_too_so_the_ack_is_not_spliced_mid_frame() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // out_console is the one queue that can be resting MID-FRAME (a `dmesg -w` flood against a
-        // stalled host reader). Dropping `wire_owner` without emptying it makes the next drain start
-        // at out_hi and write HELLO_ACK into the middle of that console frame -- the host's
-        // reassembler swallows the ACK as payload, which is the desync this resync exists to prevent.
+                                          // out_console is the one queue that can be resting MID-FRAME (a `dmesg -w` flood against a
+                                          // stalled host reader). Dropping `wire_owner` without emptying it makes the next drain start
+                                          // at out_hi and write HELLO_ACK into the middle of that console frame -- the host's
+                                          // reassembler swallows the ACK as payload, which is the desync this resync exists to prevent.
         let mut d = td();
         d.send(p::CH_CONSOLE, p::F_SOM | p::F_EOM, b"unread console flood");
         d.wire_owner = Some(Wire::Console);
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xC0FF_EE00, b""));
-        assert!(d.out_console.is_empty(), "a stale console frame must not outlive the HELLO resync");
+        assert!(
+            d.out_console.is_empty(),
+            "a stale console frame must not outlive the HELLO resync"
+        );
         assert!(d.wire_owner.is_none());
     }
 
@@ -5615,26 +6017,32 @@ mod tests {
     #[test]
     fn go_idle_silent_emits_nothing_but_still_drops_presence() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // On clean-STOP-grace expiry the host has already detached. The frame would sit in the
-        // gadget FIFO and be the FIRST thing the NEXT host reads, which reads as "the box dropped
-        // us" on a link that just came up.
+                                          // On clean-STOP-grace expiry the host has already detached. The frame would sit in the
+                                          // gadget FIFO and be the FIRST thing the NEXT host reads, which reads as "the box dropped
+                                          // us" on a link that just came up.
         let mut d = td();
         d.present = true;
         d.subscribed = true;
         let _ = sent(&mut d);
         d.go_idle(false);
-        assert!(sent(&mut d).is_empty(), "silent teardown must queue no CTRL frame");
-        assert!(!d.present, "presence must still drop -- the supervisor needs the GONE edge");
+        assert!(
+            sent(&mut d).is_empty(),
+            "silent teardown must queue no CTRL frame"
+        );
+        assert!(
+            !d.present,
+            "presence must still drop -- the supervisor needs the GONE edge"
+        );
         assert!(!d.subscribed);
     }
 
     #[test]
     fn go_idle_clears_a_pending_rearm_so_presence_cannot_be_reasserted_after_teardown() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // `rearm_presence_silently` dips HOST_PRESENT_FLAG and arms a deadline; `presence_tick`
-        // restores the flag when it elapses. If a teardown lands in between, restoring would
-        // reassert presence for a host already declared GONE -- and the supervisor's L2/L3
-        // escalation treats that flag as authoritative.
+                                          // `rearm_presence_silently` dips HOST_PRESENT_FLAG and arms a deadline; `presence_tick`
+                                          // restores the flag when it elapses. If a teardown lands in between, restoring would
+                                          // reassert presence for a host already declared GONE -- and the supervisor's L2/L3
+                                          // escalation treats that flag as authoritative.
         for notify in [true, false] {
             let mut d = td();
             d.present = true;
@@ -5644,7 +6052,10 @@ mod tests {
 
             d.go_idle(notify);
             assert!(!d.present, "notify={notify}");
-            assert!(d.rearm_deadline.is_none(), "a pending re-ARM must not outlive its session");
+            assert!(
+                d.rearm_deadline.is_none(),
+                "a pending re-ARM must not outlive its session"
+            );
 
             // Even if one somehow survived, the restore must mirror `present`, never hardcode true.
             d.rearm_deadline = Some(Instant::now() - Duration::from_secs(1));
@@ -5660,8 +6071,8 @@ mod tests {
     #[test]
     fn go_idle_clears_the_latched_replacement_flag() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
-        // host_replaced is latched at CT_HELLO and consumed only by CT_SUBSCRIBE. A host may send
-        // HELLO and never subscribe, so a stale `true` could force an unwanted re-arm much later.
+                                          // host_replaced is latched at CT_HELLO and consumed only by CT_SUBSCRIBE. A host may send
+                                          // HELLO and never subscribe, so a stale `true` could force an unwanted re-arm much later.
         for notify in [true, false] {
             let mut d = td();
             d.host_replaced = true;
@@ -5687,18 +6098,29 @@ mod tests {
         d.subscribed = true;
         d.box_health_tick(Instant::now());
         let f = sent(&mut d);
-        assert_eq!(f.len(), 1, "a fresh subscriber must be told the current health");
+        assert_eq!(
+            f.len(),
+            1,
+            "a fresh subscriber must be told the current health"
+        );
         assert_eq!(f[0].0, p::CH_CTRL);
         assert_eq!(f[0].2[0], p::CT_BOX_HEALTH);
         assert_eq!(f[0].2.len(), 2, "payload is [CT_BOX_HEALTH][flags]");
-        assert_ne!(f[0].1 & p::F_REPLAY, 0, "the first value is a replay, not a change");
+        assert_ne!(
+            f[0].1 & p::F_REPLAY,
+            0,
+            "the first value is a replay, not a change"
+        );
 
         // Throttled, and unchanged health is not re-sent.
         d.box_health_tick(Instant::now());
         assert!(sent(&mut d).is_empty());
         d.last_box_health_check = None;
         d.box_health_tick(Instant::now());
-        assert!(sent(&mut d).is_empty(), "only CHANGES go on the wire after the first");
+        assert!(
+            sent(&mut d).is_empty(),
+            "only CHANGES go on the wire after the first"
+        );
     }
 
     #[test]
@@ -5713,15 +6135,24 @@ mod tests {
         d.box_health_tick(Instant::now());
         let f = sent(&mut d);
         assert_eq!(f.len(), 1);
-        assert_eq!(f[0].1 & p::F_REPLAY, 0, "a real change must NOT be marked replay");
+        assert_eq!(
+            f[0].1 & p::F_REPLAY,
+            0,
+            "a real change must NOT be marked replay"
+        );
         assert_eq!(f[0].1, p::F_SOM | p::F_EOM);
     }
 
     #[test]
     fn box_health_bits_do_not_collide() {
         let all = [
-            p::BH_HCI_PRESENT, p::BH_SSP, p::BH_IAP2D, p::BH_AIRPLAYD,
-            p::BH_CARPLAY_WIRELESS, p::BH_WLAN_AP, p::BH_ROOTFS_OK,
+            p::BH_HCI_PRESENT,
+            p::BH_SSP,
+            p::BH_IAP2D,
+            p::BH_AIRPLAYD,
+            p::BH_CARPLAY_WIRELESS,
+            p::BH_WLAN_AP,
+            p::BH_ROOTFS_OK,
         ];
         let mut seen = 0u8;
         for b in all {
@@ -5909,16 +6340,28 @@ mod tests {
 
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
 
-        assert!(d.out_video.is_empty(), "stale main-video tail must not reach the new host");
-        assert!(d.out_alt_video.is_empty(), "stale cluster-video tail must not reach the new host");
-        assert!(d.out_audio.is_empty(), "stale audio tail would splice onto the new producer's bytes");
+        assert!(
+            d.out_video.is_empty(),
+            "stale main-video tail must not reach the new host"
+        );
+        assert!(
+            d.out_alt_video.is_empty(),
+            "stale cluster-video tail must not reach the new host"
+        );
+        assert!(
+            d.out_audio.is_empty(),
+            "stale audio tail would splice onto the new producer's bytes"
+        );
         assert_eq!(
             d.wire_owner, None,
             "an A/V queue that owned the wire mid-frame must release it — drain() would otherwise \
              try to finish a frame the queue no longer holds"
         );
         // SUBSCRIBE is not HELLO: the reliable bulk queue is untouched.
-        assert!(!d.out_lo.is_empty(), "CT_SUBSCRIBE must not discard reliable bulk");
+        assert!(
+            !d.out_lo.is_empty(),
+            "CT_SUBSCRIBE must not discard reliable bulk"
+        );
     }
 
     #[test]
@@ -6043,12 +6486,20 @@ mod tests {
 
         d.subscribed = true;
         d.health_tick(t0);
-        assert_eq!(d.last_health_log, Some(t0), "first tick of a session logs immediately");
+        assert_eq!(
+            d.last_health_log,
+            Some(t0),
+            "first tick of a session logs immediately"
+        );
 
         // Every subsequent poll wake (thousands/sec during A/V) must be a no-op until the interval.
         d.health_tick(t0 + Duration::from_millis(1));
         d.health_tick(t0 + HEALTH_LOG_INTERVAL - Duration::from_millis(1));
-        assert_eq!(d.last_health_log, Some(t0), "one line per interval, not per tick");
+        assert_eq!(
+            d.last_health_log,
+            Some(t0),
+            "one line per interval, not per tick"
+        );
 
         let t1 = t0 + HEALTH_LOG_INTERVAL;
         d.health_tick(t1);

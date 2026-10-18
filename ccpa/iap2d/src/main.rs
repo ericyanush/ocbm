@@ -268,6 +268,45 @@ fn vehicle_identity_from(
     })
 }
 
+/// Log only the identity/transport fields that matter when diagnosing the CarPlay handoff.
+/// IdentificationInformation contains no credentials; emit parameter IDs and the transport
+/// identifiers, not opaque payload bytes.
+fn log_identification_summary(body: &[u8]) {
+    fn groups(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut out = Vec::new();
+        while bytes.len() >= 4 {
+            let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+            if len < 4 || len > bytes.len() { break; }
+            let id = u16::from_be_bytes([bytes[2], bytes[3]]);
+            out.push((id, &bytes[4..len]));
+            bytes = &bytes[len..];
+        }
+        out
+    }
+    fn mac(bytes: &[u8]) -> String {
+        if bytes.len() != 6 { return format!("invalid-length:{}", bytes.len()); }
+        bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+    }
+
+    let top = groups(body);
+    let ids = top.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
+    let usb = top.iter().find(|(id, _)| *id == 16).map(|(_, value)| {
+        let nested = groups(value);
+        let cp_iface = nested.iter().find(|(id, _)| *id == 3)
+            .and_then(|(_, v)| v.first()).map(|v| v.to_string()).unwrap_or_else(|| "absent".into());
+        format!("present(cp_iface={cp_iface},subparams={})", nested.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(","))
+    }).unwrap_or_else(|| "absent".into());
+    let bt = top.iter().find(|(id, _)| *id == 17).map(|(_, value)| {
+        let nested = groups(value);
+        let address = nested.iter().find(|(id, _)| *id == 3)
+            .map(|(_, v)| mac(v)).unwrap_or_else(|| "absent".into());
+        format!("present(mac={address})")
+    }).unwrap_or_else(|| "absent".into());
+    log(&format!(
+        "TX 0x1D01 identity summary: top_params=[{ids}] usb_host_param16={usb} bluetooth_param17={bt}; no Wi-Fi MAC field is emitted in this USB-host identity"
+    ));
+}
+
 /// `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG): the box.log tailer
 /// parses this prefix and uses it instead of the millisecond it happened to READ the line at, so
 /// a burst of lines written in the same tick doesn't collapse onto one timestamp.
@@ -390,6 +429,7 @@ fn execute(action: Action, link: &mut Link, iap: &mut File) -> ExecResult {
                 "TX 0x1D01 IdentificationInformation ({} B)",
                 ib.len()
             ));
+            log_identification_summary(&ib);
             ExecResult::Commit
         }
         Action::RetryIdentify(excluded) => {
@@ -413,6 +453,7 @@ fn execute(action: Action, link: &mut Link, iap: &mut File) -> ExecResult {
                 "TX 0x1D01 retry, stripped {excluded:?} ({} B)",
                 ib.len()
             ));
+            log_identification_summary(&ib);
             ExecResult::Commit
         }
         Action::Note(m) => {

@@ -293,6 +293,33 @@ class UsbBulkTransport(
             false
         }
 
+    /** Discover, wait for the GM fixed-handler grant, and open through the helper UID. */
+    fun findAndOpenFirstAdapter(): String? =
+        synchronized(lifecycleLock) {
+            if (stopped) {
+                lastError = "USB helper transport is stopped"
+                return null
+            }
+            val remote = bridge ?: run {
+                lastError = "USB helper is not bound"
+                return null
+            }
+            try {
+                lastError = null
+                remote.openFirstAdapter().takeIf(String::isNotBlank)?.also {
+                    activeDeviceName = it
+                    connected.set(true)
+                } ?: run {
+                    if (lastError.isNullOrBlank()) lastError = "adapter absent or GM USB grant unavailable"
+                    null
+                }
+            } catch (t: Throwable) {
+                lastError = "helper discovery/open failed: ${t.message ?: t.javaClass.simpleName}"
+                log.e("[USB_HELPER] $lastError")
+                null
+            }
+        }
+
     fun open(deviceName: String): Boolean {
         synchronized(lifecycleLock) {
             if (stopped) {

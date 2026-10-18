@@ -2,9 +2,11 @@ package com.carlink
 
 import android.content.Context
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.os.ext.SdkExtensions
 import android.view.Surface
 import com.carlink.av.CarPlaySocketMediaBridge
 import com.carlink.audio.MicProfile
@@ -211,6 +213,8 @@ class CarlinkManager(
 
         /** After an overlay closes, how long to wait for frames before assuming a stuck decoder. */
         private const val OVERLAY_RECOVERY_WATCHDOG_MS = 750L
+        // Android 13 SDK extension that added automatic foreground mDNS multicast reception.
+        private const val T_EXTENSION_MULTICAST_AUTO_MANAGEMENT = 7
     }
 
     /**
@@ -939,7 +943,7 @@ class CarlinkManager(
      * return-count limit, and because "get me a claimed transport" is a coherent step on its own.
      *
      * The [released] re-checks are the point of this function. [findDevice] can burn ~80 s worst
-     * case (10 scans plus helper-side grant polls), and `release()` runs OUTSIDE
+     * case (10 helper discovery/open windows), and `release()` runs OUTSIDE
      * [lifecycleMutex], so the flag can flip under an in-flight start. Without them a released
      * manager goes on to claim the interface and bring up a full session — a zombie holding the
      * claim against its own replacement, whose start then fails with a claim error and, at
@@ -975,17 +979,9 @@ class CarlinkManager(
             return null
         }
 
-        setStatusText("Adapter found — opening...")
-        if (!t.open(dev)) {
-            val detail = t.lastError ?: "USB helper could not claim the adapter"
-            logError("Failed to claim the adapter's USB interface: $detail", tag = Logger.Tags.USB)
-            t.stop()
-            if (transport === t) transport = null
-            handleFailedStart(detail)
-            return null
-        }
+        setStatusText("Adapter found — USB interface open")
         return if (released) {
-            logWarn("[LIFECYCLE] released during USB open — closing and abandoning", tag = Logger.Tags.ADAPTR)
+            logWarn("[LIFECYCLE] released after helper opened USB — closing and abandoning", tag = Logger.Tags.ADAPTR)
             t.stop()
             if (transport === t) transport = null
             null
@@ -1049,6 +1045,9 @@ class CarlinkManager(
             handleError("usb — CT_SUBSCRIBE write failed", generation)
             return
         }
+        // Capture box/radio/projection logs into the same rolling archive as AAOS diagnostics.
+        // This is deliberately best-effort: older adapter builds may not implement CT_LOG_CTL.
+        c.enableAdapterLogs()
         c.startHeartbeat()
 
         // The adapter remains the Bluetooth/MFi coprocessor. The phone's Wi-Fi CarPlay control
@@ -1056,19 +1055,55 @@ class CarlinkManager(
         // pipes. SUBSCRIBE first so the serialized CH_MFI relay is available to pair-verify.
         startCarPlayReceiver(c, generation)
 
-        setStatusText("Waiting for phone...")
+        // The native phone session is independent of the OCBM USB management link. If USB was
+        // briefly unplugged while CarPlay remained connected, startCarPlayReceiver() intentionally
+        // keeps that receiver alive; do not regress the UI to the pre-phone waiting state.
+        val receiver = carPlayReceiver
+        if (receiver?.sessionLive == true) {
+            logInfo("[RECONNECT] OCBM restored while native CarPlay session is already live", tag = Logger.Tags.ADAPTR)
+            setState(State.DEVICE_CONNECTED)
+            setStatusText("Phone connected — restoring CarPlay...")
+        } else {
+            setStatusText("Waiting for phone...")
+        }
     }
 
-    private fun startCarPlayReceiver(owner: OcbmClient, ownerGeneration: Long) {
-        if (carPlayReceiver != null) return
-        NetworkDiagnostics.start(context)
+    /**
+     * Android T extension 7 manages multicast reception for foreground apps. Before that extension
+     * (including the truck's Android 12L build), acquire a Wi-Fi multicast lock for mDNS receive.
+     */
+    private fun acquireCarPlayMulticastLockIfRequired() {
+        val tExtension = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching { SdkExtensions.getExtensionVersion(Build.VERSION_CODES.TIRAMISU) }
+                .getOrElse {
+                    logWarn("[CP_RX] unable to read T SDK extension version; assuming multicast lock required: ${it.message}", tag = Logger.Tags.ADAPTR)
+                    0
+                }
+        } else {
+            0
+        }
+
+        if (tExtension >= T_EXTENSION_MULTICAST_AUTO_MANAGEMENT) {
+            logInfo("[CP_RX] T SDK extension $tExtension manages foreground mDNS multicast reception; skipping Wi-Fi multicast lock", tag = Logger.Tags.ADAPTR)
+            return
+        }
+
         runCatching {
             val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             carPlayMulticastLock = wifi.createMulticastLock("carlink-carplay-mdns").apply {
                 setReferenceCounted(false)
                 acquire()
             }
-        }.onFailure { logWarn("[CP_RX] unable to acquire mDNS multicast lock: ${it.message}", tag = Logger.Tags.ADAPTR) }
+            logInfo("[CP_RX] acquired Wi-Fi mDNS multicast lock (T SDK extension $tExtension < $T_EXTENSION_MULTICAST_AUTO_MANAGEMENT)", tag = Logger.Tags.ADAPTR)
+        }.onFailure {
+            logWarn("[CP_RX] unable to acquire mDNS multicast lock: ${it.message}", tag = Logger.Tags.ADAPTR)
+        }
+    }
+
+    private fun startCarPlayReceiver(owner: OcbmClient, ownerGeneration: Long) {
+        if (carPlayReceiver != null) return
+        NetworkDiagnostics.start(context)
+        acquireCarPlayMulticastLockIfRequired()
         val relay = object : MfiRelay {
             override fun copyCertificate(): ByteArray {
                 check(client === owner && connectionGeneration.get() == ownerGeneration) {
@@ -2198,7 +2233,15 @@ class CarlinkManager(
             }
         }
 
-        c.onBtPhase = { phase ->
+        c.onBtPhase = btPhase@{ phase ->
+            // A USB reattach creates a new OcbmClient while callbacks already queued by the old
+            // transport may still be draining. BT_PHASE is especially consequential here: an old
+            // IDLE/PENDING event can clear the active peer or close the receiver's handoff gate
+            // after the replacement client has reported WIFI_HANDOFF.
+            if (client !== c || connectionGeneration.get() != ownerGeneration) {
+                logDebug("[RECONNECT] ignoring BT_PHASE from retired OCBM client", tag = Logger.Tags.ADAPTR)
+                return@btPhase
+            }
             // Discovery can contain several phones on the truck hotspot. Only allow a connect-out
             // after Wi-Fi handoff, and keep CarPlayRx synchronized with the adapter's phase.
             val value = phase.toInt() and 0xFF
@@ -2206,10 +2249,23 @@ class CarlinkManager(
             if (value == Ocbm.BTP_IDLE.toInt() || value == Ocbm.BTP_PAIR_REJECTED.toInt()) adapterActiveBtPeer = null
             carPlayReceiver?.setBluetoothPhase(value)
             val text = btPhaseText(phase)
-            if (text != null) scope.launch { if (state != State.STREAMING) setStatusText(text) }
+            if (text != null) scope.launch {
+                if (client !== c || connectionGeneration.get() != ownerGeneration) return@launch
+                // On USB re-enumeration the adapter replays its last BT phase, which may still be
+                // WIFI_HANDOFF from the already-completed handoff. The native receiver is the
+                // authoritative source once its phone control session is live; a replay must not
+                // replace the connected/restoring status with a stale handoff message.
+                if (state != State.STREAMING && carPlayReceiver?.sessionLive != true) {
+                    setStatusText(text)
+                }
+            }
         }
 
-        c.onActiveBtPeer = { mac ->
+        c.onActiveBtPeer = activeBtPeer@{ mac ->
+            if (client !== c || connectionGeneration.get() != ownerGeneration) {
+                logDebug("[RECONNECT] ignoring ACTIVE_BT_PEER from retired OCBM client", tag = Logger.Tags.ADAPTR)
+                return@activeBtPeer
+            }
             // This identity is captured by the adapter from the accepted iAP2 RFCOMM socket, so it
             // is the authoritative target for the upcoming Wi-Fi/CarPlay handoff.
             val normalized = mac.trim().uppercase().takeIf { it.isNotEmpty() }
@@ -2978,24 +3034,18 @@ class CarlinkManager(
         }
     }
 
-    /** Poll the helper's device list/grant state; this app must never request USB permission. */
+    /** Ask the fixed-handler helper UID to discover, await GM's grant, and open the adapter. */
     private suspend fun findDevice(t: UsbBulkTransport): String? {
         var attempts = 0
         while (attempts < 10) {
-            val dev = t.findQuiet()
-            if (dev != null) {
-                if (t.hasPermission(dev)) {
-                    log("OCBM adapter found via USB helper: $dev")
-                    return dev
-                }
-                // The fixed-handler package receives GM's silent attach grant. The app must never
-                // call requestPermission: its own UID is not the USB owner and would show the prompt.
-                repeat(20) {
-                    if (t.hasPermission(dev)) return dev
-                    delay(250)
-                }
+            val opened = t.findAndOpenFirstAdapter()
+            if (opened != null) {
+                log("OCBM adapter discovered and opened by helper UID: $opened")
+                return opened
             }
             attempts++
+            // Retain app-level backoff for devices attached after the helper's bounded window.
+            // USB permission requests remain exclusively with GM's fixed-handler policy.
             delay(USB_WAIT_PERIOD_MS)
         }
         return null
