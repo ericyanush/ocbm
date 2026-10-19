@@ -12,6 +12,7 @@ import com.carlink.usbbridge.IUsbBridge
 import com.carlink.usbbridge.IUsbBridgeCallback
 import com.carlink.usbbridge.UsbBridgeConstants
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -38,6 +39,15 @@ class UsbBulkTransport(
     companion object {
         const val VID_CARLINKIT = 0x1314
         const val PID_OCBM = 0x2d00
+
+        // Binder callbacks must not queue behind a busy AAOS main looper. Keep this process-wide
+        // executor alive across transport instances so a timed-out binding can still deliver its
+        // late disconnect/cleanup callbacks while the manager is retrying with a fresh instance.
+        private val bindingExecutor = Executors.newCachedThreadPool { task ->
+            Thread(task, "ocbm-usb-binding").apply { isDaemon = true }
+        }
+
+        const val DEFAULT_BIND_TIMEOUT_MS = 10_000L
     }
 
     private val appContext = context.applicationContext
@@ -104,8 +114,8 @@ class UsbBulkTransport(
             }
         }
 
-    /** Bind on a worker thread; binding callbacks are delivered on the main looper. */
-    fun connect(timeoutMs: Long = 5_000): Boolean {
+    /** Bind on a worker thread; deliver binding callbacks off the AAOS main looper. */
+    fun connect(timeoutMs: Long = DEFAULT_BIND_TIMEOUT_MS): Boolean {
         check(Looper.myLooper() != Looper.getMainLooper()) { "USB helper bind must not block the main thread" }
         if (bridge != null) return true
         if (!connectStarted.compareAndSet(false, true)) {
@@ -213,7 +223,7 @@ class UsbBulkTransport(
                 if (stopped || serviceConnection !== connection) {
                     false
                 } else {
-                    appContext.bindService(intent, connection, Context.BIND_AUTO_CREATE).also {
+                    appContext.bindService(intent, Context.BIND_AUTO_CREATE, bindingExecutor, connection).also {
                         bound = it
                     }
                 }

@@ -195,6 +195,9 @@ class CarPlayRx(
      * Every successful session in that capture was preceded by an SRV query; every failure was not.
      */
     private val dialsSinceInbound = java.util.concurrent.atomic.AtomicInteger(0)
+    /** A burst of accepted connect-outs is not a stall until the phone has had time to dial back. */
+    private val lastAcceptedDialAtMs = java.util.concurrent.atomic.AtomicLong(0L)
+    private val stallReportScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
      * Suspends the rediscover churn and the connect-out without stopping the receiver.
@@ -416,6 +419,8 @@ class CarPlayRx(
          * the driver is told something before they give up.
          */
         private const val STALL_DIALS = 6
+        /** The truck log showed an inbound dial 72 ms after the old immediate stall warning. */
+        private const val STALL_QUIET_GRACE_MS = 5_000L
         /**
          * Settle after the advert is CONFIRMED registered — not after we asked for it.
          *
@@ -1563,16 +1568,38 @@ class CarPlayRx(
         // one fault twice with two different budgets.
         onDialAccepted?.let { cb -> fenced("onDialAccepted") { cb() } }
         if (liveConnections.get() > 0) { dialsSinceInbound.set(0); return }
+        lastAcceptedDialAtMs.set(android.os.SystemClock.elapsedRealtime())
         val n = dialsSinceInbound.incrementAndGet()
         if (n == 1 || n == STALL_DIALS) {
             NetworkDiagnostics.snapshot("accepted connect nudge count=$n without inbound control")
         }
-        if (n != STALL_DIALS) return   // report the crossing once, not every dial after it
-        log.e("!! STALLED: $n consecutive connect-outs accepted with no inbound control connection on :$port")
-        log.e("!! The nudge received an accepted/ambiguous response, but no inbound control connection followed.")
-        log.e("!! Acceptance proves only that the outbound request got a response; it does not prove the")
-        log.e("!! phone retained a usable route back. Compare [net] snapshots, mDNS candidates, and adapter events.")
-        onStalled?.let { cb -> fenced("onStalled") { cb(n) } }
+        if (n != STALL_DIALS || !stallReportScheduled.compareAndSet(false, true)) return
+        log.w("$n accepted connect-outs; waiting for ${STALL_QUIET_GRACE_MS}ms without another nudge or inbound session before declaring stalled")
+        try {
+            pool.execute {
+                try {
+                    while (running.get() && liveConnections.get() == 0 && dialsSinceInbound.get() >= STALL_DIALS) {
+                        val quietFor = android.os.SystemClock.elapsedRealtime() - lastAcceptedDialAtMs.get()
+                        if (quietFor >= STALL_QUIET_GRACE_MS) {
+                            log.e("!! STALLED: $n accepted connect-outs and no inbound control connection for ${quietFor}ms on :$port")
+                            log.e("!! Acceptance proves only that the outbound request got a response; it does not prove the phone retained a usable route back.")
+                            onStalled?.let { cb -> fenced("onStalled") { cb(n) } }
+                            break
+                        }
+                        Thread.sleep((STALL_QUIET_GRACE_MS - quietFor).coerceAtLeast(1L))
+                    }
+                    if (liveConnections.get() > 0 || dialsSinceInbound.get() < STALL_DIALS) {
+                        log.i("stall report cancelled; inbound control arrived during grace window")
+                    }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } finally {
+                    stallReportScheduled.set(false)
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            stallReportScheduled.set(false)
+        }
     }
 
     /** One readiness probe: what was checked, and what was found. */
@@ -1643,6 +1670,9 @@ class CarPlayRx(
     fun pauseDiscovery() { if (discoveryPaused.compareAndSet(false, true)) log.i("discovery PAUSED") }
 
     fun resumeDiscovery() { if (discoveryPaused.compareAndSet(true, false)) log.i("discovery RESUMED") }
+
+    /** Force a fresh local Bonjour browse/resolve cycle without restarting sockets or native state. */
+    fun refreshPhoneDiscovery() = refreshDiscoveryForSelection()
 
     /**
      * Re-assert our mDNS records without tearing the receiver down — cheapest recovery rung.

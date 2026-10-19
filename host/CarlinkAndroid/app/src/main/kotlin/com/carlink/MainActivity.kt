@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
@@ -60,6 +61,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Executors
 
 /**
  * Main Activity — Entry Point for Carlink Native.
@@ -80,9 +82,76 @@ import java.nio.ByteOrder
  *    [SettingsScreen] on top via AnimatedVisibility rather than replacing it.
  */
 class MainActivity : ComponentActivity() {
+    /** A short Activity recreation/background gap must not tear down an otherwise live session. */
+    private object SessionLifecycle {
+        data class Retained(val manager: CarlinkManager, val graceExpired: Boolean, val releaseAlreadyQueued: Boolean)
+
+        private val handler = Handler(Looper.getMainLooper())
+        private val releaseExecutor = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "carlink-session-release").apply { isDaemon = true }
+        }
+        private var pendingManager: CarlinkManager? = null
+        private var releasingManager: CarlinkManager? = null
+        private var pendingRelease: Runnable? = null
+        private var backgroundSinceElapsedMs: Long = 0L
+        private const val BACKGROUND_GRACE_MS = 3 * 60 * 1000L
+
+        @Synchronized fun cancelPendingRelease(): Retained? {
+            pendingRelease?.let(handler::removeCallbacks)
+            pendingRelease = null
+            val queuedRelease = releasingManager
+            val manager = pendingManager ?: queuedRelease
+            pendingManager = null
+            if (manager == null) return null
+            val expired = queuedRelease != null ||
+                SystemClock.elapsedRealtime() - backgroundSinceElapsedMs >= BACKGROUND_GRACE_MS
+            backgroundSinceElapsedMs = 0L
+            return Retained(manager, expired, queuedRelease != null)
+        }
+
+        @Synchronized fun deferRelease(manager: CarlinkManager) {
+            pendingRelease?.let(handler::removeCallbacks)
+            pendingManager = manager
+            backgroundSinceElapsedMs = SystemClock.elapsedRealtime()
+            val task = Runnable {
+                val toRelease = synchronized(this) {
+                    if (pendingManager !== manager) return@Runnable
+                    pendingManager = null
+                    pendingRelease = null
+                    backgroundSinceElapsedMs = 0L
+                    releasingManager = manager
+                    manager
+                }
+                logInfo("[LIFECYCLE] background grace expired; releasing session on IO", tag = "MAIN")
+                releaseExecutor.execute {
+                    try {
+                        toRelease.release()
+                    } finally {
+                        synchronized(this) {
+                            if (releasingManager === toRelease) releasingManager = null
+                        }
+                    }
+                }
+            }
+            pendingRelease = task
+            handler.postDelayed(task, BACKGROUND_GRACE_MS)
+        }
+
+        fun releaseThen(manager: CarlinkManager, after: () -> Unit) {
+            releaseExecutor.execute {
+                manager.release()
+                handler.post(after)
+            }
+        }
+
+        fun afterPendingRelease(after: () -> Unit) {
+            releaseExecutor.execute { handler.post(after) }
+        }
+    }
     // Nullable to prevent UninitializedPropertyAccessException if Activity
     // is destroyed before initialization completes (e.g., low memory kill)
     private var carlinkManager: CarlinkManager? = null
+    private var waitingForExpiredSessionRelease = false
 
     /** The display the live manager was built for; a configuration change that moves its content area rebuilds. */
     private var activeProfile: DisplayProfile? = null
@@ -216,7 +285,7 @@ class MainActivity : ComponentActivity() {
         // Compose renders `if (manager != null)` while we wait, so the UI boots with
         // the loading overlay and swaps in as soon as the manager is ready.
         window.decorView.post {
-            if (!isDestroyed && !isFinishing) {
+            if (!isDestroyed && !isFinishing && !waitingForExpiredSessionRelease) {
                 initializeCarlinkManager()
             }
         }
@@ -255,6 +324,38 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        SessionLifecycle.cancelPendingRelease()?.let { retained ->
+            if (retained.graceExpired) {
+                logInfo("[LIFECYCLE] background exceeded 3-minute grace; releasing old session before reconnect", tag = "MAIN")
+                waitingForExpiredSessionRelease = true
+                carlinkManagerState.value = null
+                carlinkManager = null
+                val continueAfterRelease: () -> Unit = {
+                    waitingForExpiredSessionRelease = false
+                    if (!isDestroyed && !isFinishing) initializeCarlinkManager()
+                }
+                if (retained.releaseAlreadyQueued) {
+                    SessionLifecycle.afterPendingRelease(continueAfterRelease)
+                } else {
+                    SessionLifecycle.releaseThen(retained.manager, continueAfterRelease)
+                }
+            } else if (carlinkManager == null) {
+                carlinkManager = retained.manager
+                retained.manager.addBoxStatusListener(displayModeApplier)
+                carlinkManagerState.value = retained.manager
+                logInfo("[LIFECYCLE] reattached to retained CarlinkManager", tag = "MAIN")
+            }
+        }
+        if (!waitingForExpiredSessionRelease && carlinkManager?.isReleased == true) {
+            logInfo("[LIFECYCLE] manager release already started; waiting for teardown before reconnect", tag = "MAIN")
+            waitingForExpiredSessionRelease = true
+            carlinkManagerState.value = null
+            carlinkManager = null
+            SessionLifecycle.afterPendingRelease {
+                waitingForExpiredSessionRelease = false
+                if (!isDestroyed && !isFinishing) initializeCarlinkManager()
+            }
+        }
         // Resume video decoding when app returns to foreground
         // On AAOS, Surface may remain valid while app is in background, but
         // BufferQueue can stall. Resume codec and request keyframe for immediate video.
@@ -271,6 +372,7 @@ class MainActivity : ComponentActivity() {
         // USB connection and audio continue unaffected.
         logInfo("[LIFECYCLE] onStop - pausing video", tag = "MAIN")
         carlinkManager?.pauseVideo()
+        carlinkManager?.let(SessionLifecycle::deferRelease)
     }
 
     /**
@@ -322,7 +424,10 @@ class MainActivity : ComponentActivity() {
         // MediaSession but does NOT release it — see CarlinkManager.release KDoc).
         // The MediaSession itself is owned by CarlinkMediaBrowserService; it releases
         // on its own onDestroy. Just drop the local reference here.
-        carlinkManager?.release()
+        carlinkManager?.removeBoxStatusListener(displayModeApplier)
+        // onStop already scheduled a delayed release. Do not synchronously write CT_STOP here:
+        // this callback is on the main thread and the USB bridge intentionally rejects main-thread
+        // bulk I/O. The process-level grace survives Activity destruction/recreation.
         mediaSessionManager = null
 
         logInfo("MainActivity destroyed", tag = "MAIN")
@@ -391,6 +496,21 @@ class MainActivity : ComponentActivity() {
             tag = "MAIN",
         )
         logInfo("Display config: ${config.width}x${config.height}@${config.fps}fps, ${config.dpi}dpi", tag = "MAIN")
+
+        // Reuse the process-scoped manager after Activity recreation/background return. The
+        // projection screen will rebind its fresh Surface and callback during composition.
+        val retained = carlinkManager ?: CarlinkManager.live
+        if (retained != null && !retained.isReleased &&
+            retained.panelWidthPx == config.width && retained.panelHeightPx == config.height
+        ) {
+            if (carlinkManager !== retained) {
+                carlinkManager = retained
+                retained.addBoxStatusListener(displayModeApplier)
+            }
+            carlinkManagerState.value = retained
+            logInfo("[LIFECYCLE] reusing live CarlinkManager across Activity recreation", tag = "MAIN")
+            return
+        }
 
         // Adapter audio mode (hardcoded false) — acquire the app-scope MediaSession singleton.
         applyAudioTransferModeToMediaSession(false)
@@ -555,6 +675,8 @@ class MainActivity : ComponentActivity() {
      * plane, renegotiated Open().
      */
     fun reinitialize() {
+        // A pending background release must not race this deliberate manager replacement.
+        SessionLifecycle.cancelPendingRelease()
         // Cancel any pending reinit from a rapid double-tap.
         pendingReinitRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingReinitRunnable = null
@@ -566,9 +688,8 @@ class MainActivity : ComponentActivity() {
         if (oldManager != null) {
             // Clear Compose reference FIRST — stops surface callbacks into the old manager.
             carlinkManagerState.value = null
-            oldManager.release()
+            oldManager.removeBoxStatusListener(displayModeApplier)
             carlinkManager = null
-            logInfo("[REINIT] Old CarlinkManager released", tag = "MAIN")
         }
 
         // 2. Re-assert the display mode (a mode change lands here with the new mode already set).
@@ -586,7 +707,14 @@ class MainActivity : ComponentActivity() {
                 pendingReinitRunnable = null
             }
         pendingReinitRunnable = reinitRunnable
-        mainHandler.postDelayed(reinitRunnable, 200)
+        if (oldManager == null) {
+            mainHandler.postDelayed(reinitRunnable, 200)
+        } else {
+            SessionLifecycle.releaseThen(oldManager) {
+                logInfo("[REINIT] Old CarlinkManager released off-main", tag = "MAIN")
+                mainHandler.postDelayed(reinitRunnable, 200)
+            }
+        }
     }
 
     /** Build HU_VIEWAREA_INFO (24 bytes): [screen_w, screen_h, view_w, view_h, originX, originY] */

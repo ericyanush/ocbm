@@ -399,6 +399,7 @@ class CarlinkManager(
     // launched on the Activity's lifecycleScope could otherwise survive release() and drive the
     // released manager through a full connect, claiming USB from its replacement.
     @Volatile private var released = false
+    val isReleased: Boolean get() = released
 
     private val currentState = AtomicReference(State.DISCONNECTED)
     val state: State get() = currentState.get()
@@ -955,18 +956,37 @@ class CarlinkManager(
      * posts silently no-op and nothing on screen explains it.
      */
     private suspend fun acquireTransport(): UsbBulkTransport? {
-        val t = UsbBulkTransport(context, usbLog)
-        transport = t
+        val maxBindAttempts = 2
+        for (attempt in 1..maxBindAttempts) {
+            val t = UsbBulkTransport(context, usbLog)
+            transport = t
 
-        if (!t.connect()) {
+            if (t.connect()) {
+                return acquireOpenedAdapter(t)
+            }
+
             val detail = t.lastError ?: "USB helper unavailable"
-            logError("USB helper bind failed: $detail", tag = Logger.Tags.USB)
+            logError("USB helper bind attempt $attempt/$maxBindAttempts failed: $detail", tag = Logger.Tags.USB)
             t.stop()
             if (transport === t) transport = null
+
+            // A timeout may mean the helper's bind callback was merely delayed during AAOS
+            // startup. Retry only that transient case, using a new single-use transport/binder.
+            if (attempt < maxBindAttempts && detail == "timed out binding USB helper service" && !released) {
+                logInfo("[USB_HELPER] retrying service bind once after timeout", tag = Logger.Tags.USB)
+                delay(500)
+                if (released) return null
+                continue
+            }
+
             handleFailedStart("USB helper unavailable: $detail")
             return null
         }
 
+        return null
+    }
+
+    private suspend fun acquireOpenedAdapter(t: UsbBulkTransport): UsbBulkTransport? {
         val dev = findDevice(t)
         if (dev == null) {
             val detail = t.lastError ?: "Adapter not found or helper grant unavailable"
@@ -1204,19 +1224,61 @@ class CarlinkManager(
             }
         }
         receiver.onStalled = { count ->
-            logWarn("[CP_RX] phone accepted $count connection nudges without dialing back", tag = Logger.Tags.ADAPTR)
+            logWarn("[CP_RX] sustained dial-back stall: $count accepted nudges, with no inbound connection during the grace window", tag = Logger.Tags.ADAPTR)
             if (wirelessRecoveryAttempted.compareAndSet(false, true)) {
                 scope.launch {
-                    // Let a late inbound dial win. This recovery bounces only the adapter's BT/radio
-                    // stack; it deliberately preserves the USB/MFi management session.
-                    delay(3_000)
+                    var recoveryReceiver = receiver
                     val activeClient = client
                     val activeGeneration = connectionGeneration.get()
-                    if (activeClient == null || carPlayReceiver !== receiver || receiver.sessionLive) {
+                    if (activeClient == null || carPlayReceiver !== recoveryReceiver || recoveryReceiver.sessionLive) {
                         logInfo("[CP_RX] automatic wireless recovery skipped; session changed or phone returned", tag = Logger.Tags.ADAPTR)
                         return@launch
                     }
-                    val checks = withContext(Dispatchers.IO) { receiver.selfTest() }
+
+                    // Tier 1: refresh our own advert and force a fresh browse/resolve. Keep the
+                    // adapter's iAP2 target pinned; this must not select whichever phone resolves first.
+                    logInfo("[CP_RX] recovery tier 1: reannounce + refresh Bonjour discovery", tag = Logger.Tags.ADAPTR)
+                    withContext(Dispatchers.IO) { recoveryReceiver.reannounce() }
+                    recoveryReceiver.refreshPhoneDiscovery()
+                    setStatusText("Refreshing phone discovery...")
+                    delay(10_000)
+                    if (recoveryReceiver.sessionLive || client !== activeClient || connectionGeneration.get() != activeGeneration) {
+                        logInfo("[CP_RX] dial-back recovery stopped; session returned or OCBM session changed", tag = Logger.Tags.ADAPTR)
+                        return@launch
+                    }
+
+                    // Tier 2: rebuild only the host-side receiver/listener. Never touch USB/MFi
+                    // while a phone control session is live; CarPlayRx.stop() is bounded and
+                    // reports whether its connection pumps actually drained.
+                    logWarn("[CP_RX] recovery tier 2: rebuilding idle CarPlay receiver", tag = Logger.Tags.ADAPTR)
+                    val drained = withContext(Dispatchers.IO) { recoveryReceiver.stop() }
+                    if (!drained) {
+                        logWarn("[CP_RX] receiver rebuild withheld: an old control pump did not drain", tag = Logger.Tags.ADAPTR)
+                        setStatusText("Phone connection stalled — tap Restart session to recover")
+                        return@launch
+                    }
+                    if (carPlayReceiver !== recoveryReceiver || recoveryReceiver.sessionLive || client !== activeClient || connectionGeneration.get() != activeGeneration) {
+                        logInfo("[CP_RX] receiver rebuild cancelled; owner/session changed", tag = Logger.Tags.ADAPTR)
+                        return@launch
+                    }
+                    carPlayReceiver = null
+                    withContext(Dispatchers.IO) { startCarPlayReceiver() }
+                    recoveryReceiver = carPlayReceiver ?: run {
+                        logError("[CP_RX] receiver rebuild failed to create a replacement", tag = Logger.Tags.ADAPTR)
+                        setStatusText("CarPlay receiver unavailable — tap Restart session")
+                        return@launch
+                    }
+                    setStatusText("Receiver refreshed — waiting for phone...")
+                    delay(8_000)
+                    if (recoveryReceiver.sessionLive || client !== activeClient || connectionGeneration.get() != activeGeneration) {
+                        logInfo("[CP_RX] recovery complete; phone returned or OCBM session changed", tag = Logger.Tags.ADAPTR)
+                        return@launch
+                    }
+
+                    // Tier 3: bounce adapter Bluetooth only, preserving the USB/MFi management
+                    // session. Full CT_STOP/USB reset remains a deliberate user action because it
+                    // invalidates the phone handoff and is not justified by a missing dial-back alone.
+                    val checks = withContext(Dispatchers.IO) { recoveryReceiver.selfTest() }
                     val required = setOf("listening", "native core", "/info", "MFi relay")
                     val failed = checks.filter { it.name in required && !it.ok }
                     if (failed.isNotEmpty()) {
@@ -1224,11 +1286,11 @@ class CarlinkManager(
                             failed.joinToString { "${it.name}=${it.detail}" }, tag = Logger.Tags.ADAPTR)
                         return@launch
                     }
-                    if (receiver.sessionLive || client !== activeClient || connectionGeneration.get() != activeGeneration) {
+                    if (recoveryReceiver.sessionLive || client !== activeClient || connectionGeneration.get() != activeGeneration) {
                         logInfo("[CP_RX] automatic wireless recovery cancelled; phone/session returned", tag = Logger.Tags.ADAPTR)
                         return@launch
                     }
-                    logWarn("[CP_RX] no phone control session after $count accepted nudges; restarting adapter wireless stack once (USB/MFi retained)", tag = Logger.Tags.ADAPTR)
+                    logWarn("[CP_RX] no phone control session after discovery and receiver recovery; restarting adapter wireless stack once (USB/MFi retained)", tag = Logger.Tags.ADAPTR)
                     setStatusText("Reconnecting phone — restarting Bluetooth...")
                     val status = withContext(Dispatchers.IO) { activeClient.mgmtAction(Ocbm.MGMT_RESTART_WIRELESS) }
                     logInfo("[CP_RX] automatic RESTART_WIRELESS status=$status", tag = Logger.Tags.ADAPTR)
