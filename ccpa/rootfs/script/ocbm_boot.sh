@@ -53,6 +53,10 @@ touch /tmp/UDiskPassThroughMode
   i=0; while [ ! -e /dev/usb_accessory ] && [ "$i" -lt 50 ]; do i=$((i+1)); sleep 0.1; done
   /usr/sbin/ocbmd >> /tmp/box.log 2>&1 &
   OCBMD=$!
+  # If AAOS enumerates the gadget but never opens it (e.g. USB permission did not grant),
+  # re-enumerate after a 15-second configured-without-HELLO window to retrigger device handling.
+  # The watchdog is safe to start before the host app: its timer is based on gadget CONFIGURED.
+  [ -x /script/usb_gadget_reenum.sh ] && /script/usb_gadget_reenum.sh >> /tmp/box.log 2>&1 &
   # Session supervisor: idle-waits on host presence; a host-app SUBSCRIBE drives projection + ARM
   # (docs/carplay/02_SESSION_LIFECYCLE.md). Backgrounded, so it can never block boot. Box stays IDLE (phone unswitched) until a host.
   [ -x /script/session_supervisor.sh ] && setsid /script/session_supervisor.sh >> /tmp/box.log 2>&1 &
