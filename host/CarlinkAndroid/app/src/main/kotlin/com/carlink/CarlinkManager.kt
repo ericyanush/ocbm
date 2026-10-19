@@ -41,6 +41,7 @@ import com.carlink.ocbm.Ocbm
 import com.carlink.ocbm.OcbmAvLanes
 import com.carlink.ocbm.OcbmClient
 import com.carlink.ocbm.Mfi
+import com.carlink.ocbm.RebindableMfiRelay
 import com.carlink.ocbm.OemIcon
 import com.carlink.ocbm.UsbBulkTransport
 import com.carlink.ocbm.VehicleConfigSpec
@@ -534,6 +535,9 @@ class CarlinkManager(
     /** Loopback ingress from the native AirPlay receiver, started only for an armed media session. */
     @Volatile private var carPlaySocketBridge: CarPlaySocketMediaBridge? = null
     @Volatile private var carPlayReceiver: CarPlayRx? = null
+    // The receiver can outlive a USB reconnect. Keep one stable object passed into native code,
+    // while swapping its OCBM-backed delegate only after the replacement session is subscribed.
+    private val carPlayMfiRelay = RebindableMfiRelay()
     // OCBM can replay the active Bluetooth peer/phase immediately after SUBSCRIBE, before the
     // Wi-Fi receiver has finished constructing. Retain that snapshot so the receiver starts with
     // the correct phone instead of falling back to whichever Bonjour result arrives first.
@@ -1011,6 +1015,7 @@ class CarlinkManager(
         if (client != null) stopImpl()
 
         val generation = connectionGeneration.incrementAndGet()
+        carPlayMfiRelay.clear()
 
         setState(State.CONNECTING)
         setStatusText("Searching for adapter...")
@@ -1045,6 +1050,7 @@ class CarlinkManager(
             handleError("usb — CT_SUBSCRIBE write failed", generation)
             return
         }
+        bindCarPlayMfiRelay(c, generation)
         // Capture box/radio/projection logs into the same rolling archive as AAOS diagnostics.
         // This is deliberately best-effort: older adapter builds may not implement CT_LOG_CTL.
         c.enableAdapterLogs()
@@ -1052,8 +1058,8 @@ class CarlinkManager(
 
         // The adapter remains the Bluetooth/MFi coprocessor. The phone's Wi-Fi CarPlay control
         // and A/V sessions terminate in this app, using gm_ccpa's receiver and Carlink's media
-        // pipes. SUBSCRIBE first so the serialized CH_MFI relay is available to pair-verify.
-        startCarPlayReceiver(c, generation)
+        // pipes. The relay is rebound after SUBSCRIBE so pair-verify always uses the live USB link.
+        startCarPlayReceiver()
 
         // The native phone session is independent of the OCBM USB management link. If USB was
         // briefly unplugged while CarPlay remained connected, startCarPlayReceiver() intentionally
@@ -1100,17 +1106,19 @@ class CarlinkManager(
         }
     }
 
-    private fun startCarPlayReceiver(owner: OcbmClient, ownerGeneration: Long) {
-        if (carPlayReceiver != null) return
-        NetworkDiagnostics.start(context)
-        acquireCarPlayMulticastLockIfRequired()
-        val relay = object : MfiRelay {
-            override fun copyCertificate(): ByteArray {
-                check(client === owner && connectionGeneration.get() == ownerGeneration) {
-                    "Stale CarPlay receiver requested MFi certificate from a retired session"
+    private fun bindCarPlayMfiRelay(owner: OcbmClient, ownerGeneration: Long) {
+        val delegate = object : MfiRelay {
+            private fun ensureCurrent() {
+                check(client === owner && connectionGeneration.get() == ownerGeneration && owner.subscribed) {
+                    "MFi adapter session is no longer active (generation=$ownerGeneration)"
                 }
+            }
+
+            override fun copyCertificate(): ByteArray {
+                ensureCurrent()
                 val response = owner.mfiCertificate()
                     ?: throw IllegalStateException("OCBM CH_MFI certificate request had no usable reply")
+                ensureCurrent()
                 if (response.status != Mfi.STATUS_OK) {
                     throw IllegalStateException(
                         "OCBM CH_MFI certificate failed: ${response.statusName()} (${response.payload.size}B)",
@@ -1120,11 +1128,10 @@ class CarlinkManager(
             }
 
             override fun createSignature(digest: ByteArray): ByteArray {
-                check(client === owner && connectionGeneration.get() == ownerGeneration) {
-                    "Stale CarPlay receiver requested MFi signature from a retired session"
-                }
+                ensureCurrent()
                 val response = owner.mfiSign(digest)
                     ?: throw IllegalStateException("OCBM CH_MFI signature request had no usable reply")
+                ensureCurrent()
                 if (response.status != Mfi.STATUS_OK) {
                     throw IllegalStateException(
                         "OCBM CH_MFI signature failed: ${response.statusName()} (${response.payload.size}B)",
@@ -1133,11 +1140,19 @@ class CarlinkManager(
                 return response.payload
             }
         }
+        carPlayMfiRelay.bind(ownerGeneration, delegate)
+        logInfo("[CP_RX] MFi relay bound to subscribed OCBM generation=$ownerGeneration", tag = Logger.Tags.ADAPTR)
+    }
+
+    private fun startCarPlayReceiver() {
+        if (carPlayReceiver != null) return
+        NetworkDiagnostics.start(context)
+        acquireCarPlayMulticastLockIfRequired()
         val returnIconImages = oemIconImages
         val returnIconLabel = context.getString(R.string.app_name)
         val receiver = CarPlayRx(
             context,
-            mfiRelay = relay,
+            mfiRelay = carPlayMfiRelay,
             peerFile = java.io.File(context.filesDir, "carplay_peers.bin").absolutePath,
             infoTransformer = { source ->
                 CarPlayInfoCustomizer.withReturnIcon(source, returnIconImages, returnIconLabel)
@@ -1152,7 +1167,7 @@ class CarlinkManager(
             wirelessRecoveryAttempted.set(false)
             logInfo("[CP_RX] native receiver accepted a phone control session", tag = Logger.Tags.ADAPTR)
             scope.launch {
-                if (client !== owner || carPlayReceiver !== receiver) return@launch
+                if (carPlayReceiver !== receiver) return@launch
                 setState(State.DEVICE_CONNECTED)
                 setStatusText("Phone connected — starting CarPlay...")
                 if (carPlayMicUplink == null) {
@@ -1164,7 +1179,7 @@ class CarlinkManager(
             val endedGeneration = carPlaySessionGeneration.incrementAndGet()
             logInfo("[CP_RX] phone control session ended; retiring phone-only state (generation=$endedGeneration)", tag = Logger.Tags.ADAPTR)
             scope.launch {
-                if (client !== owner || carPlayReceiver !== receiver) return@launch
+                if (carPlayReceiver !== receiver) return@launch
                 // A quick reconnect can race this callback's main-thread work. Do not let teardown
                 // from the previous connection blank the new session's metadata or decoder.
                 if (receiver.sessionLive || carPlaySessionGeneration.get() != endedGeneration) {
@@ -1179,7 +1194,7 @@ class CarlinkManager(
                 setStatusText("Phone disconnected — waiting to reconnect...")
                 withContext(Dispatchers.IO) {
                     // Joining the decoder can take up to 1.5s; never do it on the UI dispatcher.
-                    if (client === owner && carPlayReceiver === receiver &&
+                    if (carPlayReceiver === receiver &&
                         carPlaySessionGeneration.get() == endedGeneration && !receiver.sessionLive) {
                         retireVideoEpoch("phone control session ended")
                     } else {
@@ -1195,7 +1210,9 @@ class CarlinkManager(
                     // Let a late inbound dial win. This recovery bounces only the adapter's BT/radio
                     // stack; it deliberately preserves the USB/MFi management session.
                     delay(3_000)
-                    if (client !== owner || carPlayReceiver !== receiver || receiver.sessionLive) {
+                    val activeClient = client
+                    val activeGeneration = connectionGeneration.get()
+                    if (activeClient == null || carPlayReceiver !== receiver || receiver.sessionLive) {
                         logInfo("[CP_RX] automatic wireless recovery skipped; session changed or phone returned", tag = Logger.Tags.ADAPTR)
                         return@launch
                     }
@@ -1207,13 +1224,13 @@ class CarlinkManager(
                             failed.joinToString { "${it.name}=${it.detail}" }, tag = Logger.Tags.ADAPTR)
                         return@launch
                     }
-                    if (receiver.sessionLive || client !== owner) {
+                    if (receiver.sessionLive || client !== activeClient || connectionGeneration.get() != activeGeneration) {
                         logInfo("[CP_RX] automatic wireless recovery cancelled; phone/session returned", tag = Logger.Tags.ADAPTR)
                         return@launch
                     }
                     logWarn("[CP_RX] no phone control session after $count accepted nudges; restarting adapter wireless stack once (USB/MFi retained)", tag = Logger.Tags.ADAPTR)
                     setStatusText("Reconnecting phone — restarting Bluetooth...")
-                    val status = withContext(Dispatchers.IO) { owner.mgmtAction(Ocbm.MGMT_RESTART_WIRELESS) }
+                    val status = withContext(Dispatchers.IO) { activeClient.mgmtAction(Ocbm.MGMT_RESTART_WIRELESS) }
                     logInfo("[CP_RX] automatic RESTART_WIRELESS status=$status", tag = Logger.Tags.ADAPTR)
                     setStatusText(
                         if (status == 0) "Bluetooth restarted — waiting for phone..."
@@ -1309,6 +1326,7 @@ class CarlinkManager(
         // Invalidate receiver/MFi work before stopping the receiver and USB pipe. Native control
         // callbacks can already be queued on another thread when teardown begins.
         connectionGeneration.incrementAndGet()
+        carPlayMfiRelay.clear()
         logDebug("[LIFECYCLE] stop()", tag = Logger.Tags.VIDEO)
         cancelDelayedKeyframe()
         cancelReconnect()
@@ -1836,6 +1854,8 @@ class CarlinkManager(
         // a clean-slate reset, so a user who reboots after several short sessions still gets the
         // right escalation messaging on the next attempt.
         logWarn("[LIFECYCLE] Reboot adapter requested (~50 s absence expected)", tag = Logger.Tags.ADAPTR)
+        val retiredGeneration = connectionGeneration.getAndIncrement()
+        carPlayMfiRelay.clear(retiredGeneration)
         cancelReconnect()
         cancelDelayedKeyframe()
         stopMicrophoneCapture()
@@ -3101,7 +3121,8 @@ class CarlinkManager(
         // distinguish "broken after a prior session" from "never connected".
 
         logError("Adapter error: $error", tag = Logger.Tags.ADAPTR)
-        connectionGeneration.incrementAndGet()
+        val retiredGeneration = connectionGeneration.getAndIncrement()
+        carPlayMfiRelay.clear(retiredGeneration)
 
         cancelDelayedKeyframe()
         currentPhoneType = null

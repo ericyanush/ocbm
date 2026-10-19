@@ -31,22 +31,11 @@ android {
         versionName = "0.3.0-usbbridge"
     }
 
-    buildTypes {
-        // Keep helper diagnostics and USB service names readable in test builds.
-        release {
-            isMinifyEnabled = false
-        }
-    }
-
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    buildFeatures {
-        // No Compose, no BuildConfig, no AndroidX — the helper uses platform USB/service APIs.
-        buildConfig = false
-    }
 }
 
 dependencies {

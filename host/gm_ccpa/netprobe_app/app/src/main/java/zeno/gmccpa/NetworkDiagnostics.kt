@@ -13,8 +13,9 @@ import java.util.concurrent.TimeUnit
 /**
  * Low-volume network evidence for the wireless reconnect path.
  *
- * Records the default Android network and the interfaces/routes visible to this app. It deliberately
- * omits SSIDs, MAC addresses, DNS contents, and hotspot credentials. The process owns this monitor,
+ * Records the default Android network and every interface visible to this app, including interfaces
+ * that are down (which can be important during Wi-Fi handoff). It deliberately omits SSIDs, MAC
+ * addresses, DNS contents, and hotspot credentials. The process owns this monitor,
  * not an Activity, because MainActivity can be destroyed while a CarPlay session is still active.
  */
 object NetworkDiagnostics {
@@ -104,15 +105,17 @@ object NetworkDiagnostics {
         val props = runCatching { if (cm != null && active != null) cm.getLinkProperties(active) else null }.getOrNull()
         val interfaces = runCatching {
             NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
-                .filter { runCatching { it.isUp && !it.isLoopback }.getOrDefault(false) }
+                .sortedBy { it.name }
                 .joinToString(";") { nif ->
+                    val state = runCatching {
+                        "up=${nif.isUp},loopback=${nif.isLoopback},pointToPoint=${nif.isPointToPoint},mtu=${nif.mtu}"
+                    }.getOrDefault("state=unavailable")
                     val addresses = runCatching {
-                        nif.interfaceAddresses.mapNotNull { item ->
-                            val addr = item.address
-                            if (addr.isLoopbackAddress) null else "${addr.hostAddress?.substringBefore('%')}/${item.networkPrefixLength}"
-                        }.joinToString(",")
-                    }.getOrDefault("?")
-                    "${nif.name}[$addresses]"
+                        nif.interfaceAddresses.joinToString(",") { item ->
+                            "${item.address.hostAddress?.substringBefore('%')}/${item.networkPrefixLength}"
+                        }
+                    }.getOrDefault("unavailable")
+                    "${nif.name}[$state,addr=[$addresses]]"
                 }
         }.getOrDefault("unavailable")
         log.i("snapshot reason=$reason active=${active?.networkHandle ?: "none"} " +

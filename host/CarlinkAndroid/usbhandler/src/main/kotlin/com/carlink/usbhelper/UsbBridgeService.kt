@@ -1,10 +1,8 @@
 package com.carlink.usbhelper
 
 import android.app.Service
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
@@ -12,7 +10,6 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.IBinder
-import android.os.Build
 import android.os.RemoteException
 import android.os.SystemClock
 import android.util.Log
@@ -32,8 +29,9 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Owns the raw OCBM USB pipe under the fixed-handler UID. The app process receives bytes over AIDL;
  * it never calls UsbManager.openDevice and never requests a USB permission dialog. The service is
- * bound to the main app for the duration of a transport session; discovery is initiated through
- * the bound AIDL interface, and Android owns teardown after the final client unbinds.
+ * normally bound by the main app for a transport session; discovery/open is initiated through the
+ * expanded AIDL interface. Like the original helper, this also supports a sticky started-service
+ * path for system starts, while retaining the OCBM byte-stream transport and diagnostics.
  */
 class UsbBridgeService : Service() {
     private val usb by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
@@ -51,29 +49,6 @@ class UsbBridgeService : Service() {
     private var openedDeviceName: String? = null
     private var reader: Thread? = null
     private val deliveryHighWaterLogged = AtomicBoolean(false)
-    private var detachReceiverRegistered = false
-
-    private val detachReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            val action = intent?.action ?: return
-            if (action != UsbManager.ACTION_USB_DEVICE_ATTACHED &&
-                action != UsbManager.ACTION_USB_DEVICE_DETACHED
-            ) return
-            @Suppress("DEPRECATION")
-            val device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE) as? UsbDevice ?: return
-            val matches = synchronized(this@UsbBridgeService) { openedDeviceName == device.deviceName }
-            val actionName = if (action == UsbManager.ACTION_USB_DEVICE_ATTACHED) "ATTACHED" else "DETACHED"
-            val detail = "USB $actionName broadcast: ${describeDevice(device)}; inventory=${describeDevicesWithPermissions()}"
-            Log.i(TAG, detail)
-            emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, detail)
-            if (action == UsbManager.ACTION_USB_DEVICE_DETACHED && matches) {
-                val reason = "USB detach broadcast for ${device.deviceName}"
-                Log.w(TAG, reason)
-                emitState(UsbBridgeConstants.STATE_ERROR, reason)
-                closeDevice(reason)
-            }
-        }
-    }
 
     // USB reading and app-side protocol processing are isolated. The bounded, ordered queue prevents
     // a slow Binder client from stalling bulk IN indefinitely or accumulating unbounded frame data.
@@ -214,89 +189,74 @@ class UsbBridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val filter = IntentFilter().apply {
-            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
-            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-        }
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(detachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(detachReceiver, filter)
-        }
-        detachReceiverRegistered = true
+        emitState(UsbBridgeConstants.STATE_DISCONNECTED, "waiting for OCBM adapter")
     }
 
-    override fun onUnbind(intent: Intent?): Boolean {
-        // The service is bind-owned. The app closes the USB pipe before unbinding; Android then
-        // destroys this service when the final client disconnects. A later session binds afresh.
-        return super.onUnbind(intent)
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Match the original helper: a start (including a system restart of a sticky service)
+        // attempts USB open immediately. Normal app operation also binds and opens through AIDL.
+        findAndOpenAdapter()
+        return START_STICKY
     }
 
     override fun onDestroy() {
         closeDevice("service destroyed")
-        if (detachReceiverRegistered) {
-            runCatching { unregisterReceiver(detachReceiver) }
-            detachReceiverRegistered = false
-        }
         delivery.shutdownNow()
         super.onDestroy()
     }
 
-    /** Legacy-helper-style discovery: poll enumeration and the GM silent grant for a bounded window. */
+    /** Match the original helper: retry enumeration briefly, but check the USB grant once present. */
     private fun findAndOpenAdapter(): String {
-        val deadline = SystemClock.elapsedRealtime() + DISCOVERY_WINDOW_MS
-        var lastDeviceName: String? = null
-        var deviceSeen = false
-        while (SystemClock.elapsedRealtime() <= deadline) {
-            val device = usb.deviceList.values.firstOrNull(::isAdapter)
-            if (device != null) {
-                lastDeviceName = device.deviceName
-                deviceSeen = true
-                if (runCatching { usb.hasPermission(device) }.getOrDefault(false) && openDevice(device.deviceName)) {
-                    return device.deviceName
-                }
-            }
-            Thread.sleep(DISCOVERY_POLL_MS)
+        var devices = usb.deviceList.values.toList()
+        var device = devices.firstOrNull(::isAdapter)
+        for (attempt in 0 until ENUMERATION_RETRIES) {
+            if (device != null) break
+            Thread.sleep(ENUMERATION_RETRY_DELAY_MS)
+            devices = usb.deviceList.values.toList()
+            device = devices.firstOrNull(::isAdapter)
         }
-        val reason = if (deviceSeen) {
-            "OCBM adapter ${lastDeviceName ?: "unknown"} present but GM USB grant unavailable after ${DISCOVERY_WINDOW_MS}ms"
-        } else {
-            "OCBM adapter absent after ${DISCOVERY_WINDOW_MS}ms discovery window; devices=${describeDevices()}"
+        if (device == null) {
+            val reason = "OCBM adapter not found after enumeration retries; USB devices=${describeDevices(devices)}"
+            Log.w(TAG, reason)
+            emitState(UsbBridgeConstants.STATE_ERROR, reason)
+            return ""
         }
-        Log.w(TAG, reason)
-        emitState(UsbBridgeConstants.STATE_DIAGNOSTIC, reason)
-        return ""
+        if (!usb.hasPermission(device)) {
+            val reason = "USB permission was not granted for ${describeDevice(device)}"
+            Log.w(TAG, reason)
+            emitState(UsbBridgeConstants.STATE_ERROR, reason)
+            return ""
+        }
+        return if (openDevice(device.deviceName)) device.deviceName else ""
     }
 
     @Synchronized
     private fun openDevice(deviceName: String): Boolean {
-        if (connection != null) {
-            if (openedDeviceName == deviceName && usb.deviceList.containsKey(deviceName)) return true
-            closeDevice("replacing open USB device")
-        }
+        if (connection != null) return true
         val device = usb.deviceList[deviceName]
         if (device == null || !isAdapter(device)) {
             emitState(UsbBridgeConstants.STATE_ERROR, "OCBM adapter not found: $deviceName; devices=${describeDevices()}")
             return false
         }
         if (!usb.hasPermission(device)) {
-            emitState(UsbBridgeConstants.STATE_ERROR, "silent USB grant unavailable for ${device.deviceName}")
+            emitState(UsbBridgeConstants.STATE_ERROR, "USB permission was not granted")
+            return false
+        }
+        emitState(UsbBridgeConstants.STATE_CONNECTING, device.deviceName)
+        val conn = usb.openDevice(device)
+        if (conn == null) {
+            emitState(UsbBridgeConstants.STATE_ERROR, "UsbManager.openDevice failed")
             return false
         }
         val endpoints = findBulkEndpoints(device)
         if (endpoints == null) {
-            emitState(UsbBridgeConstants.STATE_ERROR, "no bulk IN/OUT interface on ${device.deviceName}")
-            return false
-        }
-        val conn = usb.openDevice(device)
-        if (conn == null) {
-            emitState(UsbBridgeConstants.STATE_ERROR, "helper openDevice failed despite permission")
+            conn.close()
+            emitState(UsbBridgeConstants.STATE_ERROR, "No claimable bulk USB interface")
             return false
         }
         if (!conn.claimInterface(endpoints.first, true)) {
             conn.close()
-            emitState(UsbBridgeConstants.STATE_ERROR, "helper could not claim USB interface ${endpoints.first.id}")
+            emitState(UsbBridgeConstants.STATE_ERROR, "No claimable bulk USB interface")
             return false
         }
         connection = conn
@@ -305,7 +265,8 @@ class UsbBridgeService : Service() {
         output = endpoints.third
         openedDeviceName = deviceName
         generation.incrementAndGet()
-        emitState(UsbBridgeConstants.STATE_CONNECTED, "${device.vendorId.toString(16)}:${device.productId.toString(16)} ${device.deviceName}")
+        emitState(UsbBridgeConstants.STATE_CONNECTED, "${device.vendorId}:${device.productId}")
+        startReader()
         return true
     }
 
@@ -444,9 +405,10 @@ class UsbBridgeService : Service() {
     private fun isAdapter(device: UsbDevice): Boolean =
         device.vendorId == VID_CARLINKIT && device.productId == PID_OCBM
 
-    private fun describeDevices(): String = usb.deviceList.values.joinToString { device ->
-        "${device.deviceName}:${device.vendorId.toString(16)}:${device.productId.toString(16)}"
-    }.ifEmpty { "none" }
+    private fun describeDevices(devices: List<UsbDevice> = usb.deviceList.values.toList()): String =
+        devices.joinToString(prefix = "[", postfix = "]") {
+            "${it.deviceName}:0x${it.vendorId.toString(16)}:0x${it.productId.toString(16)}"
+        }.ifEmpty { "none" }
 
     private fun describeDevicesWithPermissions(devices: List<UsbDevice> = usb.deviceList.values.toList()): String =
         devices.joinToString(prefix = "[", postfix = "]") { device ->
@@ -477,8 +439,8 @@ class UsbBridgeService : Service() {
         private const val VID_CARLINKIT = 0x1314
         private const val PID_OCBM = 0x2d00
         private const val READ_BUFFER_SIZE = 16 * 1024
-        private const val DISCOVERY_WINDOW_MS = 5_000L
-        private const val DISCOVERY_POLL_MS = 250L
+        private const val ENUMERATION_RETRIES = 5
+        private const val ENUMERATION_RETRY_DELAY_MS = 200L
         private const val READ_TIMEOUT_MS = 250
         private const val WRITE_TIMEOUT_MS = 2_000
         private const val WRITE_CHUNK = 16 * 1024

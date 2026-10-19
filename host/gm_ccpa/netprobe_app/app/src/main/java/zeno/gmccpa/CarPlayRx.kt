@@ -253,6 +253,9 @@ class CarPlayRx(
             if (previous != null) log.i("Bluetooth attempt ended; cleared handoff target $previous")
         } else if (phase == BT_PHASE_WIFI_HANDOFF) {
             handoffReady.set(true)
+            NetworkDiagnostics.snapshot("Bluetooth reported Wi-Fi handoff")
+            NetworkDiagnostics.snapshotAfter("Bluetooth Wi-Fi handoff settle", 1500)
+            NetworkDiagnostics.snapshotAfter("Bluetooth Wi-Fi handoff follow-up", 5000)
         }
         val ready = handoffReady.get()
         val changed = wasReady != ready

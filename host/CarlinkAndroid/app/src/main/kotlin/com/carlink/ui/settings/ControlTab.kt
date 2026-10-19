@@ -322,6 +322,7 @@ private fun AppControlCard(
         )
     }
 
+
     if (showDisplayModeDialog) {
         DisplayModeDialog(
             currentMode = displayMode,
