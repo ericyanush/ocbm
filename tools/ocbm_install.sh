@@ -149,6 +149,7 @@ wait_ncm() {  # wait for the NCM control channel to answer
 manifest() {
   echo "$ARM/ocbmd|/usr/sbin/ocbmd|755"
   echo "$REPO/ccpa/rootfs/script/ocbm_boot.sh|/script/ocbm_boot.sh|755"
+  echo "$REPO/ccpa/rootfs/script/usb_gadget_reenum.sh|/script/usb_gadget_reenum.sh|755"
   echo "$REPO/tools/run_ocbmd.sh|/script/run_ocbmd.sh|755"
   if [ "$FULL" = 1 ]; then
     # The radio seam MUST ship with session_supervisor.sh, because the supervisor's four radio

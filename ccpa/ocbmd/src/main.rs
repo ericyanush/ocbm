@@ -1068,6 +1068,13 @@ const HOST_PRESENT_FLAG: &str = "/tmp/host_present";
 #[cfg(test)]
 const HOST_PRESENT_FLAG: &str = "/tmp/ocbmd_selftest_host_present";
 
+/// Set after a correctly framed host CT_HELLO. The gadget watchdog uses this to distinguish a
+/// configured USB link whose host has not obtained/opened the device from a live OCBM transport.
+/// Deliberately survives an ocbmd-only restart and is cleared by the gadget watchdog on detach or
+/// immediately before its controlled re-enumeration.
+#[cfg(not(test))]
+const USB_HELLO_SEEN_FLAG: &str = "/tmp/ocbm_usb_hello_seen";
+
 /// The wireless SSP Numeric-Comparison code the ssp_agent publishes during pairing (absent = none).
 const PAIRING_CODE_FILE: &str = "/tmp/pairing_code";
 /// btd's loopback JSON control port (`control::CONTROL_PORT`), where the host's
@@ -4696,6 +4703,13 @@ fn main() {
                         Ok(n) => {
                             reasm.push(&rbuf[..n]);
                             while let Some((ch, flags, len)) = reasm.next(&mut plbuf) {
+                                if ch == p::CH_CTRL && plbuf.first() == Some(&p::CT_HELLO) {
+                                    // This is intentionally recorded at the runtime framing boundary,
+                                    // not Dispatcher::handle: unit tests exercise that method and
+                                    // must not mutate the adapter's /tmp state.
+                                    #[cfg(not(test))]
+                                    write_flag_atomic(USB_HELLO_SEEN_FLAG, true);
+                                }
                                 d.handle(ch, flags, &plbuf[..len]); // no per-frame copy
                             }
                         }
