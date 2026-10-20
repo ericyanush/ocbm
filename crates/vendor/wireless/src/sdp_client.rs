@@ -72,7 +72,10 @@ fn now_ms() -> u64 {
 }
 
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
+    b.iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// L2CAP-connect to `peer`'s SDP PSM (implicitly pages the phone in BlueZ). `timeout_secs` bounds both
@@ -191,7 +194,11 @@ fn build_ssa_request(search_pattern: &[u8], cont: &[u8]) -> Vec<u8> {
 
 /// Run one `ServiceSearchAttributeRequest` transaction over `sock` for `search_pattern`, reassembling
 /// any continuation chunks. Returns the assembled attribute-list blob (may be empty `35 00`).
-fn run_search(sock: &mut std::fs::File, search_pattern: &[u8], first_tid: u16) -> std::io::Result<Vec<u8>> {
+fn run_search(
+    sock: &mut std::fs::File,
+    search_pattern: &[u8],
+    first_tid: u16,
+) -> std::io::Result<Vec<u8>> {
     let mut attr_lists: Vec<u8> = Vec::new();
     let mut cont: Vec<u8> = vec![0x00];
     let mut tid = first_tid;
@@ -205,7 +212,10 @@ fn run_search(sock: &mut std::fs::File, search_pattern: &[u8], first_tid: u16) -
     loop {
         rounds += 1;
         if rounds > MAX_ROUNDS || attr_lists.len() > MAX_ATTR_BYTES {
-            log(&format!("SDP reassembly exceeded bound (rounds={rounds}, bytes={}) — stopping", attr_lists.len()));
+            log(&format!(
+                "SDP reassembly exceeded bound (rounds={rounds}, bytes={}) — stopping",
+                attr_lists.len()
+            ));
             break;
         }
         let params = build_ssa_request(search_pattern, &cont);
@@ -224,11 +234,16 @@ fn run_search(sock: &mut std::fs::File, search_pattern: &[u8], first_tid: u16) -
         let rpdu = buf[0];
         let plen = u16::from_be_bytes([buf[3], buf[4]]) as usize;
         if rpdu == SDP_ERROR_RSP {
-            log(&format!("phone returned SDP_ERROR_RSP ({})", hex(&buf[5..n.min(5 + plen)])));
+            log(&format!(
+                "phone returned SDP_ERROR_RSP ({})",
+                hex(&buf[5..n.min(5 + plen)])
+            ));
             break;
         }
         if rpdu != SDP_SVC_SEARCH_ATTR_RSP || 5 + plen > n {
-            log(&format!("unexpected SDP response pdu=0x{rpdu:02x} plen={plen} n={n}"));
+            log(&format!(
+                "unexpected SDP response pdu=0x{rpdu:02x} plen={plen} n={n}"
+            ));
             break;
         }
         let params = &buf[5..5 + plen];
@@ -357,7 +372,11 @@ impl Services {
 pub fn query(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<Services> {
     let mut disp = peer;
     disp.reverse(); // human-readable bdaddr for the log only
-    let human = disp.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+    let human = disp
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
     log(&format!("querying SDP on {human} (PSM 0x{SDP_PSM:04x})"));
     let mut sock = connect_sdp(peer, timeout_secs)?;
     log("L2CAP SDP channel up (phone paged)");
@@ -365,10 +384,17 @@ pub fn query(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<Services> {
     // (1) Targeted: the accessory-side iAP2 UUID. If iOS exposes an iAP2 RFCOMM service by this UUID,
     //     this pulls its channel directly — and an iPhone is done here, with no Android searches run.
     let iap2 = run_search(&mut sock, &search_pattern_iap2(), 1)?;
-    log(&format!("iAP2-UUID search -> {} bytes: {}", iap2.len(), hex(&iap2)));
+    log(&format!(
+        "iAP2-UUID search -> {} bytes: {}",
+        iap2.len(),
+        hex(&iap2)
+    ));
     if let Some(ch) = scan_rfcomm_channel(&iap2) {
         log(&format!("iAP2 RFCOMM channel on the phone = {ch}"));
-        return Ok(Services { iap2: Some(ch), ..Services::default() });
+        return Ok(Services {
+            iap2: Some(ch),
+            ..Services::default()
+        });
     }
 
     let mut out = Services::default();
@@ -378,7 +404,11 @@ pub fn query(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<Services> {
     //     CONNECTED for our address, which is what gearhead's wireless-setup gate reads
     //     (`pcl.java:80`, `kzt.java:56-64`, `pco.java:24-29`).
     let hfp = run_search(&mut sock, &search_pattern_uuid16(0x111F), 20)?;
-    log(&format!("HFP-AG (0x111f) search -> {} bytes: {}", hfp.len(), hex(&hfp)));
+    log(&format!(
+        "HFP-AG (0x111f) search -> {} bytes: {}",
+        hfp.len(),
+        hex(&hfp)
+    ));
     out.hfp_ag = scan_rfcomm_channel(&hfp);
     out.hfp_ag_features = scan_hfp_supported_features(&hfp);
     if let Some(ch) = out.hfp_ag {
@@ -395,7 +425,11 @@ pub fn query(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<Services> {
     //     `BTA_AG_CONN_EVT` → `BTHF_CONNECTION_STATE_SLC_CONNECTED` (`bta_ag_act.cc:533-540`),
     //     which is how both public dongles satisfy the same gate with no AT traffic at all.
     let hsp = run_search(&mut sock, &search_pattern_uuid16(0x1112), 30)?;
-    log(&format!("HSP-AG (0x1112) search -> {} bytes: {}", hsp.len(), hex(&hsp)));
+    log(&format!(
+        "HSP-AG (0x1112) search -> {} bytes: {}",
+        hsp.len(),
+        hex(&hsp)
+    ));
     out.hsp_ag = scan_rfcomm_channel(&hsp);
     if let Some(ch) = out.hsp_ag {
         log(&format!("phone's HSP audio gateway on RFCOMM channel {ch}"));
@@ -425,7 +459,11 @@ pub fn query(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<Services> {
     //     expose. Purely a diagnostic for a peer that matched NONE of the targeted searches — every
     //     service we can actually drive has been ruled out by this point.
     let all = run_search(&mut sock, &search_pattern_l2cap(), 100)?;
-    log(&format!("browse-all (L2CAP) -> {} bytes: {}", all.len(), hex(&all)));
+    log(&format!(
+        "browse-all (L2CAP) -> {} bytes: {}",
+        all.len(),
+        hex(&all)
+    ));
     let mut chans = Vec::new();
     let mut i = 0;
     while i + 4 < all.len() {
@@ -520,10 +558,23 @@ mod tests {
 
     #[test]
     fn has_audio_gateway_is_either_gateway() {
-        assert!(Services { hfp_ag: Some(4), ..Services::default() }.has_audio_gateway());
-        assert!(Services { hsp_ag: Some(3), ..Services::default() }.has_audio_gateway());
+        assert!(Services {
+            hfp_ag: Some(4),
+            ..Services::default()
+        }
+        .has_audio_gateway());
+        assert!(Services {
+            hsp_ag: Some(3),
+            ..Services::default()
+        }
+        .has_audio_gateway());
         // an iAP2 or AAWG hit alone is NOT an audio gateway
-        assert!(!Services { iap2: Some(1), aawg: Some(8), ..Services::default() }.has_audio_gateway());
+        assert!(!Services {
+            iap2: Some(1),
+            aawg: Some(8),
+            ..Services::default()
+        }
+        .has_audio_gateway());
     }
 
     /// The 16-bit search pattern, for the two gateway UUIDs. Same `build_ssa_request` tail as the

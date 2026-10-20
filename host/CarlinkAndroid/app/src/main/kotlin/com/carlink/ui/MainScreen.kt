@@ -35,10 +35,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -53,6 +55,9 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.carlink.BuildConfig
 import com.carlink.CarlinkManager
 import com.carlink.R
@@ -74,8 +79,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
-/** Poll period for the first-frame watch while DEVICE_CONNECTED. */
-private const val FIRST_FRAME_POLL_MS = 100L
+/** Poll period for whether the current renderer epoch has actually produced a frame. */
+private const val VIDEO_VISIBILITY_POLL_MS = 100L
 
 /**
  * Session-scoped UI state, one instance per [CarlinkManager] (a Reset Device rebuild replaces the
@@ -94,7 +99,7 @@ private class SessionUiState {
     /** Set once initialize() has run with a real surface + size; gates the one-shot start effect. */
     var initializedForStart by mutableStateOf(false)
 
-    /** True once the decoder has put a frame on the Surface in DEVICE_CONNECTED (polled; see [SessionEffects]). */
+    /** True only while the current renderer epoch has produced a frame (polled; see [SessionEffects]). */
     var videoOnScreen by mutableStateOf(false)
 
     /** The wireless pairing code awaiting Pair / Cancel (CT_PAIRING_CODE), or null. */
@@ -103,11 +108,16 @@ private class SessionUiState {
     /**
      * carlink_native hid its loading overlay (and forwarded touch) from the FIRST VIDEO FRAME, which
      * was its STREAMING edge. OCBM stamps STREAMING on the first media metadata instead, so the same
-     * behaviour needs the frame counter as well: projecting = STREAMING, or DEVICE_CONNECTED with
-     * video already on screen.
+     * behavior must use the current renderer epoch for BOTH states. STREAMING is session history,
+     * not proof that the current Surface has a frame: backgrounding retires the renderer while the
+     * phone session (and STREAMING state) can remain alive. Requiring a current frame keeps the
+     * loading/recovery controls available if the phone disconnects while this Activity is away.
      */
     val projecting: Boolean
-        get() = connectionState == CarlinkManager.State.STREAMING || (connectionState == CarlinkManager.State.DEVICE_CONNECTED && videoOnScreen)
+        get() =
+            videoOnScreen &&
+                (connectionState == CarlinkManager.State.STREAMING ||
+                    connectionState == CarlinkManager.State.DEVICE_CONNECTED)
 
     // Plain fields, not snapshot state: only the touch handler reads/mutates them on the UI thread.
     var lastTouchTime = 0L
@@ -134,8 +144,24 @@ fun MainScreen(
     val ui = remember(carlinkManager) { SessionUiState() }
     val surfaceState = rememberVideoSurfaceState()
     val scope = rememberCoroutineScope()
+    var surfaceRecreateToken by remember(carlinkManager) { mutableIntStateOf(0) }
     var showResetConfirm by remember(carlinkManager) { mutableStateOf(false) }
     SessionEffects(carlinkManager, ui, surfaceState, onNavigateToSettings, onStateChanged, onViewAreaChanged)
+
+    // AAOS can destroy a SurfaceView while the Activity is stopped and occasionally fail to
+    // deliver a replacement Surface on resume. The manager cannot restart its decoder without a
+    // valid Surface, so remount the view on foreground return when the old Surface is gone.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, carlinkManager) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START && surfaceState.surface?.isValid != true) {
+                logInfo("[UI_SURFACE] No valid Surface on foreground return — recreating SurfaceView", tag = "UI")
+                surfaceRecreateToken++
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // The surface rect comes from the SAME profile the config was built from — the bars the
     // session's display mode keeps visible plus the parity pixel — not from the live Compose
@@ -149,10 +175,20 @@ fun MainScreen(
             carlinkManager,
             ui,
             surfaceState,
+            surfaceRecreateToken,
                 Modifier.fillMaxSize(),
         )
         if (!ui.projecting) {
-            LoadingOverlay(carlinkManager, ui.statusText)
+            // STREAMING is retained across a brief Surface/decoder loss. Audio and the phone's
+            // CarPlay control session may still be live, so the generic adapter status (often
+            // left at "Waiting for phone...") is misleading while video is being rebuilt.
+            val overlayStatus =
+                if (ui.connectionState == CarlinkManager.State.STREAMING && !ui.videoOnScreen) {
+                    "CarPlay connected — restoring video..."
+                } else {
+                    ui.statusText
+                }
+            LoadingOverlay(carlinkManager, overlayStatus)
             TopActions(
                 onNavigateToSettings = onNavigateToSettings,
                 onResetConnection = { showResetConfirm = true },
@@ -243,15 +279,33 @@ private fun SessionEffects(
         if (ui.connectionState != CarlinkManager.State.STREAMING) ui.activeTouches.clear()
     }
 
-    // First-frame watch: while DEVICE_CONNECTED (video may already be decoding, STREAMING not yet
-    // stamped) poll the frame counter so the overlay lifts on the first rendered frame, as the
-    // carlink_native STREAMING edge did. Cancelled by the state change that keys it.
+    // Keep the overlay tied to the CURRENT renderer epoch, not just the last session state. This
+    // also catches pauseVideo() retiring the epoch while MainActivity is backgrounded and a phone
+    // disconnect that does not immediately move the manager out of STREAMING. Without this, a
+    // resumed Activity can remain a black Surface with the Settings/Reset controls hidden.
     LaunchedEffect(ui.connectionState) {
-        ui.videoOnScreen = false
-        if (ui.connectionState != CarlinkManager.State.DEVICE_CONNECTED) return@LaunchedEffect
-        while (carlinkManager.videoFramesRendered() == 0L) delay(FIRST_FRAME_POLL_MS)
-        logInfo("[UI_STATE] First video frame on screen in DEVICE_CONNECTED — lifting loading overlay", tag = "UI")
-        ui.videoOnScreen = true
+        val canProject =
+            ui.connectionState == CarlinkManager.State.DEVICE_CONNECTED ||
+                ui.connectionState == CarlinkManager.State.STREAMING
+        if (!canProject) {
+            ui.videoOnScreen = false
+            return@LaunchedEffect
+        }
+
+        var wasVisible = ui.videoOnScreen
+        while (true) {
+            val hasCurrentFrame = carlinkManager.videoFramesRendered() > 0L
+            if (hasCurrentFrame != ui.videoOnScreen) {
+                if (hasCurrentFrame) {
+                    logInfo("[UI_STATE] Current video renderer produced a frame — hiding recovery overlay", tag = "UI")
+                } else if (wasVisible) {
+                    logInfo("[UI_STATE] Current video renderer has no frames — showing recovery overlay", tag = "UI")
+                }
+                ui.videoOnScreen = hasCurrentFrame
+            }
+            wasVisible = hasCurrentFrame
+            delay(VIDEO_VISIBILITY_POLL_MS)
+        }
     }
 
     // Forward the AAOS day/night state to CarPlay: on reaching STREAMING and on every mid-session
@@ -325,6 +379,7 @@ private fun ProjectionSurface(
     carlinkManager: CarlinkManager,
     ui: SessionUiState,
     surfaceState: VideoSurfaceState,
+    surfaceRecreateToken: Int,
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
@@ -346,7 +401,7 @@ private fun ProjectionSurface(
                 )
             }
         }
-        key(carlinkManager) {
+        key(carlinkManager, surfaceRecreateToken) {
             VideoSurface(
                 // AAOS narrows the Compose content bounds when it exposes the compact CarPlay
                 // area. Keep the SurfaceView at physical panel size and its origin at (0,0);

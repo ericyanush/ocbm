@@ -193,6 +193,8 @@ object Ocbm {
     /** box->host `[CT_ACTIVE_BT_PEER][UTF-8 Bluetooth MAC | empty]`, emitted from accepted iAP2
      * RFCOMM identity before Wi-Fi handoff. Empty clears the active-phone pin. */
     const val CT_ACTIVE_BT_PEER: Byte = 0x1D
+    /** Box->host `[CT_IAP2_SLOT][17-byte ASCII Bluetooth MAC][BTP_*]`; phase IDLE removes the slot. */
+    const val CT_IAP2_SLOT: Byte = 0x1E
 
     const val BH_HCI_PRESENT: Int = 0x01
     const val BH_SSP: Int = 0x02
@@ -283,6 +285,7 @@ object Ocbm {
     const val CAP_IP: Int = 0x0000_0008
     const val CAP_FILE: Int = 0x0000_0010
     const val CAP_ETH: Int = 0x0000_0020
+    const val CAP_MULTI_IAP2: Int = 0x0000_0040
 
     fun capsString(caps: Int): String {
         val bits = ArrayList<String>()
@@ -292,6 +295,7 @@ object Ocbm {
         if (caps and CAP_IP != 0) bits.add("IP")
         if (caps and CAP_FILE != 0) bits.add("FILE")
         if (caps and CAP_ETH != 0) bits.add("ETH")
+        if (caps and CAP_MULTI_IAP2 != 0) bits.add("MULTI_IAP2")
         return if (bits.isEmpty()) "none" else bits.joinToString("|")
     }
 

@@ -135,6 +135,7 @@ fun mergeDeviceList(
     bondedMacs: Set<String>,
     suppressed: Set<String>,
     preferredMac: String?,
+    iap2Slots: Map<String, Byte> = emptyMap(),
     formatLastSeen: (Long) -> String,
 ): List<DeviceInfo> {
     val bonded = bondedMacs.map { it.lowercase() }.toSet()
@@ -150,6 +151,7 @@ fun mergeDeviceList(
                 type = "CarPlay",
                 lastConnected = k?.lastConnectedMs?.let(formatLastSeen),
                 bonded = mac in bonded,
+                iap2Phase = iap2Slots[mac.uppercase()],
             )
         }.sortedWith(
             compareBy(

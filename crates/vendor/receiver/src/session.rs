@@ -345,6 +345,9 @@ impl SessionDelegate for NoSession {
 
 /// The real A/V session. Forwards decoded streams to carlink_linux's IPC ports.
 pub struct AvSession {
+    /// Native control-generation token supplied by the JNI owner. Used only to correlate logs
+    /// across phone switches; it does not alter protocol state.
+    generation: u64,
     shared: Option<[u8; 32]>,
     /// Whether the control plane (timing / event / keepAlive) is already set up.
     ///
@@ -456,6 +459,7 @@ fn parse_control_plist(body: &[u8]) -> Option<Value> {
 impl AvSession {
     pub fn new() -> Self {
         Self {
+            generation: 0,
             shared: None,
             control_setup: AtomicBool::new(false),
             timing_port: 0,
@@ -469,6 +473,11 @@ impl AvSession {
             negotiated_features: Vec::new(),
             resolution: (0, 0, 0),
         }
+    }
+
+    /// Attach the owning native control generation for diagnostic correlation.
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
     }
 
     /// Allocate a fresh liveness flag for an A/V stream of type `ty`, first stopping any prior thread
@@ -534,9 +543,9 @@ impl AvSession {
         let reuse = self.control_setup.load(Ordering::Acquire);
         if reuse {
             eprintln!(
-                "[session] SETUP phase1 repeated with no TEARDOWN — reusing timingPort {} \
+                "[session] gen={} SETUP phase1 repeated with no TEARDOWN — reusing timingPort {} \
                  eventPort {} keepAlivePort {} (reference: _ControlSetup is guarded by controlSetup)",
-                self.timing_port, self.event_port, self.keepalive_port
+                self.generation, self.timing_port, self.event_port, self.keepalive_port
             );
         }
         // Re-arm the session-liveness flag (#119): a full TEARDOWN (or a prior aborted SETUP) leaves
@@ -717,8 +726,8 @@ impl AvSession {
         d.insert("enabledFeatures".into(), Value::Array(feats));
 
         eprintln!(
-            "[session] SETUP phase1 → timingPort {} eventPort {} keepAlivePort {}",
-            self.timing_port, self.event_port, self.keepalive_port
+            "[session] gen={} SETUP phase1 → timingPort {} eventPort {} keepAlivePort {}",
+            self.generation, self.timing_port, self.event_port, self.keepalive_port
         );
         // Control plane is up. Cleared only by `reset()` (full TEARDOWN / Drop), matching the
         // reference's `_ControlTearDown`.
@@ -1584,8 +1593,8 @@ impl AvSession {
             .collect();
         let (w, h, fps) = self.resolution;
         eprintln!(
-            "[session] SETUP negotiated: streams={negotiated_types:?} {w}x{h}@{fps} features={:?}",
-            self.negotiated_features
+            "[session] gen={} SETUP negotiated: streams={negotiated_types:?} {w}x{h}@{fps} features={:?}",
+            self.generation, self.negotiated_features
         );
         let mut d = Dictionary::new();
         d.insert("streams".into(), Value::Array(resp));
@@ -1788,7 +1797,8 @@ impl SessionDelegate for AvSession {
                 }
             }
             eprintln!(
-                "[session] partial TEARDOWN reason=host-request — stopped streams {stopped:?}, session kept"
+                "[session] gen={} partial TEARDOWN reason=host-request — stopped streams {stopped:?}, session kept",
+                self.generation
             );
             // The mic uplink is the INPUT leg of the type-100 MainAudio stream, so it dies WITH that
             // stream — not only at session end (`reset()`, which was the sole `clear()` caller).
@@ -1819,7 +1829,8 @@ impl SessionDelegate for AvSession {
             return;
         }
         eprintln!(
-            "[session] full TEARDOWN reason=host-request — stopping stream threads + resetting session state"
+            "[session] gen={} full TEARDOWN reason=host-request — stopping stream threads + resetting session state",
+            self.generation
         );
         self.reset();
     }
@@ -1874,6 +1885,7 @@ impl SessionDelegate for AvSession {
     }
 
     fn record(&mut self) -> Vec<u8> {
+        eprintln!("[session] gen={} RECORD begin", self.generation);
         // Accept the event-channel TCP HERE (the C's _ControlStart), holding the RECORD 200 OK until
         // it completes. The iPhone connects the event channel after the SETUP response, so by RECORD
         // it's usually pending; poll briefly (up to ~5s) like the C's bounded SocketAccept.
@@ -1890,7 +1902,7 @@ impl SessionDelegate for AvSession {
             for _ in 0..50 {
                 match listener.accept() {
                     Ok((stream, peer)) => {
-                        eprintln!("[session] RECORD: event channel accepted from {peer}");
+                        eprintln!("[session] gen={} RECORD: event channel accepted from {peer}", self.generation);
                         stream.set_nonblocking(false).ok();
                         // Wire the encrypted event channel (receiver→iPhone commands, e.g. touch
                         // hidSendReport) — the C's _ControlStart. Was a plain drain before.
@@ -1917,7 +1929,7 @@ impl SessionDelegate for AvSession {
                         // MainAudio is NOT the audio gate (confirms the iOS-27 trace: modes = runtime
                         // routing, not stream creation). The real gate is the SETUP-phase1 `mainBuffered`
                         // feature echo above. The A/B helper was removed as dead code (audit 2026-07-12).
-                        eprintln!("[session] RECORD: session-focus handshake sent (requestUI={u}, takeScreen={m})");
+                        eprintln!("[session] gen={} RECORD: session-focus handshake sent (requestUI={u}, takeScreen={m})", self.generation);
                         // ALT / cluster video. VERIFIED mechanism (docs/carplay/04_CAPABILITIES_AND_CONFIG.md [CAP]; the old Carlinkit
                         // firmware's "two nav commands" = Cmd 508 RequestNaviScreenFocus / 509 Release):
                         //   1. Advertising `altScreen` in /info + enabledFeatures makes iOS AUTO-SETUP the
@@ -1935,13 +1947,13 @@ impl SessionDelegate for AvSession {
                         thread::sleep(std::time::Duration::from_millis(100));
                     }
                     Err(e) => {
-                        eprintln!("[session] RECORD: event accept error: {e}");
+                        eprintln!("[session] gen={} RECORD: event accept error: {e}", self.generation);
                         break;
                     }
                 }
             }
             if !accepted {
-                eprintln!("[session] RECORD: event channel not connected within timeout");
+                eprintln!("[session] gen={} RECORD: event channel not connected within timeout", self.generation);
             }
             control_started = accepted;
         }
@@ -1983,7 +1995,7 @@ impl SessionDelegate for AvSession {
         if control_started {
             crate::events::mark_session_started(true);
         }
-        eprintln!("[session] RECORD done");
+        eprintln!("[session] gen={} RECORD done", self.generation);
         Vec::new()
     }
 }
@@ -1998,7 +2010,8 @@ impl Drop for AvSession {
         // connection (link loss / net.rs error), not a host-initiated TEARDOWN.
         if self.control_setup.load(Ordering::Acquire) {
             eprintln!(
-                "[session] TEARDOWN reason=link-loss (Drop with no prior host TEARDOWN) — stopping stream threads + resetting session state"
+                "[session] gen={} TEARDOWN reason=link-loss (Drop with no prior host TEARDOWN) — stopping stream threads + resetting session state",
+                self.generation
             );
         }
         self.reset();

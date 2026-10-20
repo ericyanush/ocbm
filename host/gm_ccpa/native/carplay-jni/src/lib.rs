@@ -557,7 +557,9 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
         // them — and forwards decoded elementary streams to localhost:
         //   :9001 video  Annex-B      :9002 media audio  ADTS      :9003 voice audio  tagged AUs
         // which is exactly what MediaCodec consumes, so the decode path needs no JNI at all.
+        let gen = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         let mut av = receiver::session::AvSession::new();
+        av.set_generation(gen);
         match peer.parse::<std::net::SocketAddr>() {
             Ok(a) => { av.set_peer_addr(a); println!("[jni] session peer {a}"); }
             Err(e) => println!("[jni] peer addr {peer:?} unparsed ({e}) — session will use defaults"),
@@ -567,7 +569,6 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
         // Install into the already-held slot, dropping any incumbent (see CORE above), and return
         // the generation token as the handle. A stale token can no longer be dereferenced — it is
         // just an integer that no longer matches the slot.
-        let gen = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         *slot = Some((gen, Native { server }));
         drop(slot);
         println!("[jni] ControlServer ready — pi={pi} (AvSession attached, gen {gen})");

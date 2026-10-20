@@ -996,6 +996,7 @@ class OcbmClient(
     private fun mfiRequest(
         build: (Byte) -> ByteArray,
         timeoutMs: Long,
+        requester: String,
         expectedOk: (ByteArray) -> Boolean,
     ): Mfi.Response? {
         val deadline = System.currentTimeMillis() + timeoutMs
@@ -1003,19 +1004,30 @@ class OcbmClient(
         // the tunnel (a late frame is fine, a late HTTP reply is not) or /auth-setup (which surfaces
         // the failure), and blocking past the phone's timeout helps neither.
         if (!mfiLock.tryLock(timeoutMs, TimeUnit.MILLISECONDS)) {
-            log.w("!! CH_MFI busy — could not acquire the chip lock within ${timeoutMs}ms")
+            log.w("!! CH_MFI requester=$requester busy — could not acquire the chip lock within ${timeoutMs}ms")
             return null
         }
         try {
             val tag = nextMfiTag()
+            val tagHex = "%02x".format(tag.toInt() and 0xff)
             // Drain stale/late replies from a previous request UNDER the lock, so this request's poll
             // cannot pick up an earlier answer that arrived after that caller's timeout.
             while (mfiQ.poll() != null) { /* discard */ }
-            if (!send(Ocbm.CH_MFI, build(tag))) return null
+            log.i(">> CH_MFI request=$requester tag=$tagHex")
+            if (!send(Ocbm.CH_MFI, build(tag))) {
+                log.e("!! CH_MFI request=$requester tag=$tagHex send failed")
+                return null
+            }
             while (true) {
                 val remaining = deadline - System.currentTimeMillis()
-                if (remaining <= 0) return null
-                val pl = mfiQ.poll(remaining, TimeUnit.MILLISECONDS) ?: return null
+                if (remaining <= 0) {
+                    log.e("!! CH_MFI requester=$requester tag=$tagHex timed out after ${timeoutMs}ms")
+                    return null
+                }
+                val pl = mfiQ.poll(remaining, TimeUnit.MILLISECONDS) ?: run {
+                    log.e("!! CH_MFI requester=$requester tag=$tagHex timed out after ${timeoutMs}ms")
+                    return null
+                }
                 val resp = Mfi.parse(pl, pl.size) ?: continue
                 // Tag first, when the box echoes one: this is the only check that can tell two
                 // same-length SIGNATURE replies apart, which length correlation structurally cannot.
@@ -1027,6 +1039,7 @@ class OcbmClient(
                             .format(resp.tag, tag))
                         continue
                     }
+                    log.i("<< CH_MFI request=$requester tag=$tagHex status=${resp.statusName()} payload=${resp.payload.size}B")
                     return resp
                 }
                 // Untagged peer (older box): fall back to the old weak length correlation.
@@ -1034,6 +1047,7 @@ class OcbmClient(
                     log.w("!! CH_MFI stale/mismatched OK reply (${resp.payload.size}B) discarded")
                     continue
                 }
+                log.i("<< CH_MFI request=$requester tag=$tagHex status=${resp.statusName()} payload=${resp.payload.size}B (untagged peer)")
                 return resp
             }
         } finally {
@@ -1046,19 +1060,23 @@ class OcbmClient(
      * /tmp/carplay_mfi.lock with a 10 s deadline, and MFi blocks its single-threaded dispatch.
      */
     fun mfiCertificate(timeoutMs: Long = MFI_CERT_TIMEOUT_MS): Mfi.Response? {
-        log.i(">> CH_MFI copy_certificate")
         // A certificate is ~945 B; a 128-B OK reply is the signature answer to another request.
-        return mfiRequest({ t -> Mfi.certRequest(t) }, timeoutMs) { it.size > Mfi.SIG_LEN }
+        return mfiRequest({ t -> Mfi.certRequest(t) }, timeoutMs, "unspecified/copy_certificate") { it.size > Mfi.SIG_LEN }
     }
+
+    fun mfiCertificate(timeoutMs: Long, requester: String): Mfi.Response? =
+        mfiRequest({ t -> Mfi.certRequest(t) }, timeoutMs, "$requester/copy_certificate") { it.size > Mfi.SIG_LEN }
 
     /**
      * Sign a 20-byte SHA-1 digest. The chip sequence alone runs up to ~2.1 s, and with lock
      * contention the worst case approaches 12 s.
      */
     fun mfiSign(digest: ByteArray, timeoutMs: Long = MFI_SIGN_TIMEOUT_MS): Mfi.Response? {
-        log.i(">> CH_MFI create_signature (${digest.size}B digest)")
-        return mfiRequest({ t -> Mfi.signRequest(digest, t) }, timeoutMs) { it.size == Mfi.SIG_LEN }
+        return mfiRequest({ t -> Mfi.signRequest(digest, t) }, timeoutMs, "unspecified/create_signature") { it.size == Mfi.SIG_LEN }
     }
+
+    fun mfiSign(digest: ByteArray, timeoutMs: Long, requester: String): Mfi.Response? =
+        mfiRequest({ t -> Mfi.signRequest(digest, t) }, timeoutMs, "$requester/create_signature") { it.size == Mfi.SIG_LEN }
 
     // ---- CH_FILE --------------------------------------------------------------------------------
 

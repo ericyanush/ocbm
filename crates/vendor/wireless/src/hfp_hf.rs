@@ -95,7 +95,10 @@ pub fn wbs_enabled() -> bool {
         return true;
     }
     let raw = box_common::lever("BT_HFP_WBS", "CARPLAY_HFP_WBS");
-    matches!(raw.as_deref().map(str::trim), Some("1") | Some("on") | Some("yes"))
+    matches!(
+        raw.as_deref().map(str::trim),
+        Some("1") | Some("on") | Some("yes")
+    )
 }
 
 /// Ceiling on the whole service-level connection. Stock's took 392 ms end to end (`AT+BRSF` at
@@ -257,7 +260,11 @@ struct AtReader<'a, S: Read> {
 
 impl<'a, S: Read> AtReader<'a, S> {
     fn new(io: &'a mut S) -> Self {
-        Self { io, buf: Vec::with_capacity(256), queued: std::collections::VecDeque::new() }
+        Self {
+            io,
+            buf: Vec::with_capacity(256),
+            queued: std::collections::VecDeque::new(),
+        }
     }
 
     /// Move every complete line out of `buf` into `queued`, keeping any trailing partial.
@@ -266,7 +273,9 @@ impl<'a, S: Read> AtReader<'a, S> {
         for i in 0..self.buf.len() {
             if self.buf[i] == b'\r' || self.buf[i] == b'\n' {
                 if i > start {
-                    let line = String::from_utf8_lossy(&self.buf[start..i]).trim().to_string();
+                    let line = String::from_utf8_lossy(&self.buf[start..i])
+                        .trim()
+                        .to_string();
                     if !line.is_empty() {
                         self.queued.push_back(line);
                     }
@@ -327,8 +336,9 @@ pub fn is_unsolicited(line: &str) -> bool {
     // `startBluetoothSco`), so on this link `+BVRA: 1` is not an edge case — it is the FIRST audio
     // event most drives will see. It was already tolerated as an "unknown intermediate result", but
     // only by accident of `command`'s fallback; naming it makes the classification deliberate.
-    const PREFIXES: [&str; 9] =
-        ["+CIEV", "+BSIR", "+CLIP", "+CCWA", "+VGS", "+VGM", "+BCS", "+BIND", "+BVRA"];
+    const PREFIXES: [&str; 9] = [
+        "+CIEV", "+BSIR", "+CLIP", "+CCWA", "+VGS", "+VGM", "+BCS", "+BIND", "+BVRA",
+    ];
     line == "RING" || PREFIXES.iter().any(|p| line.starts_with(p))
 }
 
@@ -370,7 +380,10 @@ fn command<S: Read + Write>(
         .io
         .write_all(wire.as_bytes())
         .map_err(|e| fail(format!("write failed: {e}")))?;
-    reader.io.flush().map_err(|e| fail(format!("flush failed: {e}")))?;
+    reader
+        .io
+        .flush()
+        .map_err(|e| fail(format!("flush failed: {e}")))?;
 
     let mut collected = Vec::new();
     loop {
@@ -415,8 +428,11 @@ pub fn establish_hfp_with<S: Read + Write>(io: &mut S, wbs: bool) -> Result<SlcU
     let mut reader = AtReader::new(io);
 
     // 1. Feature exchange. The AG's reply is what gates step 1b and step 6.
-    let hf_features =
-        if wbs { HF_SUPPORTED_FEATURES_WBS } else { HF_SUPPORTED_FEATURES };
+    let hf_features = if wbs {
+        HF_SUPPORTED_FEATURES_WBS
+    } else {
+        HF_SUPPORTED_FEATURES
+    };
     let brsf = command(
         &mut reader,
         "AT+BRSF",
@@ -441,7 +457,14 @@ pub fn establish_hfp_with<S: Read + Write>(io: &mut S, wbs: bool) -> Result<SlcU
     //     With the lever off this step does not exist and the dialogue is byte-identical to stock's.
     let offered_wbs = wbs && ag_features & AG_FEATURE_CODEC_NEGOTIATION != 0;
     if offered_wbs {
-        command(&mut reader, "AT+BAC", "AT+BAC=1,2", None, &mut unsolicited, total_deadline)?;
+        command(
+            &mut reader,
+            "AT+BAC",
+            "AT+BAC=1,2",
+            None,
+            &mut unsolicited,
+            total_deadline,
+        )?;
     }
 
     // 2. Indicator names and ranges. Parsed for the NAMES: `+CIEV: 6,4` is unreadable without them.
@@ -453,14 +476,38 @@ pub fn establish_hfp_with<S: Read + Write>(io: &mut S, wbs: bool) -> Result<SlcU
         &mut unsolicited,
         total_deadline,
     )?;
-    let indicators = cind_test.first().map(|l| parse_indicator_names(l)).unwrap_or_default();
+    let indicators = cind_test
+        .first()
+        .map(|l| parse_indicator_names(l))
+        .unwrap_or_default();
 
     // 3. Enable unsolicited indicator events. We never act on them; we log them.
-    command(&mut reader, "AT+CMER", "AT+CMER=3,0,0,1", None, &mut unsolicited, total_deadline)?;
+    command(
+        &mut reader,
+        "AT+CMER",
+        "AT+CMER=3,0,0,1",
+        None,
+        &mut unsolicited,
+        total_deadline,
+    )?;
     // 4. Calling line identification.
-    command(&mut reader, "AT+CLIP", "AT+CLIP=1", None, &mut unsolicited, total_deadline)?;
+    command(
+        &mut reader,
+        "AT+CLIP",
+        "AT+CLIP=1",
+        None,
+        &mut unsolicited,
+        total_deadline,
+    )?;
     // 5. Call waiting notification.
-    command(&mut reader, "AT+CCWA", "AT+CCWA=1", None, &mut unsolicited, total_deadline)?;
+    command(
+        &mut reader,
+        "AT+CCWA",
+        "AT+CCWA=1",
+        None,
+        &mut unsolicited,
+        total_deadline,
+    )?;
 
     // 6. Hold modes — only when the AG claims three-way calling. Asking a gateway that does not
     //    would earn an `ERROR` and abort an SLC that was otherwise complete.
@@ -481,7 +528,14 @@ pub fn establish_hfp_with<S: Read + Write>(io: &mut S, wbs: bool) -> Result<SlcU
 
     // 7. Current indicator values. Its OK is the moment the AG logs `Connected` and, on stock,
     //    26 ms before the phone opened the Android Auto channel.
-    command(&mut reader, "AT+CIND?", "AT+CIND?", Some("+CIND:"), &mut unsolicited, total_deadline)?;
+    command(
+        &mut reader,
+        "AT+CIND?",
+        "AT+CIND?",
+        Some("+CIND:"),
+        &mut unsolicited,
+        total_deadline,
+    )?;
 
     let carry = reader.buf.clone();
     let mut pending: Vec<String> = reader.queued.iter().cloned().collect();
@@ -641,7 +695,10 @@ pub struct CallTracker {
 
 impl CallTracker {
     pub fn new(indicators: &[String]) -> Self {
-        Self { indicators: indicators.to_vec(), ..Default::default() }
+        Self {
+            indicators: indicators.to_vec(),
+            ..Default::default()
+        }
     }
 
     /// True while the AG has audio to carry: a call in any phase, or a voice-recognition session.
@@ -653,7 +710,11 @@ impl CallTracker {
     pub fn observe(&mut self, line: &str) -> Vec<CallEvent> {
         let mut out = Vec::new();
         if let Some(rest) = line.strip_prefix("+BVRA:") {
-            let on = rest.trim().split(',').next().and_then(|v| v.trim().parse::<u8>().ok());
+            let on = rest
+                .trim()
+                .split(',')
+                .next()
+                .and_then(|v| v.trim().parse::<u8>().ok());
             if let Some(v) = on {
                 let on = v != 0;
                 if on != self.vr {
@@ -670,13 +731,23 @@ impl CallTracker {
             }
             return out;
         }
-        let Some(args) = line.strip_prefix("+CIEV:") else { return out };
+        let Some(args) = line.strip_prefix("+CIEV:") else {
+            return out;
+        };
         let mut parts = args.trim().splitn(2, ',');
-        let (Some(idx), Some(val)) = (parts.next(), parts.next()) else { return out };
-        let Ok(i) = idx.trim().parse::<usize>() else { return out };
+        let (Some(idx), Some(val)) = (parts.next(), parts.next()) else {
+            return out;
+        };
+        let Ok(i) = idx.trim().parse::<usize>() else {
+            return out;
+        };
         // 1-based, per HFP 1.7 §4.35 — the same convention `describe_unsolicited` renders with.
-        let Some(name) = i.checked_sub(1).and_then(|z| self.indicators.get(z)) else { return out };
-        let Ok(v) = val.trim().parse::<u8>() else { return out };
+        let Some(name) = i.checked_sub(1).and_then(|z| self.indicators.get(z)) else {
+            return out;
+        };
+        let Ok(v) = val.trim().parse::<u8>() else {
+            return out;
+        };
         match name.as_str() {
             "call" => {
                 let was = self.call;
@@ -737,7 +808,13 @@ pub fn parse_clip(line: &str) -> Option<String> {
 
 /// The codec id out of an unsolicited `+BCS: <id>`. `None` for any other line.
 pub fn parse_bcs(line: &str) -> Option<u8> {
-    line.strip_prefix("+BCS:")?.trim().split(',').next()?.trim().parse::<u8>().ok()
+    line.strip_prefix("+BCS:")?
+        .trim()
+        .split(',')
+        .next()?
+        .trim()
+        .parse::<u8>()
+        .ok()
 }
 
 /// What to answer a `+BCS: <id>` with. The AG has stopped and is WAITING for this — HFP 1.7 §4.11.3
@@ -799,7 +876,10 @@ pub fn choose_codec(id: u8, wbs: bool, narrowed: bool) -> CodecChoice {
 pub fn autoanswer() -> bool {
     let raw = box_common::lever("BT_HFP_AUTOANSWER", "CARPLAY_HFP_AUTOANSWER")
         .or_else(|| std::fs::read_to_string("/tmp/hfp_autoanswer").ok());
-    matches!(raw.as_deref().map(str::trim), Some("1") | Some("on") | Some("yes"))
+    matches!(
+        raw.as_deref().map(str::trim),
+        Some("1") | Some("on") | Some("yes")
+    )
 }
 
 #[cfg(test)]
@@ -822,7 +902,12 @@ mod tests {
 
     impl FakeAg {
         fn new(script: Vec<(&'static str, &'static str)>) -> Self {
-            Self { script, sent: Vec::new(), pending_read: Vec::new(), partial: Vec::new() }
+            Self {
+                script,
+                sent: Vec::new(),
+                pending_read: Vec::new(),
+                partial: Vec::new(),
+            }
         }
     }
 
@@ -893,7 +978,15 @@ mod tests {
         assert_eq!(up.slc.chld.as_deref(), Some("(0,1,2,3)"));
         assert_eq!(
             up.slc.indicators,
-            ["call", "callsetup", "service", "signal", "roam", "battchg", "callheld"]
+            [
+                "call",
+                "callsetup",
+                "service",
+                "signal",
+                "roam",
+                "battchg",
+                "callheld"
+            ]
         );
         assert_eq!(
             ag.sent,
@@ -908,8 +1001,16 @@ mod tests {
             ]
         );
         // The interleaved +BSIR results must be surfaced, not silently eaten.
-        assert!(up.pending.iter().any(|l| l == "+BSIR: 0"), "pending: {:?}", up.pending);
-        assert!(up.pending.iter().any(|l| l == "+BSIR: 1"), "pending: {:?}", up.pending);
+        assert!(
+            up.pending.iter().any(|l| l == "+BSIR: 0"),
+            "pending: {:?}",
+            up.pending
+        );
+        assert!(
+            up.pending.iter().any(|l| l == "+BSIR: 1"),
+            "pending: {:?}",
+            up.pending
+        );
         assert!(up.carry.is_empty(), "no partial line should be left over");
     }
 
@@ -924,7 +1025,11 @@ mod tests {
         let up = establish_hfp_with(&mut ag, false).expect("SLC must still establish");
         assert_eq!(up.slc.ag_features, Some(878));
         assert_eq!(up.slc.chld, None);
-        assert!(!ag.sent.iter().any(|c| c.starts_with("AT+CHLD")), "sent: {:?}", ag.sent);
+        assert!(
+            !ag.sent.iter().any(|c| c.starts_with("AT+CHLD")),
+            "sent: {:?}",
+            ag.sent
+        );
     }
 
     /// An `ERROR` must fail, and must name the step that got it — the whole point of `SlcError`.
@@ -960,7 +1065,10 @@ mod tests {
         let err = establish_hfp_with(&mut ag, false).expect_err("EOF must fail");
         assert_eq!(err.step, "AT+BRSF");
         assert_eq!(err.why, "the gateway closed the link");
-        assert!(started.elapsed() < STEP_BUDGET, "must not wait out the step budget on EOF");
+        assert!(
+            started.elapsed() < STEP_BUDGET,
+            "must not wait out the step budget on EOF"
+        );
     }
 
     /// Framing tolerance: a gateway that uses bare `\n`, or crams the whole response into one
@@ -1001,7 +1109,10 @@ mod tests {
     #[test]
     fn indicator_names_come_out_in_order() {
         let line = "+CIND: (\"call\",(0,1)),(\"callsetup\",(0-3)),(\"battchg\",(0-5))";
-        assert_eq!(parse_indicator_names(line), ["call", "callsetup", "battchg"]);
+        assert_eq!(
+            parse_indicator_names(line),
+            ["call", "callsetup", "battchg"]
+        );
         // An unreadable response is an empty list, never a panic or a failed SLC.
         assert!(parse_indicator_names("+CIND: garbage").is_empty());
         assert!(parse_indicator_names("+CIND: (\"unterminated").is_empty());
@@ -1011,12 +1122,22 @@ mod tests {
     /// only readable with the indicator list from `AT+CIND=?`.
     #[test]
     fn ciev_is_rendered_against_the_indicator_names() {
-        let names: Vec<String> =
-            ["call", "callsetup", "service", "signal", "roam", "battchg", "callheld"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        assert_eq!(describe_unsolicited("+CIEV: 6,4", &names), "+CIEV: 6,4 (battchg = 4)");
+        let names: Vec<String> = [
+            "call",
+            "callsetup",
+            "service",
+            "signal",
+            "roam",
+            "battchg",
+            "callheld",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            describe_unsolicited("+CIEV: 6,4", &names),
+            "+CIEV: 6,4 (battchg = 4)"
+        );
         // Out of range, zero (the list is 1-based) and malformed all fall back to the raw line.
         assert_eq!(describe_unsolicited("+CIEV: 99,1", &names), "+CIEV: 99,1");
         assert_eq!(describe_unsolicited("+CIEV: 0,1", &names), "+CIEV: 0,1");
@@ -1028,7 +1149,14 @@ mod tests {
 
     #[test]
     fn unsolicited_classification_covers_what_the_ag_volunteers() {
-        for l in ["+CIEV: 1,0", "+BSIR: 0", "RING", "+CLIP: \"x\",129", "+VGS=7", "+BCS: 2"] {
+        for l in [
+            "+CIEV: 1,0",
+            "+BSIR: 0",
+            "RING",
+            "+CLIP: \"x\",129",
+            "+VGS=7",
+            "+BCS: 2",
+        ] {
             assert!(is_unsolicited(l), "{l} must be unsolicited");
         }
         for l in ["OK", "ERROR", "+BRSF: 879", "+CIND: 0,0", "+CHLD: (0,1)"] {
@@ -1085,7 +1213,11 @@ mod tests {
         let up = establish_hfp_with(&mut ag, false).expect("SLC must establish");
         assert!(!up.slc.wbs);
         assert_eq!(ag.sent[0], "AT+BRSF=63");
-        assert!(!ag.sent.iter().any(|c| c.starts_with("AT+BAC")), "sent: {:?}", ag.sent);
+        assert!(
+            !ag.sent.iter().any(|c| c.starts_with("AT+BAC")),
+            "sent: {:?}",
+            ag.sent
+        );
     }
 
     /// An AG without `+BRSF` bit 9 must NOT be sent `AT+BAC`: HFP 1.7 §4.2.1 makes the exchange
@@ -1100,8 +1232,15 @@ mod tests {
         let mut ag = FakeAg::new(script);
         let up = establish_hfp_with(&mut ag, true).expect("SLC must still establish");
         assert_eq!(up.slc.ag_features, Some(367));
-        assert!(!up.slc.wbs, "nothing was offered, so nothing may be recorded as offered");
-        assert!(!ag.sent.iter().any(|c| c.starts_with("AT+BAC")), "sent: {:?}", ag.sent);
+        assert!(
+            !up.slc.wbs,
+            "nothing was offered, so nothing may be recorded as offered"
+        );
+        assert!(
+            !ag.sent.iter().any(|c| c.starts_with("AT+BAC")),
+            "sent: {:?}",
+            ag.sent
+        );
     }
 
     /// A `+BCS` that arrives DURING the dialogue must be surfaced as unsolicited, not mistaken for
@@ -1113,7 +1252,11 @@ mod tests {
         script[3] = ("AT+CMER=3,0,0,1", "\r\n+BCS: 2\r\n\r\nOK\r\n");
         let mut ag = FakeAg::new(script);
         let up = establish_hfp_with(&mut ag, true).expect("SLC must establish");
-        assert!(up.pending.iter().any(|l| l == "+BCS: 2"), "pending: {:?}", up.pending);
+        assert!(
+            up.pending.iter().any(|l| l == "+BCS: 2"),
+            "pending: {:?}",
+            up.pending
+        );
     }
 
     #[test]
@@ -1131,11 +1274,18 @@ mod tests {
     fn bcs_ids_parse_and_nothing_else_does() {
         assert_eq!(parse_bcs("+BCS: 2"), Some(2));
         assert_eq!(parse_bcs("+BCS:1"), Some(1));
-        assert_eq!(parse_bcs("+BCS: 3,1"), Some(3), "a trailing field must not defeat the id");
+        assert_eq!(
+            parse_bcs("+BCS: 3,1"),
+            Some(3),
+            "a trailing field must not defeat the id"
+        );
         assert_eq!(parse_bcs("+BCS: x"), None);
         assert_eq!(parse_bcs("+BCS:"), None);
         assert_eq!(parse_bcs("+BVRA: 1"), None);
-        assert!(is_unsolicited("+BCS: 2"), "the SLC must not read it as an answer");
+        assert!(
+            is_unsolicited("+BCS: 2"),
+            "the SLC must not read it as an answer"
+        );
     }
 
     /// Every reachable `+BCS` must produce exactly one command: the AG is stopped, waiting, and will
@@ -1157,13 +1307,22 @@ mod tests {
 
     #[test]
     fn the_ag_choosing_msbc_is_accepted_only_while_wideband_is_live() {
-        assert_eq!(choose_codec(CODEC_MSBC, true, false), CodecChoice::Use(CODEC_MSBC));
+        assert_eq!(
+            choose_codec(CODEC_MSBC, true, false),
+            CodecChoice::Use(CODEC_MSBC)
+        );
         assert_eq!(choose_codec(CODEC_MSBC, true, false).command(), "AT+BCS=2");
         // Lever off — we never offered it, so accepting would be a lie about a socket we never
         // configured.
-        assert_eq!(choose_codec(CODEC_MSBC, false, false), CodecChoice::NarrowToCvsd);
+        assert_eq!(
+            choose_codec(CODEC_MSBC, false, false),
+            CodecChoice::NarrowToCvsd
+        );
         // Already fallen back once: a second +BCS: 2 must not walk us back in.
-        assert_eq!(choose_codec(CODEC_MSBC, true, true), CodecChoice::NarrowToCvsd);
+        assert_eq!(
+            choose_codec(CODEC_MSBC, true, true),
+            CodecChoice::NarrowToCvsd
+        );
         assert_eq!(CodecChoice::NarrowToCvsd.command(), "AT+BAC=1");
     }
 
@@ -1172,7 +1331,10 @@ mod tests {
     #[test]
     fn cvsd_is_always_accepted() {
         for (wbs, narrowed) in [(false, false), (true, false), (false, true), (true, true)] {
-            assert_eq!(choose_codec(CODEC_CVSD, wbs, narrowed), CodecChoice::Use(CODEC_CVSD));
+            assert_eq!(
+                choose_codec(CODEC_CVSD, wbs, narrowed),
+                CodecChoice::Use(CODEC_CVSD)
+            );
         }
         assert_eq!(choose_codec(CODEC_CVSD, true, false).command(), "AT+BCS=1");
     }
@@ -1223,10 +1385,21 @@ mod tests {
         let mut t = CallTracker::new(&ind);
         assert!(!t.audio_wanted());
         assert_eq!(t.observe("+CIEV: 2,1"), [CallEvent::IncomingRinging]);
-        assert!(t.audio_wanted(), "a ringing call already needs the mic seam up");
-        assert_eq!(t.observe("RING"), [], "RING must not duplicate the indicator transition");
+        assert!(
+            t.audio_wanted(),
+            "a ringing call already needs the mic seam up"
+        );
+        assert_eq!(
+            t.observe("RING"),
+            [],
+            "RING must not duplicate the indicator transition"
+        );
         assert_eq!(t.observe("+CIEV: 1,1"), [CallEvent::CallActive]);
-        assert_eq!(t.observe("+CIEV: 2,0"), [], "setup clearing into an active call is not an abandonment");
+        assert_eq!(
+            t.observe("+CIEV: 2,0"),
+            [],
+            "setup clearing into an active call is not an abandonment"
+        );
         assert!(t.audio_wanted());
         assert_eq!(t.observe("+CIEV: 1,0"), [CallEvent::CallEnded]);
         assert!(!t.audio_wanted());
@@ -1261,7 +1434,13 @@ mod tests {
     fn unrelated_indicators_produce_no_events() {
         let ind = stock_indicators();
         let mut t = CallTracker::new(&ind);
-        for l in ["+CIEV: 6,4", "+CIEV: 4,3", "+CIEV: 3,1", "+CIEV: 5,0", "+BSIR: 1"] {
+        for l in [
+            "+CIEV: 6,4",
+            "+CIEV: 4,3",
+            "+CIEV: 3,1",
+            "+CIEV: 5,0",
+            "+BSIR: 1",
+        ] {
             assert_eq!(t.observe(l), [], "{l} must not be a call transition");
         }
         assert!(!t.audio_wanted());
@@ -1277,7 +1456,11 @@ mod tests {
         assert!(!t.audio_wanted());
         // …but RING still works, which is the whole reason the latch exists.
         assert_eq!(t.observe("RING"), [CallEvent::IncomingRinging]);
-        assert_eq!(t.observe("RING"), [], "the latch must not log one line per ring");
+        assert_eq!(
+            t.observe("RING"),
+            [],
+            "the latch must not log one line per ring"
+        );
     }
 
     /// The Assistant path. gearhead calls `startVoiceRecognition` BEFORE `startBluetoothSco`
@@ -1305,9 +1488,19 @@ mod tests {
 
     #[test]
     fn clip_yields_the_bare_number() {
-        assert_eq!(parse_clip("+CLIP: \"+441234567890\",145"), Some("+441234567890".into()));
-        assert_eq!(parse_clip("+CLIP: \"5551234\",129,,,\"Alice\""), Some("5551234".into()));
-        assert_eq!(parse_clip("+CLIP: \"\",128"), None, "a withheld number is not a number");
+        assert_eq!(
+            parse_clip("+CLIP: \"+441234567890\",145"),
+            Some("+441234567890".into())
+        );
+        assert_eq!(
+            parse_clip("+CLIP: \"5551234\",129,,,\"Alice\""),
+            Some("5551234".into())
+        );
+        assert_eq!(
+            parse_clip("+CLIP: \"\",128"),
+            None,
+            "a withheld number is not a number"
+        );
         assert_eq!(parse_clip("+CIEV: 1,1"), None);
     }
 

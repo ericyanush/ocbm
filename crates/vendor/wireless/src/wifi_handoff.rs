@@ -276,7 +276,9 @@ pub fn read_hostapd_ap_config() -> Option<AccessoryWiFiConfig> {
         }
     }
     if ssid.is_empty() {
-        eprintln!("[wifi_handoff] {path} names no SSID — refusing to describe an AP that is not running");
+        eprintln!(
+            "[wifi_handoff] {path} names no SSID — refusing to describe an AP that is not running"
+        );
         return None;
     }
     let (security_type, passphrase) = if has_wpa {
@@ -284,7 +286,11 @@ pub fn read_hostapd_ap_config() -> Option<AccessoryWiFiConfig> {
         // a usable passphrase (wpa_psk-only) is still advertised as secured rather than open (audit B5).
         (
             Some(AccessoryWiFiSecurityType::Wpa2OrWpa3Personal),
-            if passphrase.is_empty() { None } else { Some(passphrase) },
+            if passphrase.is_empty() {
+                None
+            } else {
+                Some(passphrase)
+            },
         )
     } else {
         (Some(AccessoryWiFiSecurityType::None), None)

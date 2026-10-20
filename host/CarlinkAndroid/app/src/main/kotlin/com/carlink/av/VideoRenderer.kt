@@ -9,6 +9,7 @@ import java.io.InputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * H.264 / HEVC decoder for the CarPlay screen stream, rendering straight to a [Surface].
@@ -42,6 +43,7 @@ class VideoRenderer(
 ) {
     private val log = ProbeLog.sub("video")
     private val running = AtomicBoolean(false)
+    private val firstFrameCallback = AtomicReference<(() -> Unit)?>(null)
 
     @Volatile private var codec: MediaCodec? = null
 
@@ -90,6 +92,11 @@ class VideoRenderer(
     fun stop() {
         running.set(false)
         log.i("stopping — ${framesRendered.get()} frames, ${bytesIn.get()} bytes, ${ausDropped.get()} AUs dropped")
+    }
+
+    /** Arm a one-shot callback for the next real decoded frame; used once per CarPlay session. */
+    fun armFirstFrameCallback(callback: () -> Unit) {
+        firstFrameCallback.set(callback)
     }
 
     /**
@@ -286,6 +293,12 @@ class VideoRenderer(
                     c.releaseOutputBuffer(outIdx, real)
                     val n = if (real) framesRendered.incrementAndGet() else 0L
                     if (n == 1L) log.i("FIRST FRAME RENDERED")
+                    if (real) firstFrameCallback.getAndSet(null)?.let { callback ->
+                        log.i("session first-frame confirmation")
+                        runCatching(callback).onFailure {
+                            log.w("first-frame callback failed: ${it.javaClass.simpleName}: ${it.message}")
+                        }
+                    }
                     if (n > 0L && n % LOG_EVERY_FRAMES == 0L) log.i("$n frames rendered (${bytesIn.get()} B in)")
                 }
                 outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> log.i("output format: ${c.outputFormat}")

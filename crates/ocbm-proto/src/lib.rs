@@ -215,6 +215,8 @@ pub const CT_ACTIVE_BT_PEER: u8 = 0x1D; // box->host [UTF-8 Bluetooth MAC | empt
                                         // accepted by the active RFCOMM/iAP2 session. Sent before
                                         // BTP_WIFI_HANDOFF so a host can pin discovery/nudge to that
                                         // peer rather than choosing among every advertised iPhone.
+pub const CT_IAP2_SLOT: u8 = 0x1E; // box->host [17-byte ASCII Bluetooth MAC][BTP_*] -> per-phone
+                                   // iAP2 progress. BTP_IDLE means that phone's slot was released.
 pub const BH_HCI_PRESENT: u8 = 0x01; // hci0 exists AND is UP (HCI_UP in /sys/class/bluetooth/hci0/flags).
                                      // CORRECTED 2026-08-29: this used to test only that the sysfs node
                                      // EXISTED, which survives `hciconfig hci0 down` (wireless_down leaves
@@ -360,6 +362,7 @@ pub const CAP_MFI: u32 = 0x0000_0004;
 pub const CAP_IP: u32 = 0x0000_0008;
 pub const CAP_FILE: u32 = 0x0000_0010;
 pub const CAP_ETH: u32 = 0x0000_0020; // box can bridge a raw-ethernet netdev (ncm0) over CH_ETH
+pub const CAP_MULTI_IAP2: u32 = 0x0000_0040; // box reports independently tracked per-phone iAP2 slots
 
 // OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
 // AAOS has no NCM, so L3 is done in userspace over this channel (no kernel TUN needed).

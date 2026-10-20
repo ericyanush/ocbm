@@ -22,6 +22,7 @@ import zeno.gmccpa.pair.Tlv8
 import zeno.gmccpa.logging.SessionTrace
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /** Pure selection rule shared by tests and the discovery callback. */
@@ -35,6 +36,13 @@ internal fun isAllowedCarPlayCandidate(
     if (!handoffReady) return false
     if (activeBluetoothPeer != null) return advertisedBluetoothMac.equals(activeBluetoothPeer, ignoreCase = true)
     return discoveredServiceNames.size == 1 && discoveredServiceNames.contains(serviceName)
+}
+
+/** Compare an accepted control socket with the recently resolved endpoint(s) for the selected phone. */
+internal fun isExpectedInboundPeer(remoteAddress: String, expectedAddresses: Set<String>): Boolean {
+    fun normalized(value: String) = value.substringBefore('%').trim().lowercase()
+    val remote = normalized(remoteAddress)
+    return remote.isNotEmpty() && expectedAddresses.any { normalized(it) == remote }
 }
 
 /**
@@ -80,6 +88,8 @@ class CarPlayRx(
      * Runs on the accept thread: hand off, do not block.
      */
     var onSessionUp: (() -> Unit)? = null,
+    /** Fires after the inbound peer has been checked against the selected Bonjour/iAP2 phone. */
+    var onControlConnectionAccepted: ((phoneMac: String?, generation: Long) -> Unit)? = null,
     /**
      * Fired when the last live control connection goes away — clean TEARDOWN and abrupt link loss
      * alike, because the two are indistinguishable here (the phone simply stops reading).
@@ -175,9 +185,19 @@ class CarPlayRx(
      * identity is eligible to receive a nudge for the current handoff. */
     private val pinnedPhoneMac = AtomicReference<String?>(null)
     private val handoffReady = AtomicBoolean(false)
+    /** Changes whenever the selected peer/handoff attempt changes; fences queued and retrying dials. */
+    private val handoffGeneration = AtomicLong(0L)
     private val discoveryRefreshInFlight = AtomicBoolean(false)
     /** Current Bonjour instances and their TXT Bluetooth identities, used only for safe fallback. */
     private val peerCandidates = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** Recent resolved control-service IPs, joined to the Bluetooth identity in its TXT record. */
+    private val peerAddressesByMac = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
+    @Volatile var sessionPhoneMac: String? = null
+        private set
+    /** NsdManager's legacy resolveService API permits only one outstanding resolve at a time. */
+    private val resolveLock = Any()
+    private val pendingResolves = LinkedHashMap<String, NsdServiceInfo>()
+    private var resolvingServiceName: String? = null
 
     /** The incumbent control connection, for hijack: a new inbound supersedes and closes it. */
     @Volatile private var currentSocket: Socket? = null
@@ -213,6 +233,8 @@ class CarPlayRx(
     /** Is a control connection up right now? The box/attach paths need this to avoid disturbing a
      *  live session; nothing outside could see it before. */
     val sessionLive: Boolean get() = liveConnections.get() > 0
+    /** Current native receiver generation, used to fence media-confirmation callbacks. */
+    val activeControlGeneration: Long get() = latestGen
 
     /**
      * How many accepted control connections have not yet finished.
@@ -236,12 +258,14 @@ class CarPlayRx(
             else log.w("ignoring malformed active iAP2 peer '$mac'")
             return
         }
-        // A newly accepted RFCOMM peer starts a new attempt. Do not let the prior phone's handoff
-        // readiness authorize a nudge before this peer reaches BTP_WIFI_HANDOFF.
-        handoffReady.set(false)
         val previous = pinnedPhoneMac.getAndSet(normalized)
         if (previous != normalized) {
+            // A newly selected RFCOMM peer starts a new attempt. Do not let the prior phone's
+            // handoff readiness authorize a nudge for this peer before it reaches WIFI_HANDOFF.
+            handoffReady.set(false)
+            val generation = handoffGeneration.incrementAndGet()
             log.i("handoff target pinned to Bluetooth peer $normalized")
+            log.i("handoff generation=$generation invalidated by peer change ${previous ?: "none"} -> $normalized")
             refreshDiscoveryForSelection()
         }
     }
@@ -253,9 +277,16 @@ class CarPlayRx(
         if (phase == BT_PHASE_IDLE || phase == BT_PHASE_PAIR_REJECTED) {
             handoffReady.set(false)
             val previous = pinnedPhoneMac.getAndSet(null)
+            if (previous != null || wasReady) {
+                val generation = handoffGeneration.incrementAndGet()
+                log.i("handoff generation=$generation invalidated by Bluetooth idle/reject")
+            }
             if (previous != null) log.i("Bluetooth attempt ended; cleared handoff target $previous")
         } else if (phase == BT_PHASE_WIFI_HANDOFF) {
-            handoffReady.set(true)
+            if (handoffReady.compareAndSet(false, true)) {
+                val generation = handoffGeneration.incrementAndGet()
+                log.i("handoff generation=$generation ready for peer=${pinnedPhoneMac.get() ?: "unidentified"}")
+            }
             NetworkDiagnostics.snapshot("Bluetooth reported Wi-Fi handoff")
             NetworkDiagnostics.snapshotAfter("Bluetooth Wi-Fi handoff settle", 1500)
             NetworkDiagnostics.snapshotAfter("Bluetooth Wi-Fi handoff follow-up", 5000)
@@ -266,6 +297,31 @@ class CarPlayRx(
             log.i(if (ready) "Bluetooth handoff ready; selecting only the active phone" else "Bluetooth handoff not ready; suppressing connect-outs")
             if (ready) refreshDiscoveryForSelection()
         }
+    }
+
+    /**
+     * End the incumbent CarPlay control session after the caller has pinned a different,
+     * handoff-ready iAP2 peer. Closing this socket lets its normal pump teardown run; the receiver
+     * itself, its listener, Bonjour advertisement, and the adapter USB/MFi session stay alive.
+     */
+    fun disconnectActiveSessionForPhoneSwitch(targetMac: String): Boolean {
+        val target = targetMac.trim().uppercase()
+        if (!target.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}")) || pinnedPhoneMac.get() != target || !handoffReady.get()) {
+            log.w("phone switch refused: target $target is not the pinned handoff-ready peer")
+            return false
+        }
+        val incumbent = currentSocket
+        if (incumbent == null || liveConnections.get() == 0) {
+            log.i("phone switch refused: no active CarPlay control socket")
+            return false
+        }
+        return runCatching {
+            log.i("switching CarPlay control session to iAP2 peer $target; closing incumbent socket")
+            incumbent.close()
+            true
+        }.onFailure {
+            log.w("could not close incumbent for phone switch: ${it.message}")
+        }.getOrDefault(false)
     }
 
     private fun refreshDiscoveryForSelection() {
@@ -313,6 +369,12 @@ class CarPlayRx(
         log.w("no adapter peer identity and ${candidates.size} Bonjour candidates are present; withholding nudge")
         return false
     }
+
+    /** True only while this exact peer and handoff attempt still owns the pending dial/retry. */
+    private fun isCurrentHandoff(expectedPeer: String?, expectedGeneration: Long): Boolean =
+        running.get() && handoffReady.get() &&
+            handoffGeneration.get() == expectedGeneration &&
+            pinnedPhoneMac.get() == expectedPeer
 
     /** When the advert went live. The connect-out must not run until iOS has had time to index it. */
     @Volatile private var advertisedAt = 0L
@@ -572,6 +634,9 @@ class CarPlayRx(
         // BEFORE anything else: from here on this instance speaks to nobody. See [stopped].
         stopped = true
         running.set(false)
+        handoffReady.set(false)
+        handoffGeneration.incrementAndGet()
+        synchronized(resolveLock) { pendingResolves.clear() }
         // Nothing this receiver was waiting for can arrive now, and its absence is not a fault.
         SessionTrace.cancel(X_ADVERT, "receiver stopped")
         try { server?.close() } catch (_: Throwable) {}
@@ -829,15 +894,21 @@ class CarPlayRx(
                 SessionTrace.Board.up(B_BROWSE, "_carplay-ctrl._tcp")
             }
             override fun onServiceFound(s: NsdServiceInfo) {
-                log.i("found _carplay-ctrl peer '${s.serviceName}' — resolving")
+                if (discListener !== this) return
+                log.i("found _carplay-ctrl peer '${s.serviceName}' — queueing serialized resolve")
                 // Count the instance before its asynchronous resolve completes so a fallback
                 // cannot misclassify the first of two phones as the only candidate.
                 peerCandidates.putIfAbsent(s.serviceName, "")
-                resolve(s)
+                enqueueResolve(s)
             }
             override fun onServiceLost(s: NsdServiceInfo) {
+                if (discListener !== this) return
                 log.w("lost _carplay-ctrl peer '${s.serviceName}'")
-                peerCandidates.remove(s.serviceName)
+                val lostMac = peerCandidates.remove(s.serviceName)
+                if (!lostMac.isNullOrBlank() && peerCandidates.values.none { it == lostMac }) {
+                    peerAddressesByMac.remove(lostMac)
+                }
+                synchronized(resolveLock) { pendingResolves.remove(s.serviceName) }
                 lastDial.clear()
                 lastDetectedKey = null   // so its return is announced as a fresh DETECTED
                 SessionTrace.Board.down(B_PEER, "'${s.serviceName}' left the link (mDNS goodbye or TTL expiry)")
@@ -853,79 +924,158 @@ class CarPlayRx(
         nsd?.discoverServices("_carplay-ctrl._tcp", NsdManager.PROTOCOL_DNS_SD, l)
     }
 
-    private fun resolve(s: NsdServiceInfo) {
+    private fun enqueueResolve(s: NsdServiceInfo) {
+        val next = synchronized(resolveLock) {
+            // Keep the newest announcement even while an older resolve for this same service is
+            // in flight. NSD can refresh the endpoint during a resolve; dropping that update would
+            // leave us with only the stale cached port until the next browse cycle.
+            pendingResolves[s.serviceName] = s
+            takeNextResolveLocked()
+        }
+        next?.let(::startResolve)
+    }
+
+    /** Caller holds [resolveLock]. Resolve a previously identified target first, otherwise FIFO. */
+    private fun takeNextResolveLocked(): NsdServiceInfo? {
+        if (resolvingServiceName != null || pendingResolves.isEmpty()) return null
+        val target = pinnedPhoneMac.get()
+        val selected = pendingResolves.entries.firstOrNull { (name, _) ->
+            target != null && peerCandidates[name]?.equals(target, ignoreCase = true) == true
+        } ?: pendingResolves.entries.first()
+        pendingResolves.remove(selected.key)
+        resolvingServiceName = selected.key
+        return selected.value
+    }
+
+    private fun finishResolve(serviceName: String) {
+        val next = synchronized(resolveLock) {
+            if (resolvingServiceName == serviceName) resolvingServiceName = null
+            takeNextResolveLocked()
+        }
+        next?.let(::startResolve)
+    }
+
+    private fun startResolve(s: NsdServiceInfo) {
+        if (!running.get()) {
+            finishResolve(s.serviceName)
+            return
+        }
+        val manager = nsd
+        if (manager == null) {
+            log.w("resolve skipped for '${s.serviceName}' — NsdManager is unavailable")
+            finishResolve(s.serviceName)
+            return
+        }
         @Suppress("DEPRECATION")
-        nsd?.resolveService(s, object : NsdManager.ResolveListener {
-            override fun onResolveFailed(si: NsdServiceInfo, code: Int) = log.w("resolve FAILED '${si.serviceName}' code=$code")
-            override fun onServiceResolved(si: NsdServiceInfo) {
-                val raw = si.host ?: return
-                // NsdManager hands back a link-local IPv6 with NO scope id, and connecting to one
-                // without a scope fails EINVAL — there is no way for the stack to know which
-                // interface to use. Re-bind it to the interface the hotspot bridge lives on.
-                val host = withScope(raw)
-                val key = "${host.hostAddress}:${si.port}"
-                log.i("resolved '${si.serviceName}' -> $key")
-                // _carplay-ctrl TXT carries `id=<Bluetooth MAC>` on current iOS releases. Learn
-                // that alongside the Bonjour instance name so the Phones tab can label a bond
-                // before AirPlay SETUP (CT_PHONE_IDENT) completes. This is discovery only: the
-                // manager must not treat it as a connected/last-used phone.
-                val advertisedId =
-                    runCatching { si.attributes["id"] }
-                        .getOrNull()
-                        ?.toString(Charsets.UTF_8)
-                        ?.trim()
-                        .orEmpty()
-                val advertisedMac = advertisedId.uppercase()
-                peerCandidates[si.serviceName] = advertisedMac
-                val phoneName = si.serviceName.trim()
-                if (phoneName.isNotEmpty() && advertisedId.isNotEmpty()) {
-                    onPhoneDiscovered?.let { cb ->
-                        fenced("onPhoneDiscovered") { cb(phoneName, advertisedId) }
-                    }
+        try {
+            manager.resolveService(s, object : NsdManager.ResolveListener {
+            override fun onResolveFailed(si: NsdServiceInfo, code: Int) {
+                if (code == NsdManager.FAILURE_ALREADY_ACTIVE) {
+                    log.w("resolve FAILED '${si.serviceName}' code=$code (another NSD resolve is active); retrying on next browse")
                 } else {
-                    log.i("peer identity TXT incomplete: name='${si.serviceName}' id='${advertisedId.ifEmpty { "<absent>" }}'")
+                    log.w("resolve FAILED '${si.serviceName}' code=$code")
                 }
-                // The one unambiguous "an iPhone is here" line. A phone on br0 is NOT enough on its
-                // own (the hotspot is an ordinary saved network — see SessionSupervisor.onBtPhase);
-                // a resolvable _carplay-ctrl record is the phone saying it is ready for CarPlay.
-                if (key != lastDetectedKey) {
-                    lastDetectedKey = key
-                    val iface = host.hostAddress?.substringAfter('%', "")?.takeIf { it.isNotEmpty() } ?: "the hotspot link"
-                    log.i("*** iPhone DETECTED on $iface: '${si.serviceName}' at $key (_carplay-ctrl._tcp resolved)")
-                    SessionTrace.Board.up(B_PEER, "'${si.serviceName}' $key")
-                }
-                // Re-dial on a cooldown rather than once ever: the phone needs a fresh nudge after
-                // each Bluetooth handoff, and dialing exactly once meant a second handoff in the same
-                // app session was never followed up.
-                // NEVER nudge a phone that is already talking to us. iOS treats /ctrl-int/1/connect as
-                // a new session request and opens a FRESH inbound connection, which acceptLoop's hijack
-                // then uses to kill the incumbent — mid-handshake. That is self-inflicted: the phone is
-                // not retrying, we are provoking it. Observed as a ~6 s cycle (the cooldown plus dial
-                // latency) with a new generation each time, gen=5,6,7..., none surviving long enough to
-                // finish activation. The cooldown alone cannot cover it: the phone's _carplay-ctrl port
-                // changes every session, so a re-announce arrives under a new key with no cooldown at all.
-                if (liveConnections.get() > 0) {
-                    log.i("   (control connection already live — not nudging)")
-                    return
-                }
-                if (!candidateAllowed(si.serviceName, advertisedMac)) return
-                val now = System.currentTimeMillis()
-                val last = lastDial[key] ?: 0L
-                if (now - last < REDIAL_COOLDOWN_MS) {
-                    log.i("   (dialed ${(now - last) / 1000}s ago — within the ${REDIAL_COOLDOWN_MS / 1000}s cooldown, skipping)")
-                    return
-                }
-                lastDial[key] = now
-                if (!running.get()) return   // stop() has run; the pool is shut down
+                finishResolve(si.serviceName)
+            }
+            override fun onServiceResolved(si: NsdServiceInfo) {
                 try {
-                    pool.execute { connectOutWithRetry(si.serviceName, advertisedMac, host, si.port) }
-                } catch (t: java.util.concurrent.RejectedExecutionException) {
-                    // stop() raced this resolve. Same guard acceptLoop and reannounce() carry: this
-                    // callback runs on NsdManager's own HandlerThread, where an uncaught throw is fatal.
-                    log.i("   (receiver stopped — not dispatching the connect-out)")
+                    handleResolvedService(si)
+                } catch (t: Throwable) {
+                    log.w("resolved-service handling failed for '${si.serviceName}': ${t.message}")
+                } finally {
+                    finishResolve(si.serviceName)
                 }
             }
         })
+        } catch (t: Throwable) {
+            log.w("resolve dispatch failed for '${s.serviceName}': ${t.message}")
+            finishResolve(s.serviceName)
+        }
+    }
+
+    private fun handleResolvedService(si: NsdServiceInfo) {
+        if (!running.get()) return
+        if (!peerCandidates.containsKey(si.serviceName)) {
+            log.i("resolved '${si.serviceName}' after Bonjour lost it; ignoring stale service result")
+            return
+        }
+        val raw = si.host ?: return
+        // NsdManager hands back a link-local IPv6 with NO scope id, and connecting to one
+        // without a scope fails EINVAL — there is no way for the stack to know which
+        // interface to use. Re-bind it to the interface the hotspot bridge lives on.
+        val host = withScope(raw)
+        val key = "${host.hostAddress}:${si.port}"
+        log.i("resolved '${si.serviceName}' -> $key")
+        // _carplay-ctrl TXT carries `id=<Bluetooth MAC>` on current iOS releases. Learn
+        // that alongside the Bonjour instance name so the Phones tab can label a bond
+        // before AirPlay SETUP (CT_PHONE_IDENT) completes. This is discovery only: the
+        // manager must not treat it as a connected/last-used phone.
+        val advertisedId = runCatching { si.attributes["id"] }
+            .getOrNull()
+            ?.toString(Charsets.UTF_8)
+            ?.trim()
+            .orEmpty()
+        val advertisedMac = advertisedId.uppercase()
+        peerCandidates[si.serviceName] = advertisedMac
+        if (advertisedMac.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}"))) {
+            peerAddressesByMac.computeIfAbsent(advertisedMac) {
+                java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+            }.add(host.hostAddress?.substringBefore('%') ?: "")
+        }
+        val phoneName = si.serviceName.trim()
+        if (phoneName.isNotEmpty() && advertisedId.isNotEmpty()) {
+            onPhoneDiscovered?.let { cb ->
+                fenced("onPhoneDiscovered") { cb(phoneName, advertisedId) }
+            }
+        } else {
+            log.i("peer identity TXT incomplete: name='${si.serviceName}' id='${advertisedId.ifEmpty { "<absent>" }}'")
+        }
+        // The one unambiguous "an iPhone is here" line. A phone on br0 is NOT enough on its
+        // own (the hotspot is an ordinary saved network — see SessionSupervisor.onBtPhase);
+        // a resolvable _carplay-ctrl record is the phone saying it is ready for CarPlay.
+        if (key != lastDetectedKey) {
+            lastDetectedKey = key
+            val iface = host.hostAddress?.substringAfter('%', "")?.takeIf { it.isNotEmpty() } ?: "the hotspot link"
+            log.i("*** iPhone DETECTED on $iface: '${si.serviceName}' at $key (_carplay-ctrl._tcp resolved)")
+            SessionTrace.Board.up(B_PEER, "'${si.serviceName}' $key")
+        }
+        // Never nudge a phone already talking to us: its new inbound control connection can
+        // otherwise supersede the incumbent during handshake.
+        if (liveConnections.get() > 0) {
+            log.i("   (control connection already live — not nudging)")
+            return
+        }
+        val selectedPeer = pinnedPhoneMac.get()
+        val selectedGeneration = handoffGeneration.get()
+        if (!candidateAllowed(si.serviceName, advertisedMac)) return
+        if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+            log.i("resolved '${si.serviceName}' but the selected handoff changed before dial scheduling; dropping stale result")
+            return
+        }
+        val now = System.currentTimeMillis()
+        val last = lastDial[key] ?: 0L
+        if (now - last < REDIAL_COOLDOWN_MS) {
+            log.i("   (dialed ${(now - last) / 1000}s ago — within the ${REDIAL_COOLDOWN_MS / 1000}s cooldown, skipping)")
+            return
+        }
+        lastDial[key] = now
+        if (!running.get()) return
+        try {
+            pool.execute {
+                connectOutWithRetry(
+                    si.serviceName,
+                    advertisedMac,
+                    host,
+                    si.port,
+                    selectedPeer,
+                    selectedGeneration,
+                )
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // This callback runs on NsdManager's HandlerThread; a stop racing dispatch must not
+            // let an uncaught exception escape that thread.
+            log.i("   (receiver stopped — not dispatching the connect-out)")
+        }
     }
 
     /**
@@ -958,7 +1108,14 @@ class CarPlayRx(
      * `HandleControlServerEvent command 'connect'`. We never dial the phone for the control channel
      * itself; the phone opens that inbound afterwards.
      */
-    private fun connectOutWithRetry(serviceName: String, phoneMac: String, host: InetAddress, peerPort: Int) {
+    private fun connectOutWithRetry(
+        serviceName: String,
+        phoneMac: String,
+        host: InetAddress,
+        peerPort: Int,
+        selectedPeer: String?,
+        selectedGeneration: Long,
+    ) {
         // SINGLE-FLIGHT. rediscoverLoop restarts discovery every 12 s and each restart re-resolves
         // under a fresh addr:port key, so every cycle used to dispatch its own dialer on top of the
         // ones still running — four concurrent `live lookup` threads were observed in one process,
@@ -967,10 +1124,25 @@ class CarPlayRx(
             log.i("   (a connect-out is already in flight — not stacking another)")
             return
         }
-        try { dialOut(serviceName, phoneMac, host, peerPort) } finally { dialInFlight.set(false) }
+        try {
+            dialOut(serviceName, phoneMac, host, peerPort, selectedPeer, selectedGeneration)
+        } finally {
+            dialInFlight.set(false)
+        }
     }
 
-    private fun dialOut(serviceName: String, phoneMac: String, host: InetAddress, peerPort: Int) {
+    private fun dialOut(
+        serviceName: String,
+        phoneMac: String,
+        host: InetAddress,
+        peerPort: Int,
+        selectedPeer: String?,
+        selectedGeneration: Long,
+    ) {
+        if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+            log.i("connect-out cancelled before start — stale handoff generation=$selectedGeneration peer=${selectedPeer ?: "unidentified"}")
+            return
+        }
         // Hold off until the advert has been up long enough for iOS to have committed it to the
         // endpoint index it is about to search. Dialing early is not merely wasted — the pending
         // autoconnect is consumed and resolved against an index that does not contain us yet.
@@ -991,7 +1163,10 @@ class CarPlayRx(
             if (!held) { log.i("advert not yet REGISTERED — holding the connect-out until it is"); held = true }
             try { Thread.sleep(250) } catch (_: InterruptedException) { return }
         }
-        if (!running.get()) return
+        if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+            log.i("connect-out cancelled while waiting for advert — handoff generation changed")
+            return
+        }
         if (advertisedAt == 0L) {
             // Registration failed outright. The self-hosted responder is a real advert in its own
             // right — it carries the same TXT, on a hostname we own — so if it is up there IS
@@ -1012,7 +1187,10 @@ class CarPlayRx(
                 try { Thread.sleep(minOf(left, 2000L)) } catch (_: InterruptedException) { return }
             }
         }
-        if (!running.get()) return
+        if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+            log.i("connect-out cancelled while waiting for advert settle — handoff generation changed")
+            return
+        }
         // carplayd's connect-out (`ccpa/carplayd/src/discovery.rs`) retries up to 10x at 1s and only
         // marks a peer dialed on success. The phone
         // holds a 30s assertion on the connect command, so an early dial is simply wasted.
@@ -1033,9 +1211,16 @@ class CarPlayRx(
         // Re-query periodically rather than once: the peer can move mid-retry.
         if (discoveryPaused.get()) { log.i("connect-out suppressed — discovery is paused"); return }
         var candidates = dialCandidates(serviceName, host, peerPort)
-        NetworkDiagnostics.snapshot("connect-out retry chain started candidates=${candidates.size}")
+        if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+            log.i("connect-out cancelled after live lookup — handoff generation changed")
+            return
+        }
+        NetworkDiagnostics.snapshot("connect-out retry chain started peer=${selectedPeer ?: "unidentified"} handoffGen=$selectedGeneration candidates=${candidates.size}")
         for (attempt in 1..10) {
-            if (!running.get()) return
+            if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+                log.i("connect-out retry cancelled — peer/generation changed (peer=${selectedPeer ?: "unidentified"} generation=$selectedGeneration)")
+                return
+            }
             if (discoveryPaused.get()) { log.i("connect-out abandoned — discovery was paused"); return }
             if (!candidateAllowed(serviceName, phoneMac)) {
                 log.i("connect-out abandoned — '$serviceName' is no longer the selected handoff peer")
@@ -1046,8 +1231,15 @@ class CarPlayRx(
             // re-queries at attempt 3 or 6 can pick up the phone's NEW ctrl port and nudge mid-session.
             if (liveConnections.get() > 0) { log.i("connect-out: session is live — stopping retries"); return }
             for ((h, p) in candidates) {
-                if (!running.get()) return
+                if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+                    log.i("connect-out candidate cancelled — peer/generation changed")
+                    return
+                }
                 if (connectOut(h, p)) {
+                    if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+                        log.i("connect-out response ignored — peer/generation changed while request was in flight")
+                        return
+                    }
                     log.i("connect-out accepted on attempt $attempt via ${h.hostAddress}:$p")
                     noteDialAccepted()
                     return
@@ -1214,6 +1406,22 @@ class CarPlayRx(
                 }
                 acceptFailures = 0
                 log.i(">>> INBOUND CONTROL CONNECTION local=${c.localAddress?.hostAddress}:${c.localPort} peer=${c.inetAddress?.hostAddress}:${c.port}")
+                val selectedPeer = pinnedPhoneMac.get()
+                val selectedGeneration = handoffGeneration.get()
+                if (handoffReady.get() && selectedPeer != null) {
+                    val expected = peerAddressesByMac[selectedPeer]?.toSet().orEmpty()
+                    val remote = c.inetAddress?.hostAddress.orEmpty()
+                    if (expected.isEmpty() || !isExpectedInboundPeer(remote, expected)) {
+                        log.w("rejecting inbound control peer ${remote.substringBefore('%')} for selected iAP2 peer=$selectedPeer generation=$selectedGeneration; expected=${expected.ifEmpty { setOf("<no resolved endpoint>") }}")
+                        runCatching { c.close() }
+                        continue
+                    }
+                    if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
+                        log.i("rejecting inbound control peer=${remote.substringBefore('%')}: handoff changed before accept (peer=$selectedPeer generation=$selectedGeneration)")
+                        runCatching { c.close() }
+                        continue
+                    }
+                }
                 dialsSinceInbound.set(0)
                 // Claim the liveness slot HERE, before anything else — specifically before the
                 // incumbent is closed below.
@@ -1242,7 +1450,7 @@ class CarPlayRx(
                     try { prev.close() } catch (_: Throwable) {}
                 }
                 try {
-                    pool.execute { handle(c) }
+                    pool.execute { handle(c, selectedPeer, selectedGeneration) }
                 } catch (t: Throwable) {
                     // The pool is shut down (stop() raced us). Release the slot we just took or the
                     // count never returns to zero and no session-end is ever reported again.
@@ -1275,14 +1483,20 @@ class CarPlayRx(
         }
     }
 
-    private fun handle(c: Socket) {
+    private fun handle(c: Socket, selectedPeer: String?, selectedGeneration: Long) {
         // The matching decrement for acceptLoop's increment lives here and NOWHERE else, so it pairs
         // 1:1 with the accept even when startNativeFor() throws before either pump is entered.
         try {
             // Prefer the ported receiver core. It owns the RTSP state machine, pairing (including the
             // Ed25519/X25519 that API 32 cannot do), the ChaCha20-Poly1305 channel, /auth-setup and
             // SETUP/RECORD. Kotlin only shuttles bytes.
-            val h = startNativeFor(c)
+            if (handoffReady.get() && selectedPeer != null && !isCurrentHandoff(selectedPeer, selectedGeneration)) {
+                log.i("discarding accepted socket before native start: stale handoff peer=$selectedPeer generation=$selectedGeneration")
+                try { c.close() } catch (_: Throwable) {}
+                if (currentSocket === c) currentSocket = null
+                return
+            }
+            val h = startNativeFor(c, selectedPeer)
             if (h == NativeCore.BUSY) {
                 // The incumbent still owns the native core (it is inside ControlServer::feed, most
                 // likely MFi). Close and say so: the stub path cannot pair, so running it here would
@@ -1306,7 +1520,7 @@ class CarPlayRx(
      * per control connection. Installing a new core supersedes the previous generation in the Rust
      * slot, so the incumbent's pump then feeds a stale handle and gets null (see [handleNative]).
      */
-    private fun startNativeFor(c: Socket): Long {
+    private fun startNativeFor(c: Socket, phoneMac: String?): Long {
         // These three bails all end in the same "native core unavailable" line at the call site, but
         // for very different reasons — so each says which one it was. An unlogged bail here cost a
         // truck session: a null relay stopped the native core loading, and because the lazy loader in
@@ -1331,14 +1545,16 @@ class CarPlayRx(
         // The relay is the only place Kotlin can SEE /auth-setup: the request itself is inside the
         // encrypted channel, but the native core must come back out to the relay for the two chip
         // ops, and those calls are the step. See [TracedRelay].
-        val traced = TracedRelay(relay)
+        val traced = TracedRelay(relay, addr, phoneMac ?: pinnedPhoneMac.get() ?: "unknown")
         val h = NativeCore.start(pi, edSeed, info, peers, addr, traced)
         if (h == NativeCore.BUSY) return h   // the caller closes; do NOT report a session up
         if (h != 0L) {
             traced.gen = h
             latestGen = h
+            sessionPhoneMac = phoneMac
             log.i("native receiver core started for $addr gen=$h (/info ${info.size}B)")
             SessionTrace.Board.up(B_CORE, "gen=$h peer=$addr")
+            onControlConnectionAccepted?.let { cb -> fenced("onControlConnectionAccepted") { cb(phoneMac, h) } }
             // Stand the A/V consumers up NOW, not when the phone asks. Streams are SETUP within
             // ~300 ms of RECORD and the producer dials the seam per access unit, so anything not
             // already listening loses frames outright.
@@ -1365,7 +1581,11 @@ class CarPlayRx(
      * [gen] is stamped after `NativeCore.start` returns; no chip op can be requested before the core
      * has been fed its first bytes, so it is always set by the time it is read.
      */
-    private inner class TracedRelay(private val inner: MfiRelay) : MfiRelay {
+    private inner class TracedRelay(
+        private val inner: MfiRelay,
+        private val controlPeer: String,
+        private val handoffPhoneMac: String,
+    ) : MfiRelay {
         @Volatile var gen = 0L
         private val seen = AtomicBoolean(false)
         @Volatile private var sigDone = false
@@ -1377,7 +1597,7 @@ class CarPlayRx(
         private fun <T> traced(op: String, body: () -> T): T {
             if (seen.compareAndSet(false, true)) {
                 SessionTrace.met(xRequest())
-                log.i("/auth-setup in progress on gen=$gen — MFi $op requested via the relay")
+                log.i("/auth-setup in progress on gen=$gen — MFi $op requested via the relay; path=airplay-auth-setup handoffPhone=$handoffPhoneMac controlPeer=$controlPeer")
                 SessionTrace.expect(xChipOps(), AUTH_SETUP_CHIP_MS,
                     "POST /auth-setup arrived on gen=$gen (the native core asked the relay for the MFi " +
                     "$op); the box's chip has ~15 s per op and iOS is holding the request open")
@@ -1397,8 +1617,14 @@ class CarPlayRx(
 
         override fun copyCertificate(): ByteArray = traced("certificate") { inner.copyCertificate() }
         override fun createSignature(digest: ByteArray): ByteArray = traced("signature") { inner.createSignature(digest) }
-        override fun copyCertificateFast(): ByteArray = inner.copyCertificateFast()
-        override fun createSignatureFast(digest: ByteArray): ByteArray = inner.createSignatureFast(digest)
+        override fun copyCertificateFast(): ByteArray {
+            log.i("MFi request path=iap2-tunnel op=copy_certificate gen=$gen handoffPhone=$handoffPhoneMac controlPeer=$controlPeer")
+            return inner.copyCertificateFast()
+        }
+        override fun createSignatureFast(digest: ByteArray): ByteArray {
+            log.i("MFi request path=iap2-tunnel op=create_signature gen=$gen handoffPhone=$handoffPhoneMac controlPeer=$controlPeer digestBytes=${digest.size}")
+            return inner.createSignatureFast(digest)
+        }
     }
 
     /** Raw byte pump into ControlServer::feed() — the sans-IO seam. [handle] is this connection's gen. */
@@ -1552,6 +1778,7 @@ class CarPlayRx(
     /** The last control connection went away. Clean and abrupt are indistinguishable here. */
     private fun fireSessionDown() {
         if (stopped) { log.i("suppressing session-down from a stopped receiver"); return }
+        sessionPhoneMac = null
         log.w("*** SESSION DOWN — no live control connection")
         onSessionDown?.let { cb -> fenced("onSessionDown") { cb() } }
     }

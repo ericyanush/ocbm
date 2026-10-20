@@ -304,6 +304,25 @@ class OcbmClientTest {
         assertEquals(listOf("04:41:A5:B8:26:B1", ""), seen)
     }
 
+    @Test
+    fun `multi phone capability and peer keyed iAP2 slot transitions are decoded`() {
+        val t = FakeTransport()
+        val c = newClient(t)
+        t.deliver(Ocbm.CH_CTRL, helloAck(Ocbm.CAP_MULTI_IAP2 or Ocbm.CAP_MFI))
+        assertTrue(c.hasMultiIap2Slots)
+
+        val seen = ArrayList<Pair<String, Byte>>()
+        c.onIap2Slot = { mac, phase -> seen.add(mac to phase) }
+        val mac = "04:41:A5:B8:26:B1".toByteArray(Charsets.US_ASCII)
+        t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_IAP2_SLOT) + mac + byteArrayOf(Ocbm.BTP_WIFI_HANDOFF))
+        t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_IAP2_SLOT) + mac + byteArrayOf(Ocbm.BTP_IDLE))
+
+        assertEquals(
+            listOf("04:41:A5:B8:26:B1" to Ocbm.BTP_WIFI_HANDOFF, "04:41:A5:B8:26:B1" to Ocbm.BTP_IDLE),
+            seen,
+        )
+    }
+
     /** An unknown phase must count as progress, never as an error — the box may add values. */
     @Test
     fun `an unknown BT phase is still delivered`() {

@@ -58,7 +58,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -144,7 +144,11 @@ impl ScoCodec {
         }
     }
     fn from_u8(v: u8) -> Self {
-        if v == 1 { ScoCodec::Msbc } else { ScoCodec::Cvsd }
+        if v == 1 {
+            ScoCodec::Msbc
+        } else {
+            ScoCodec::Cvsd
+        }
     }
     fn as_num(self) -> u8 {
         match self {
@@ -291,7 +295,11 @@ pub struct FrameAggregator {
 
 impl FrameAggregator {
     pub fn new(frame: usize) -> Self {
-        Self { buf: Vec::with_capacity(frame * 2), frame: frame.max(2), odd_seen: false }
+        Self {
+            buf: Vec::with_capacity(frame * 2),
+            frame: frame.max(2),
+            odd_seen: false,
+        }
     }
 
     /// Feed one SCO packet; returns every complete frame it completed.
@@ -382,7 +390,10 @@ impl Uplink {
         if self.buf.len() > max {
             let mut excess = self.buf.len() - max;
             if unit > 1 {
-                excess = excess.div_ceil(unit).saturating_mul(unit).min(self.buf.len());
+                excess = excess
+                    .div_ceil(unit)
+                    .saturating_mul(unit)
+                    .min(self.buf.len());
             }
             self.buf.drain(..excess);
         }
@@ -479,7 +490,11 @@ where
     F: FnOnce() -> std::io::Result<()>,
 {
     apply_voice()?;
-    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
     // SAFETY: one initialised pollfd, count 1, on a descriptor this function borrows.
     if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLOUT != 0 {
         return Ok(());
@@ -510,7 +525,11 @@ where
                 "the controller never reported the (e)SCO link up",
             ));
         }
-        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
         // SAFETY: as above.
         let r = unsafe { libc::poll(&mut pfd, 1, 500) };
         if r < 0 {
@@ -607,17 +626,29 @@ impl ScoAudio {
         let owns_path = !SCO_PATH_TAKEN.swap(true, Ordering::AcqRel);
         if !owns_path {
             log("another headset link already owns the SCO path — this link carries control only");
-            return ScoAudio { shutdown, state, handles, owns_path };
+            return ScoAudio {
+                shutdown,
+                state,
+                handles,
+                owns_path,
+            };
         }
         {
             let (sd, st) = (shutdown.clone(), state.clone());
-            handles.push(std::thread::spawn(move || sco_listen(local_bdaddr, &sd, &st)));
+            handles.push(std::thread::spawn(move || {
+                sco_listen(local_bdaddr, &sd, &st)
+            }));
         }
         {
             let (sd, st) = (shutdown.clone(), state.clone());
             handles.push(std::thread::spawn(move || mic_seam_serve(&sd, &st)));
         }
-        ScoAudio { shutdown, state, handles, owns_path }
+        ScoAudio {
+            shutdown,
+            state,
+            handles,
+            owns_path,
+        }
     }
 
     /// The AG signalled that audio is imminent. Idempotent; only the first transition logs.
@@ -626,7 +657,9 @@ impl ScoAudio {
             return;
         }
         if !self.state.armed.swap(true, Ordering::Relaxed) {
-            log(&format!("armed by {why} — opening the mic seam ahead of the SCO connection"));
+            log(&format!(
+                "armed by {why} — opening the mic seam ahead of the SCO connection"
+            ));
         }
     }
 
@@ -682,15 +715,23 @@ impl ScoAudio {
             // and never reads the socket. Answering `AT+BCS=2` anyway is the exact failure this
             // check exists to prevent: the AG sends mSBC air frames into a channel the controller is
             // still decoding as CVSD, and the call is noise both ways.
-            log("the SCO listener has no BT_DEFER_SETUP — the air mode cannot be selected per \
-                 connection, so wideband is refused and the AG is offered CVSD only");
-            self.state.codec.store(ScoCodec::Cvsd.as_num(), Ordering::Relaxed);
+            log(
+                "the SCO listener has no BT_DEFER_SETUP — the air mode cannot be selected per \
+                 connection, so wideband is refused and the AG is offered CVSD only",
+            );
+            self.state
+                .codec
+                .store(ScoCodec::Cvsd.as_num(), Ordering::Relaxed);
             return false;
         }
         if self.state.no_transparent.load(Ordering::Relaxed) {
-            log("a previous connection could not be put in transparent mode — wideband stays \
-                 refused on this link, the AG is offered CVSD only");
-            self.state.codec.store(ScoCodec::Cvsd.as_num(), Ordering::Relaxed);
+            log(
+                "a previous connection could not be put in transparent mode — wideband stays \
+                 refused on this link, the AG is offered CVSD only",
+            );
+            self.state
+                .codec
+                .store(ScoCodec::Cvsd.as_num(), Ordering::Relaxed);
             return false;
         }
         true
@@ -719,7 +760,9 @@ impl Drop for ScoAudio {
             SCO_PATH_TAKEN.store(false, Ordering::Release);
             let f = self.state.frames.load(Ordering::Relaxed);
             if f > 0 {
-                log(&format!("SCO audio stopped after {f} frames on this headset link"));
+                log(&format!(
+                    "SCO audio stopped after {f} frames on this headset link"
+                ));
             }
         }
     }
@@ -774,7 +817,10 @@ fn sco_open_listener(local: Option<[u8; 6]>, initial: u16) -> std::io::Result<st
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let addr = SockaddrSco { sco_family: AF_BLUETOOTH, sco_bdaddr: local.unwrap_or([0u8; 6]) };
+    let addr = SockaddrSco {
+        sco_family: AF_BLUETOOTH,
+        sco_bdaddr: local.unwrap_or([0u8; 6]),
+    };
     let r = unsafe {
         libc::bind(
             fd,
@@ -854,7 +900,9 @@ fn sco_listen(local: Option<[u8; 6]>, shutdown: &AtomicBool, state: &State) {
                  so this link is CVSD only",
                 e.raw_os_error()
             ));
-            state.codec.store(ScoCodec::Cvsd.as_num(), Ordering::Relaxed);
+            state
+                .codec
+                .store(ScoCodec::Cvsd.as_num(), Ordering::Relaxed);
         }
     }
     log("SCO listener up (CVSD 8 kHz mono) — awaiting the phone's audio connection");
@@ -899,7 +947,9 @@ fn sco_accept_loop(lfd: libc::c_int, shutdown: &AtomicBool, state: &State) {
                     // Latch, so the AT layer narrows to CVSD on the next `+BCS` (`AT+BAC=1`) instead
                     // of promising an air mode that drops the connection every time.
                     state.no_transparent.store(true, Ordering::Relaxed);
-                    state.codec.store(ScoCodec::Cvsd.as_num(), Ordering::Relaxed);
+                    state
+                        .codec
+                        .store(ScoCodec::Cvsd.as_num(), Ordering::Relaxed);
                     log(&format!(
                         "BT_VOICE setsockopt({:#06x}) on the accepted child failed: {e} (errno \
                          {:?}) — dropping this connection; wideband is refused from here on and the \
@@ -908,7 +958,10 @@ fn sco_accept_loop(lfd: libc::c_int, shutdown: &AtomicBool, state: &State) {
                         e.raw_os_error()
                     ));
                 } else {
-                    log(&format!("SCO deferred accept failed: {e} (errno {:?})", e.raw_os_error()));
+                    log(&format!(
+                        "SCO deferred accept failed: {e} (errno {:?})",
+                        e.raw_os_error()
+                    ));
                 }
                 continue; // `conn` drops here, closing the child
             }
@@ -937,7 +990,11 @@ fn sco_accept_loop(lfd: libc::c_int, shutdown: &AtomicBool, state: &State) {
 /// a healthy call ends with a partial frame in hand. A residue that is consistently the SAME value
 /// across calls is normal; one that grows is not, and is the first thing to look at if the audio
 /// ever sounds clocked wrong.
-fn sco_pump(conn: &std::fs::File, shutdown: &AtomicBool, state: &State) -> (u64, usize, &'static str) {
+fn sco_pump(
+    conn: &std::fs::File,
+    shutdown: &AtomicBool,
+    state: &State,
+) -> (u64, usize, &'static str) {
     // Read ONCE, for the life of this connection. A `+BCS` that changes the codec always tears the
     // (e)SCO channel down first, so re-reading per packet could only ever produce a pipeline whose
     // halves disagree about what the bytes in flight are.
@@ -969,7 +1026,11 @@ fn sco_pump(conn: &std::fs::File, shutdown: &AtomicBool, state: &State) -> (u64,
                 continue;
             }
             Err(e) => {
-                let why = if e.raw_os_error() == Some(libc::ECONNRESET) { "reset" } else { "read error" };
+                let why = if e.raw_os_error() == Some(libc::ECONNRESET) {
+                    "reset"
+                } else {
+                    "read error"
+                };
                 return (frames, agg.pending(), why);
             }
         };
@@ -1040,7 +1101,9 @@ fn sco_pump(conn: &std::fs::File, shutdown: &AtomicBool, state: &State) -> (u64,
                 ScoCodec::Cvsd => "packets of silence sent to the phone",
                 ScoCodec::Msbc => "eSCO packets skipped (no silent mSBC frame exists to send)",
             };
-            log(&format!("uplink underrun: {underruns} {what} in the last 5 s (is the app capturing?)"));
+            log(&format!(
+                "uplink underrun: {underruns} {what} in the last 5 s (is the app capturing?)"
+            ));
         }
         let Some(out) = out else { continue };
         match writer.write_all(&out) {
@@ -1096,7 +1159,13 @@ struct VoiceSink {
 
 impl VoiceSink {
     fn new(codec: ScoCodec) -> Self {
-        Self { sock: None, last_try: None, dropped: 0, reported: false, codec }
+        Self {
+            sock: None,
+            last_try: None,
+            dropped: 0,
+            reported: false,
+            codec,
+        }
     }
 
     /// Connect and declare the format. Retries at most every 2 s.
@@ -1169,7 +1238,10 @@ impl Drop for VoiceSink {
             let _ = s.shutdown(Shutdown::Both);
         }
         if self.dropped > 0 {
-            log(&format!("voice sink: {} frames discarded with no connection", self.dropped));
+            log(&format!(
+                "voice sink: {} frames discarded with no connection",
+                self.dropped
+            ));
         }
     }
 }
@@ -1286,7 +1358,9 @@ fn mic_seam_serve(shutdown: &AtomicBool, state: &State) {
 /// Push a back-channel line to the connected peer. Best-effort; a failure drops the peer, which
 /// ocbmd handles by reconnecting.
 fn notify(state: &State, line: &str) {
-    let Ok(mut g) = state.mic_tx.lock() else { return };
+    let Ok(mut g) = state.mic_tx.lock() else {
+        return;
+    };
     if let Some(s) = g.as_mut() {
         if s.write_all(format!("{line}\n").as_bytes()).is_err() {
             *g = None;
@@ -1374,7 +1448,9 @@ fn serve_mic_peer(stream: TcpStream, shutdown: &AtomicBool, state: &State) {
         }
         chunks += 1;
         if chunks == 1 {
-            log(&format!("mic seam: first uplink PCM chunk ({len} B) — the app is capturing"));
+            log(&format!(
+                "mic seam: first uplink PCM chunk ({len} B) — the app is capturing"
+            ));
         }
         if let Ok(mut u) = state.uplink.lock() {
             u.push(&pcm, announced.uplink_max(), announced.uplink_unit());
@@ -1501,14 +1577,22 @@ mod tests {
     fn an_odd_packet_drops_its_stray_byte_and_latches() {
         let mut a = FrameAggregator::new(FRAME_BYTES);
         assert!(a.push(&[1u8; 49]).is_empty());
-        assert_eq!(a.pending(), 48, "the 49th byte must be dropped, not carried");
+        assert_eq!(
+            a.pending(),
+            48,
+            "the 49th byte must be dropped, not carried"
+        );
         assert!(a.odd_seen);
     }
 
     #[test]
     fn seam_format_is_twenty_one_bytes_of_telephony_pcm() {
         let m = sco_format_msg(SCO_SCID, ScoCodec::Cvsd);
-        assert_eq!(u32::from_be_bytes(m[0..4].try_into().unwrap()), 21, "len counts magic+marker+body");
+        assert_eq!(
+            u32::from_be_bytes(m[0..4].try_into().unwrap()),
+            21,
+            "len counts magic+marker+body"
+        );
         assert_eq!(&m[4..8], b"SEAV");
         assert_eq!(m[8], 0x02, "SEAM_FORMAT");
         assert_eq!(u64::from_le_bytes(m[9..17].try_into().unwrap()), SCO_SCID);
@@ -1539,7 +1623,10 @@ mod tests {
     /// framing exists for, asserted here for the new marker too.
     #[test]
     fn every_message_carries_the_resync_magic_at_the_same_offset() {
-        for m in [sco_format_msg(1, ScoCodec::Cvsd), sco_frame_msg(1, &[0u8; 4])] {
+        for m in [
+            sco_format_msg(1, ScoCodec::Cvsd),
+            sco_frame_msg(1, &[0u8; 4]),
+        ] {
             assert_eq!(&m[4..8], &SEAM_MAGIC);
         }
     }
@@ -1549,7 +1636,11 @@ mod tests {
         assert_eq!(parse_mic_header("mic 320\n"), Some(320));
         assert_eq!(parse_mic_header("mic 320\r\n"), Some(320));
         assert_eq!(parse_mic_header("mic 1048576\n"), Some(1 << 20));
-        assert_eq!(parse_mic_header("mic 1048577\n"), None, "over ocbmd's own 1 MiB cap");
+        assert_eq!(
+            parse_mic_header("mic 1048577\n"),
+            None,
+            "over ocbmd's own 1 MiB cap"
+        );
         assert_eq!(parse_mic_header("mic 0\n"), None);
         assert_eq!(parse_mic_header("mic -8\n"), None);
         assert_eq!(parse_mic_header("touch 1 2 3\n"), None);
@@ -1595,7 +1686,10 @@ mod tests {
         assert_eq!(m[17], ocbm_proto::SEAM_CODEC_MSBC);
         assert_eq!(u32::from_le_bytes(m[18..22].try_into().unwrap()), 16000);
         assert_eq!(m[22], 1, "mono");
-        assert_eq!(m[23], 16, "the DECODED audio is S16 — this field is not about the payload");
+        assert_eq!(
+            m[23], 16,
+            "the DECODED audio is S16 — this field is not about the payload"
+        );
         assert_eq!(m[24], 1, "audio_type 1 = telephony");
         // The CVSD form must not have moved.
         assert_eq!(sco_format_msg(SCO_SCID, ScoCodec::Cvsd)[17], 0);
@@ -1610,7 +1704,10 @@ mod tests {
         pkt[1] = 0xC8; // H2 sequence
         pkt[2] = 0xAD; // mSBC frame sync
         let m = sco_frame_msg(SCO_SCID, &pkt);
-        assert_eq!(u32::from_be_bytes(m[0..4].try_into().unwrap()) as usize, 13 + MSBC_PKT_BYTES);
+        assert_eq!(
+            u32::from_be_bytes(m[0..4].try_into().unwrap()) as usize,
+            13 + MSBC_PKT_BYTES
+        );
         assert_eq!(m[8], ocbm_proto::SEAM_PKT_PLAIN);
         assert_eq!(&m[17..], &pkt[..], "the payload must be untouched");
         assert_eq!(m[17], 0x01);
@@ -1624,10 +1721,18 @@ mod tests {
     fn the_voice_settings_are_the_kernels_own_values() {
         assert_eq!(ScoCodec::Msbc.voice_setting(), 0x0003);
         assert_eq!(ScoCodec::Cvsd.voice_setting(), 0x0060);
-        assert_eq!(std::mem::size_of::<BtVoice>(), 2, "struct bt_voice is one u16");
+        assert_eq!(
+            std::mem::size_of::<BtVoice>(),
+            2,
+            "struct bt_voice is one u16"
+        );
         assert_eq!(ScoCodec::from_u8(ScoCodec::Msbc.as_num()), ScoCodec::Msbc);
         assert_eq!(ScoCodec::from_u8(ScoCodec::Cvsd.as_num()), ScoCodec::Cvsd);
-        assert_eq!(ScoCodec::from_u8(200), ScoCodec::Cvsd, "an unknown value must degrade to CVSD");
+        assert_eq!(
+            ScoCodec::from_u8(200),
+            ScoCodec::Cvsd,
+            "an unknown value must degrade to CVSD"
+        );
         assert_eq!(ScoCodec::Msbc.as_str(), "mSBC");
         assert_eq!(ScoCodec::Cvsd.as_str(), "CVSD");
     }
@@ -1656,7 +1761,10 @@ mod tests {
         assert_eq!(got.len(), MSBC_PKT_BYTES);
         assert_eq!(got[58], 0xAA);
         assert_eq!(got[59], 0xBB);
-        assert_eq!(u.underruns, 1, "a satisfied take must not count as an underrun");
+        assert_eq!(
+            u.underruns, 1,
+            "a satisfied take must not count as an underrun"
+        );
         // Two packets in one `mic` chunk is the normal case: the app batches.
         u.push(&[7u8; MSBC_PKT_BYTES * 2], 2400, MSBC_PKT_BYTES);
         assert!(u.take_packet(MSBC_PKT_BYTES).is_some());
@@ -1677,7 +1785,11 @@ mod tests {
             u.push(&pkt, max, MSBC_PKT_BYTES);
         }
         assert!(u.buf.len() <= max);
-        assert_eq!(u.buf.len() % MSBC_PKT_BYTES, 0, "the queue must stay packet-aligned");
+        assert_eq!(
+            u.buf.len() % MSBC_PKT_BYTES,
+            0,
+            "the queue must stay packet-aligned"
+        );
         let head = u.take_packet(MSBC_PKT_BYTES).expect("a whole packet");
         assert_eq!(head[0], 0x01, "the H2 header must still be at offset 0");
         assert_eq!(head[1], 2, "the two oldest packets are the ones dropped");
@@ -1722,8 +1834,15 @@ mod tests {
             Ok(())
         });
         assert!(r.is_ok());
-        assert!(applied, "the per-connection air mode must be applied on every accepted child");
-        assert_eq!(drain_and_close(sv), pkt, "the trigger read must not have consumed anything");
+        assert!(
+            applied,
+            "the per-connection air mode must be applied on every accepted child"
+        );
+        assert_eq!(
+            drain_and_close(sv),
+            pkt,
+            "the trigger read must not have consumed anything"
+        );
     }
 
     /// ORDER, which is the whole reason the setter is a closure: `BT_VOICE` is only settable while
@@ -1738,8 +1857,16 @@ mod tests {
             Err(std::io::Error::from_raw_os_error(libc::EINVAL))
         });
         let e = r.expect_err("a failed air mode must fail the accept");
-        assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "the errno must survive for the log");
-        assert_eq!(drain_and_close(sv), pkt, "nothing may have been read from the child");
+        assert_eq!(
+            e.raw_os_error(),
+            Some(libc::EINVAL),
+            "the errno must survive for the log"
+        );
+        assert_eq!(
+            drain_and_close(sv),
+            pkt,
+            "nothing may have been read from the child"
+        );
     }
 
     /// The mapping the device log turned on: 3.14 accepts `BT_VOICE` only in `BT_OPEN`/`BT_BOUND`/

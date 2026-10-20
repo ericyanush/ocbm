@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Usb
@@ -23,6 +25,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -36,15 +40,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.carlink.CarlinkManager
 import com.carlink.R
+import com.carlink.ocbm.Ocbm
 import com.carlink.protocol.PhoneType
 import com.carlink.ui.adaptive.AdaptiveGrid
 import com.carlink.ui.theme.AutomotiveDimens
@@ -79,13 +88,25 @@ fun PhonesTabContent(
     modifier: Modifier = Modifier,
 ) {
     val view = LocalView.current
+    val focusManager = LocalFocusManager.current
 
     // Observe device list and connection state
     var pairedDevices by remember { mutableStateOf(carlinkManager.pairedDevices) }
-    var activeBtMac by remember { mutableStateOf(carlinkManager.connectedBtMac) }
+    var activeBtMac by remember { mutableStateOf(carlinkManager.activeCarPlayBtMac) }
+    var hasLiveCarPlaySession by remember { mutableStateOf(carlinkManager.hasLiveCarPlaySession) }
     var activeWifi by remember { mutableIntStateOf(carlinkManager.currentWifi ?: -1) }
     var phoneType by remember { mutableStateOf(carlinkManager.currentPhoneType) }
-    var managerState by remember { mutableStateOf(carlinkManager.state) }
+    var fallbackSeconds by remember { mutableIntStateOf(carlinkManager.phoneFallbackSeconds) }
+    var fallbackSecondsText by remember { mutableStateOf(fallbackSeconds.toString()) }
+    var fallbackFieldWasFocused by remember { mutableStateOf(false) }
+
+    fun applyFallbackSeconds() {
+        val requested = fallbackSecondsText.toIntOrNull() ?: fallbackSeconds
+        val applied = requested.coerceIn(5, 120)
+        fallbackSeconds = applied
+        fallbackSecondsText = applied.toString()
+        carlinkManager.setPhoneFallbackSeconds(applied)
+    }
 
     // Register device listener for DevList updates (supports multiple listeners)
     DisposableEffect(carlinkManager) {
@@ -106,8 +127,8 @@ fun PhonesTabContent(
     // until CarlinkManager grows a multi-observer connection-state listener.
     LaunchedEffect(carlinkManager) {
         while (true) {
-            managerState = carlinkManager.state
-            activeBtMac = carlinkManager.connectedBtMac
+            activeBtMac = carlinkManager.activeCarPlayBtMac
+            hasLiveCarPlaySession = carlinkManager.hasLiveCarPlaySession
             activeWifi = carlinkManager.currentWifi ?: -1
             phoneType = carlinkManager.currentPhoneType
             delay(1000)
@@ -117,12 +138,65 @@ fun PhonesTabContent(
     // Hoisted remove dialog state to prevent stale device references across recompositions.
     var deviceToRemove by remember { mutableStateOf<CarlinkManager.DeviceInfo?>(null) }
 
-    AdaptiveGrid(
-        modifier = modifier.fillMaxWidth().padding(vertical = 16.dp),
-        minCellWidth = CARD_MIN_WIDTH,
-        maxCellWidth = CARD_MAX_WIDTH,
-        gap = CARD_GAP,
-    ) {
+    Column(modifier = modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+        androidx.compose.foundation.layout.Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Preferred phone timeout",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            OutlinedTextField(
+                value = fallbackSecondsText,
+                onValueChange = { entered ->
+                    if (entered.length <= 3 && entered.all(Char::isDigit)) fallbackSecondsText = entered
+                },
+                modifier = Modifier
+                    .width(144.dp)
+                    .onFocusChanged { focusState ->
+                        if (focusState.isFocused) {
+                            fallbackFieldWasFocused = true
+                        } else if (fallbackFieldWasFocused) {
+                            fallbackFieldWasFocused = false
+                            applyFallbackSeconds()
+                        }
+                    },
+                singleLine = true,
+                suffix = { Text("sec") },
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                    imeAction = ImeAction.Done,
+                ),
+                keyboardActions = KeyboardActions(onDone = {
+                    applyFallbackSeconds()
+                    focusManager.clearFocus()
+                }),
+                textStyle = MaterialTheme.typography.bodyLarge,
+            )
+        }
+        Text(
+            text = "Wait this long before temporarily using another paired phone (5–120 seconds).",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+        Spacer(modifier = Modifier.height(28.dp))
+        Text(
+            text = "Paired phones",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 12.dp),
+        )
+
+        AdaptiveGrid(
+            modifier = Modifier.fillMaxWidth(),
+            minCellWidth = CARD_MIN_WIDTH,
+            maxCellWidth = CARD_MAX_WIDTH,
+            gap = CARD_GAP,
+        ) {
         // === USB Device Card (always present) ===
         // wifi=0 means explicit USB; wifi=-1 (null) with active phoneType means
         // the adapter didn't send the wifi field — treat as USB since wireless
@@ -141,24 +215,36 @@ fun PhonesTabContent(
             pairedDevices.forEach { device ->
                 // Stable keying by btMac preserves per-card state across list reorderings.
                 key(device.btMac) {
+                    // MGMT_INFO's transport field can briefly be empty/stale while audio/video
+                    // are already live. The phone identity from the AirPlay session plus the
+                    // manager's keyed/streaming state is authoritative; only an explicit USB
+                    // transport should suppress the wireless card highlight.
                     val isDeviceActive =
-                        activeWifi == 1 &&
-                            activeBtMac != null &&
-                            device.btMac == activeBtMac &&
-                            (
-                                managerState == CarlinkManager.State.STREAMING ||
-                                    managerState == CarlinkManager.State.DEVICE_CONNECTED
-                            )
+                        activeBtMac != null &&
+                            device.btMac.equals(activeBtMac, ignoreCase = true)
 
                     WirelessDeviceCard(
                         device = device,
                         isConnected = isDeviceActive,
+                        isPreferred = device.btMac.equals(carlinkManager.preferredBtMac, ignoreCase = true),
+                        canSwitch =
+                            !isDeviceActive &&
+                                device.iap2Phase == Ocbm.BTP_WIFI_HANDOFF &&
+                                hasLiveCarPlaySession,
+                        onSwitch = { carlinkManager.switchActivePhone(device.btMac) },
+                        onSelect = {
+                            view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                            carlinkManager.setPreferredDevice(
+                                if (device.btMac.equals(carlinkManager.preferredBtMac, ignoreCase = true)) null else device.btMac,
+                            )
+                        },
                         onRemove = {
                             deviceToRemove = device
                         },
                     )
                 }
             }
+        }
         }
     }
 
@@ -267,6 +353,10 @@ private fun UsbDeviceCard(
 private fun WirelessDeviceCard(
     device: CarlinkManager.DeviceInfo,
     isConnected: Boolean,
+    isPreferred: Boolean,
+    canSwitch: Boolean,
+    onSwitch: () -> Unit,
+    onSelect: () -> Unit,
     onRemove: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -303,18 +393,58 @@ private fun WirelessDeviceCard(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Status line — "Connected", "Not paired with adapter", "Last seen: ..." or "Disconnected"
+            // Keep the live CarPlay session, adapter/iAP2 state, and saved preference separate.
+            // A phone can be paired and handoff-ready without being the active CarPlay session,
+            // and being preferred must not hide either of those states.
             Text(
-                text = deviceStatusText(device, isConnected),
+                text = if (isConnected) "CarPlay: Active" else "CarPlay: Not active",
                 style = MaterialTheme.typography.bodySmall,
                 color = if (isConnected) Color.White.copy(alpha = 0.85f) else colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
 
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = adapterDeviceStatusText(device),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (isConnected) Color.White.copy(alpha = 0.85f) else colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+
+            if (isPreferred) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Preferred for next connection",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (isConnected) Color.White else colorScheme.primary,
+                    textAlign = TextAlign.Center,
+                )
+            }
+
             Spacer(modifier = Modifier.height(16.dp))
 
             // Push remove button to bottom
             Spacer(modifier = Modifier.weight(1f))
+
+            if (canSwitch) {
+                Button(
+                    onClick = onSwitch,
+                    modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight),
+                ) {
+                    Text("Switch CarPlay here")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+
+            OutlinedButton(
+                onClick = onSelect,
+                modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight),
+            ) {
+                Text(if (isPreferred) "Clear preference" else "Use this phone")
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
 
             // Remove button — matches "Disconnect Adapter" style (filled error)
             Button(
@@ -358,15 +488,15 @@ private fun deviceTypeIcon(deviceType: String): Int =
         else -> R.drawable.ic_phone_projection
     }
 
-/** "Connected", "Not paired with adapter", "Last seen: ..." or "Disconnected". */
-private fun deviceStatusText(
-    device: CarlinkManager.DeviceInfo,
-    isConnected: Boolean,
-): String =
+/** The adapter's current per-phone Bluetooth/iAP2 state, independent of active CarPlay. */
+private fun adapterDeviceStatusText(device: CarlinkManager.DeviceInfo): String =
     when {
-        isConnected -> "Connected"
-        !device.bonded -> "Not paired with adapter"
-        else -> device.lastConnected?.let { "Last seen: $it" } ?: "Disconnected"
+        !device.bonded -> "Adapter: Not paired"
+        device.iap2Phase == Ocbm.BTP_WIFI_HANDOFF -> "Adapter: Wi-Fi handoff ready"
+        device.iap2Phase != null ->
+            "Adapter: ${Ocbm.btpName(device.iap2Phase).lowercase().replace('_', ' ').replaceFirstChar { it.uppercase() }}"
+        device.lastConnected != null -> "Adapter: Disconnected · last seen ${device.lastConnected}"
+        else -> "Adapter: Disconnected"
     }
 
 // ==================== Empty State ====================

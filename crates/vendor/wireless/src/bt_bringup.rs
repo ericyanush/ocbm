@@ -81,9 +81,13 @@ fn run(args: &[&str]) -> std::io::Result<()> {
     let out = Command::new("hciconfig").args(args).output()?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        eprintln!("[btd] hciconfig {args:?} failed: status={} stderr={stderr:?}", out.status);
+        eprintln!(
+            "[btd] hciconfig {args:?} failed: status={} stderr={stderr:?}",
+            out.status
+        );
         return Err(std::io::Error::other(format!(
-            "hciconfig {args:?} failed: {}", out.status
+            "hciconfig {args:?} failed: {}",
+            out.status
         )));
     }
     Ok(())
@@ -123,7 +127,10 @@ fn stop_conflicting_daemons() {
 /// `docs/ops/06_CORRECTIONS_LEDGER.md` R-20W-5.
 fn hci_ldisc_registered() -> bool {
     std::fs::read_to_string("/proc/tty/ldiscs")
-        .map(|s| s.lines().any(|l| l.split_whitespace().next() == Some("n_hci")))
+        .map(|s| {
+            s.lines()
+                .any(|l| l.split_whitespace().next() == Some("n_hci"))
+        })
         .unwrap_or(true) // unreadable /proc: do not block bring-up on a diagnostic
 }
 
@@ -153,7 +160,9 @@ fn restore_sco_setup() {
     // session's critical path — for half a minute behind a bring-up that is already doing the work.
     // `timeout` is present on this platform (radio_hal.sh itself uses it); if it somehow is not,
     // fall back to a direct call rather than silently skipping the restore.
-    let run = Command::new("timeout").args(["20", "sh", HAL, "sco_on"]).output();
+    let run = Command::new("timeout")
+        .args(["20", "sh", HAL, "sco_on"])
+        .output();
     let run = match run {
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
             Command::new("sh").arg(HAL).arg("sco_on").output()
@@ -179,7 +188,9 @@ fn restore_sco_setup() {
                 _ => eprintln!("[bt-bringup] radio_hal.sh sco_on exited {code} ({last})"),
             }
         }
-        Err(e) => eprintln!("[bt-bringup] could not run {HAL} sco_on: {e} (HFP call audio may be silent)"),
+        Err(e) => {
+            eprintln!("[bt-bringup] could not run {HAL} sco_on: {e} (HFP call audio may be silent)")
+        }
     }
 }
 
@@ -299,7 +310,11 @@ mod tests {
         let eir = eir_bytes(&"x".repeat(400));
         assert_eq!(eir[0] as usize, MAX_NAME_FOR_TEST + 2);
         assert_eq!(eir[1], 0x09);
-        assert_eq!(eir[2 + MAX_NAME_FOR_TEST], 0x00, "NUL must follow the truncated name");
+        assert_eq!(
+            eir[2 + MAX_NAME_FOR_TEST],
+            0x00,
+            "NUL must follow the truncated name"
+        );
         assert!(eir.len() <= 240, "EIR is {} bytes", eir.len());
     }
 

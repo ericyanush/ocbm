@@ -29,9 +29,10 @@
 //! (`AA-wireless-UUID search -> 2 bytes: 3500`) and is kept only as a diagnostic.
 //! See docs/androidauto/03_WIRELESS.md §2f and §6d.
 //!
-//! Only ever attempts while no session is live (`session_active`), so it never fights the accept path
-//! or a session already in progress. Bounded backoff (10→60 s) between rounds; reset after any session
-//! so a post-drive reconnect is prompt.
+//! The outbound reconnect worker remains deliberately single-flight: it does not start a second
+//! outbound paging attempt while any iAP2 slot is active. The RFCOMM accept path can meanwhile
+//! accept additional phone-initiated slots. Bounded backoff (10→60 s) between rounds; reset after a
+//! session so a post-drive reconnect is prompt.
 
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,7 +90,11 @@ fn acl_hold_secs() -> Option<u64> {
     let parse = |v: &str| v.trim().parse::<u64>().ok();
     let configured = box_common::lever("BT_ACL_HOLD_SECS", "CARPLAY_ACL_HOLD_SECS")
         .and_then(|v| parse(&v))
-        .or_else(|| std::fs::read_to_string("/tmp/acl_hold_secs").ok().and_then(|v| parse(&v)));
+        .or_else(|| {
+            std::fs::read_to_string("/tmp/acl_hold_secs")
+                .ok()
+                .and_then(|v| parse(&v))
+        });
     match configured {
         Some(0) => None,
         Some(n) => Some(n),
@@ -218,7 +223,9 @@ fn attempt(
             return Attempt::Failed;
         }
     };
-    log(&format!("RFCOMM connected OUT to the phone (ch {channel}) — starting iAP2 handshake"));
+    log(&format!(
+        "RFCOMM connected OUT to the phone (ch {channel}) — starting iAP2 handshake"
+    ));
     // The real success signal is iAP2 progress inside bt_driver::run, NOT the mgmt DEVICE_CONNECTED
     // for our own outbound connect (docs/wireless/01_BT_AND_RADIO.md §Design notes — the Model-A latching gotcha).
     // Claim the single-session slot ATOMICALLY, immediately before running the driver. compare_exchange
@@ -234,7 +241,7 @@ fn attempt(
         log("session already active — standing down (dropping outbound connect)");
         return Attempt::Failed;
     };
-    bt_driver::run(sock, name, shutdown);
+    bt_driver::run(sock, name, peer, shutdown);
     log("reconnect session ended");
     Attempt::Ran
 }
@@ -279,7 +286,10 @@ fn attempt_headset(
     // forces one, for a bench run that wants to isolate a failure to a single route.
     let forced = hfp_hf::forced_path();
     if let Some(p) = forced {
-        log(&format!("AA: headset path forced to {} by BT_AA_HEADSET_PATH", p.as_str()));
+        log(&format!(
+            "AA: headset path forced to {} by BT_AA_HEADSET_PATH",
+            p.as_str()
+        ));
     }
     let candidates = headset_candidates(&services, forced);
     if candidates.is_empty() {
@@ -337,7 +347,11 @@ fn attempt_headset(
             ),
         }
         let end = hold_headset_link(&sock, up, shutdown);
-        log(&format!("AA: {} link released ({})", path.as_str(), end.as_str()));
+        log(&format!(
+            "AA: {} link released ({})",
+            path.as_str(),
+            end.as_str()
+        ));
         match end {
             // A real session ran on top of this link, so the caller resets its backoff.
             HeadsetLinkEnd::ProjectionEnded => return Attempt::Ran,
@@ -498,7 +512,8 @@ fn hold_headset_link_inner(
         if hfp_hf::wbs_enabled() { "ON" } else { "OFF" },
         match (path, wbs, hfp_hf::wbs_enabled()) {
             (_, true, _) => "offered AT+BRSF=191 then AT+BAC=1,2; the AG chooses with +BCS",
-            (hfp_hf::Path::Hsp, _, _) => "the HSP path runs no AT dialogue at all — CVSD narrowband",
+            (hfp_hf::Path::Hsp, _, _) =>
+                "the HSP path runs no AT dialogue at all — CVSD narrowband",
             (_, false, true) =>
                 "but the AG does not claim codec negotiation (+BRSF bit 9) — CVSD narrowband",
             (_, false, false) => "AT+BRSF=63, no AT+BAC — CVSD narrowband, the proven path",
@@ -517,7 +532,11 @@ fn hold_headset_link_inner(
                    sco: &sco_audio::ScoAudio,
                    narrowed: &mut bool|
      -> Vec<String> {
-        log(&format!("AA: {} says {}", path.as_str(), hfp_hf::describe_unsolicited(l, &indicators)));
+        log(&format!(
+            "AA: {} says {}",
+            path.as_str(),
+            hfp_hf::describe_unsolicited(l, &indicators)
+        ));
         if let Some(num) = hfp_hf::parse_clip(l) {
             log(&format!("AA: HFP caller id {num}"));
         }
@@ -560,7 +579,9 @@ fn hold_headset_link_inner(
                 hfp_hf::CodecChoice::NarrowToCvsd => {
                     *narrowed = true;
                     sco.set_codec(sco_audio::ScoCodec::Cvsd);
-                    log(&format!("AA: declining codec id {id} — offering CVSD only (AT+BAC=1)"));
+                    log(&format!(
+                        "AA: declining codec id {id} — offering CVSD only (AT+BAC=1)"
+                    ));
                     choice.command()
                 }
             };
@@ -645,7 +666,11 @@ fn hold_headset_link_inner(
             log("AA: the pump has a live TCP session — the phone is on the AP");
         }
 
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: one initialised pollfd, count 1, on an fd this function borrows for its lifetime.
         let r = unsafe { libc::poll(&mut pfd, 1, 1000) };
         if r < 0 {
@@ -799,7 +824,10 @@ pub fn run(
         let has_bonds = !bonds.is_empty();
         if last_state != Some(has_bonds) {
             if has_bonds {
-                log(&format!("{} bonded phone(s) — driving reconnect when idle", bonds.len()));
+                log(&format!(
+                    "{} bonded phone(s) — driving reconnect when idle",
+                    bonds.len()
+                ));
             } else {
                 log("no bonded phones — reconnect idle (accept path handles first pairing; re-checking)");
             }
@@ -834,7 +862,10 @@ pub fn run(
         let targets: Vec<[u8; 6]> = match request {
             Some(Some(addr)) => {
                 if bonds.contains(&addr) {
-                    log(&format!("explicit connect request for {}", control::fmt_addr(&addr)));
+                    log(&format!(
+                        "explicit connect request for {}",
+                        control::fmt_addr(&addr)
+                    ));
                     vec![addr]
                 } else {
                     // Requesting an unbonded phone cannot work — there is no link key to offer, so
@@ -898,26 +929,49 @@ mod tests {
     /// that is the route the stock firmware proved against this exact phone.
     #[test]
     fn auto_tries_hfp_before_hsp() {
-        let s = Services { hfp_ag: Some(4), hsp_ag: Some(3), ..Services::default() };
-        assert_eq!(headset_candidates(&s, None), vec![(Path::Hfp, 4), (Path::Hsp, 3)]);
+        let s = Services {
+            hfp_ag: Some(4),
+            hsp_ag: Some(3),
+            ..Services::default()
+        };
+        assert_eq!(
+            headset_candidates(&s, None),
+            vec![(Path::Hfp, 4), (Path::Hsp, 3)]
+        );
     }
 
     /// A forced path yields ONLY that path — never a silent fallback to the other, which would
     /// defeat the point of a lever whose job is isolating a failure to one route.
     #[test]
     fn a_forced_path_excludes_the_other_one() {
-        let s = Services { hfp_ag: Some(4), hsp_ag: Some(3), ..Services::default() };
-        assert_eq!(headset_candidates(&s, Some(Path::Hfp)), vec![(Path::Hfp, 4)]);
-        assert_eq!(headset_candidates(&s, Some(Path::Hsp)), vec![(Path::Hsp, 3)]);
+        let s = Services {
+            hfp_ag: Some(4),
+            hsp_ag: Some(3),
+            ..Services::default()
+        };
+        assert_eq!(
+            headset_candidates(&s, Some(Path::Hfp)),
+            vec![(Path::Hfp, 4)]
+        );
+        assert_eq!(
+            headset_candidates(&s, Some(Path::Hsp)),
+            vec![(Path::Hsp, 3)]
+        );
     }
 
     /// Forcing a path the peer does not expose must yield nothing, not the other one.
     #[test]
     fn forcing_a_path_the_peer_lacks_yields_nothing() {
-        let hsp_only = Services { hsp_ag: Some(3), ..Services::default() };
+        let hsp_only = Services {
+            hsp_ag: Some(3),
+            ..Services::default()
+        };
         assert!(headset_candidates(&hsp_only, Some(Path::Hfp)).is_empty());
         assert_eq!(headset_candidates(&hsp_only, None), vec![(Path::Hsp, 3)]);
-        let hfp_only = Services { hfp_ag: Some(4), ..Services::default() };
+        let hfp_only = Services {
+            hfp_ag: Some(4),
+            ..Services::default()
+        };
         assert!(headset_candidates(&hfp_only, Some(Path::Hsp)).is_empty());
         assert_eq!(headset_candidates(&hfp_only, None), vec![(Path::Hfp, 4)]);
     }
@@ -925,7 +979,11 @@ mod tests {
     /// An iAP2 or AA-wireless hit is not an audio gateway; neither may produce a candidate.
     #[test]
     fn only_gateway_records_produce_candidates() {
-        let s = Services { iap2: Some(1), aawg: Some(8), ..Services::default() };
+        let s = Services {
+            iap2: Some(1),
+            aawg: Some(8),
+            ..Services::default()
+        };
         assert!(headset_candidates(&s, None).is_empty());
         assert!(headset_candidates(&Services::default(), None).is_empty());
     }
@@ -997,7 +1055,13 @@ mod tests {
     /// CarPlay session down with it.
     #[test]
     fn a_malformed_table_is_no_session_and_never_panics() {
-        for t in ["", "header only\n", "h\n   0:\n", "h\n   0: nocolon 00:00 01\n", "h\n   0: AB:ZZZZ x 01\n"] {
+        for t in [
+            "",
+            "header only\n",
+            "h\n   0:\n",
+            "h\n   0: nocolon 00:00 01\n",
+            "h\n   0: AB:ZZZZ x 01\n",
+        ] {
             assert!(!has_established_on_local_port(t, 5288), "table {t:?}");
         }
     }

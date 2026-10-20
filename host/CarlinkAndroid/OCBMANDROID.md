@@ -2,16 +2,27 @@
 
 The head-unit counterpart to `host/MacHost/`: an Android app for a GM **gminfo3.7** unit (2024
 Silverado, Intel, AAOS 12L / API 32) that claims the CPC200-CCPA over **OCBM** and runs **full**
-wireless CarPlay — the adapter's own WiFi and Bluetooth, the adapter as the AirPlay endpoint, all
-media crossing the USB bulk pipe.
+wireless CarPlay — the adapter's Bluetooth/MFi coprocessor, the AAOS app as the AirPlay endpoint,
+and the truck's built-in hotspot as the iPhone's Wi-Fi leg. The adapter SoftAP is disabled. In the
+direct-receiver path, media crosses vehicle Wi-Fi into the AAOS app; OCBM USB carries adapter
+control/MFi traffic. The legacy OCBM A/V path remains available when the native receiver is inactive.
 
-> Not to be confused with the sibling `gm_ccpa` project, which offloads WiFi to the *vehicle's* SoftAP
-> and reduces the adapter to BT + MFi. That is a different architecture. This one uses the full OCBM
-> stack. `gm_ccpa` is still where several of the components below were proven on this hardware.
+## WHERE THINGS STAND (updated 2026-10-14)
 
-## WHERE THINGS STAND (updated 2026-09-18, end of session)
+> **Wireless receiver integration, 2026-10-14 — built, not yet truck-verified.** The existing
+> Carlink UI, renderer, AAC/voice players, metadata handling, and rolling log/export remain in use.
+> The app now starts gm_ccpa's Kotlin/Rust receiver after OCBM SUBSCRIBE, relays MFi certificate and
+> signing operations over CH_MFI, accepts the receiver's loopback media seams (video 9001, media
+> audio 9002, voice 9003, metadata 9004), and runs the receiver mic gate/uplink on 9112. Touch,
+> keyframe requests, media buttons, night mode, and limited-UI commands are routed to the native
+> receiver while it is active. Receiver Kotlin logs are forwarded into Carlink's rolling diagnostics.
+> The x86_64 Android JNI library is built from `host/gm_ccpa/native/carplay-jni` by
+> `tools/build_carplay_jni.sh`; the GM `info.bplist` asset is bundled from gm_ccpa. Debug unit tests,
+> sideload APK assembly, Play-release Kotlin compilation, and R8 minification passed. The path has
+> **not** yet been exercised on the truck; verify phone discovery, pairing/MFi, first video/audio,
+> microphone/Siri/calls, and disconnect/reconnect before treating it as stable.
 
-> **Status note, 2026-09-18 — active, three work packages landed today.** This replaces a
+> **Historical status note, 2026-09-18 — active, three work packages landed that day.** This replaces a
 > 2026-09-11 note (removed) that called the app "dormant, and behind" and pointed readers at
 > `gm_ccpa`/`host/MacHost/` instead — that was true on 2026-08-16 and is not true now. Today's
 > build gate is green
@@ -68,7 +79,7 @@ The in-screen dashboard (frosted-glass cards, `FrostedGlass.kt`) is gone. The UI
   spinner, `[ status ]`, the CT_PROJ_MODE/CT_BOX_HEALTH line, and top-left **Settings** / **Reset
   Device** (= `MainActivity.reinitialize()`, the full session rebuild).
 - **`ui/SettingsScreen.kt`** — slides in OVER `MainScreen` (`CarlinkApp` in `MainActivity.kt`, so the
-  SurfaceView survives). Navigation rail: back, **Phones** / **Control** tabs, close-app (confirm →
+  SurfaceView survives). Navigation rail: back, **Phones** / **Wi-Fi** / **Control** tabs, close-app (confirm →
   `stop()` + `finishAffinity`), version. Reached from the overlay's Settings button or, mid-session,
   from the CarPlay OEM "Carlink" tile (`requestUI` → `onHostUIPressed`). Closing it calls
   `recoverVideoFromOverlay()`.
@@ -87,8 +98,18 @@ The in-screen dashboard (frosted-glass cards, `FrostedGlass.kt`) is gone. The UI
 - **Dropped, no OCBM backing:** the Adapter Configuration dialog (audio source, mic source, media
   delay, video resolution, FPS, drive side, GPS forwarding, cluster navigation, WiFi band — all
   riddleBox `BoxSettings`/`AdapterConfig` knobs; the OCBM path pushes `VehicleConfigYaml` from the
-  detected display and hardcodes the rest), Reset Cluster (no cluster in this build), and the Logs
-  tab (`Logger` has no file sink or level switch — `adb logcat` only).
+  detected display and hardcodes the rest), and Reset Cluster (no cluster in this build).
+
+**Logs tab.** The app starts a bounded rolling diagnostic capture before the adapter manager is
+created. `Logger`, `ProbeLog`, and OCBM `CH_LOG` adapter records are written asynchronously to
+app-private files (2 MiB per file, up to five files / 10 MiB, seven-day retention). Adapter records
+retain the adapter timestamp, source, sequence, and backfill/drop/truncation flags. After
+`CT_SUBSCRIBE`, the app best-effort enables the adapter's bounded log stream (256 KiB for
+`/tmp/box.log`; daemon logs are streamed from their current contents/tails). Settings → Logs exports
+a ZIP through Android's Storage Access Framework, so an attached USB drive can be selected. The
+adapter stream is captured only while the app has an active OCBM session; it cannot recover logs
+that were lost when the adapter rebooted before the app collected them. Purge deletes only app-private
+logs. Direct `android.util.Log` calls outside the logging facades are not included.
 
 No protocol or state-machine change was needed; `MainScreen` gained one plain callback
 (`onStateChanged`) so the overlay can gate its buttons on the connection state without polling, and
@@ -151,11 +172,85 @@ waiting on box verbs") and the proposed verbs in
 | Restart Wireless (new) | `MGMT_RESTART_WIRELESS`, confirmed; the text says a wired phone is not affected | live: ACK status=0, no SESSION_EVENT / PROJ_MODE / BOX_HEALTH change, wired CarPlay stayed up |
 | Reboot Adapter | `MGMT_REBOOT`, confirmed; dialog now says ~50 s and warns about the USB permission prompt after re-enumeration | dialog screenshot |
 | Disconnect Adapter | `CarlinkManager.disconnect()` = `stopImpl` under the lifecycle mutex on IO, now confirmed; the stop path resets the status line to "Disconnected" | dialog screenshot |
-| Close App | the same `disconnect()`; `finishAffinity()` runs after it returns, so onDestroy's synchronous `release()` never overlaps a teardown in flight | code |
+| Activity background/recreation | video pauses immediately; the process-scoped manager is retained for a cancellable 3-minute grace period. Returning reuses the existing manager and session; only expiry releases it | `MainActivity.SessionLifecycle` |
+| Close App / terminal release | final manager release runs on a dedicated IO executor, so `CT_STOP` and USB helper teardown are not attempted synchronously from `onDestroy`/the UI thread | code |
 | Phones cards | information-only (no tap; there is no targeted-connect verb, and the tap used to bounce wireless). Remove: bonded → `MGMT_FORGET_DEVICE`; **unbonded → local history delete, nothing sent** (the box holds no bond and its FORGET handler restarts wireless unconditionally) | screenshot `02_remove_unbonded_dialog` |
 | Display Mode ▸ Apply & Restart | MacHost's rule (`OCBMClient.swift` `sessionConfigChanged`): a phone session owns the box (`CT_PROJ_MODE` wired/wireless CP) → persist, "Display mode saved — applies at the next connection" dialog, window re-asserted to the APPLIED mode (the dialog's live preview would otherwise leave bars under a session built without them); applied by a `BoxStatusListener` when the box reports no phone session — skipped while a clean-slate reset is in flight. No phone session → rebuild now, as before | live: log `phone session active (WIRED_CP) — mode saved`; no `[REINIT]`; screenshot `09_display_mode_deferred_notice` |
 | Back from Settings | keyframe + 750 ms watchdog gated on a live video epoch, not `state == STREAMING` (OCBM stamps STREAMING on first media metadata, so wired sessions sit in DEVICE_CONNECTED with video) | live: `Recovering video after overlay close (state=DEVICE_CONNECTED)` |
 | Wireless pairing code | Pair / Cancel dialog on the main screen → `CT_PAIR_CONFIRM` 1/0 (`OcbmClient.sendPairConfirm`); one answer per prompt, box cancels on its own after 55 s | `OcbmClientTest` pins the bytes; NOT hardware-exercised (no wireless pairing today) |
+
+## USB permission split — fixed-handler helper owns the OCBM pipe
+
+The GM fixed-handler workaround and the production OCBM transport are now one architecture. The
+separate `:usbhandler` APK keeps package `android.car.usb.handler`, which GM's fixed-handler path
+silently grants USB permission on adapter attach. It deliberately does **not** declare
+`android.car.usb.handler.UsbHostManagementActivity`, even though GM's configuration names that
+component. Testing in the original Carlink app confirmed the truck tolerates the missing activity
+after granting permission; declaring it caused distraction overlays when USB devices attached
+while driving. The helper also has no USB attach receiver: the main app manages its connection
+lifecycle, and the helper should not launch UI or perform diagnostic opens on attach.
+
+Production I/O is performed only by `com.carlink.usbhelper.UsbBridgeService` in that helper APK.
+`:app` binds through the `:usbbridge` AIDL contract, asks the helper to enumerate/verify the grant,
+then receives arbitrary raw bulk-IN chunks and sends bounded bulk-OUT chunks. OCBM framing remains
+in `OcbmClient` in the main app. AIDL OUT writes now return an empty success result or a diagnostic
+including the bulk-transfer result, byte offset, endpoint, device path and USB generation; the app
+copies failures into its rolling diagnostics and treats a failed USB write as a dead link. The helper
+tracks open-device identity separately from its reader state, serializes teardown against writes,
+and reports USB detach broadcasts immediately. Incomplete AIDL chunk assemblies are validated,
+bounded and expired; slow Binder delivery and queue pressure are also reported to the app log.
+Because the AIDL write result changed from Boolean to diagnostic text, install the helper and main
+app built from the same revision together. The helper uses a bind-owned lifecycle matching the
+original Carlink split app: the main app binds, invokes the helper's bounded device/grant scan and
+open operation, closes the USB pipe, and unbinds on teardown. Android destroys the helper when its
+last binding is released; the next session binds it afresh. The helper is not started, sticky, or
+foreground. Its bounded scan can bridge a brief enumeration/grant timing race; it cannot manufacture
+a GM grant if `UsbManager.hasPermission()` remains false until physical replug. The exported service deliberately has no custom signature permission, matching
+the original Carlink helper; the main app and helper therefore do not need matching signing keys.
+Both APKs must still be installed for the same AAOS user. As with any exported unprotected service,
+another app that knows its component can attempt to bind.
+
+The app must not call `UsbManager.requestPermission()` or open the USB device under its own UID. If
+the helper is absent/unbindable, the adapter is not enumerated, or its silent grant is missing, the
+UI/logs report the helper failure instead of falling back to a permission prompt. After an adapter
+reboot/re-enumeration, the fixed handler grants the helper again and the app can reconnect.
+
+Build/install for a test unit:
+
+```sh
+./gradlew :usbhandler:assembleDebug :app:assembleSideloadDebug
+adb install -r "$HOME/.cache/gradle-builds/carlink-android-ocbm/usbhandler/outputs/apk/debug/usbhandler-debug.apk"
+adb install -r "$HOME/.cache/gradle-builds/carlink-android-ocbm/app/outputs/apk/sideload/debug/app-sideload-debug.apk"
+```
+
+Install both in the same foreground AAOS user (the truck commonly uses user 10); they may be signed
+with different certificates. Replug the adapter and inspect the main app's USB diagnostics. A
+successful helper bind, adapter open, and `raw OCBM read stream started` confirm that the silent
+grant remains usable without the fixed-handler activity.
+
+The steering-wheel Siri path is retained separately in `:app`'s `voice/` package: the selected
+AAOS assistant receives the PTT session and sends the OCBM Siri down/up pair. It is independent of
+which APK owns USB and still requires selecting Carlink as the system digital assistant.
+
+## Play internal testing identity and driving-optimized declaration
+
+The `play` app flavor uses `ey.carlink`, matching the existing Carlink Play listing, with version
+code 188 (the prior Carlink build used 187) and version name 1.2.3. The `sideload` flavor retains
+`zeno.carlink.ocbm` and its OCBM version label, so it can remain installed alongside the Play app.
+The USB helper remains a separate package, `android.car.usb.handler`; do not change it to either
+main-app ID.
+
+Both variants use the common main manifest. It declares `distractionOptimized=true` on
+`.MainActivity` and `com.android.automotive.application.DISTRACTION_OPTIMIZED=true` on the
+application. These are the AAOS declarations; they do not themselves grant restricted platform
+permissions or guarantee that every vehicle/system policy will allow every activity while moving.
+
+Build the variants with `./gradlew :app:assembleSideloadDebug :app:bundlePlayRelease`. The repo
+does not contain a Play upload-key signing configuration or credentials. The release bundle must
+be signed with the same upload key used for the existing Play listing before upload (Play App
+Signing does not make a different upload key interchangeable). Keep signing secrets outside the
+repository; configure the existing upload-key mechanism before treating the generated AAB as
+ready for Play Console.
 
 Also in this pass: the stale `STOP_GRACE` comments went (CT_STOP is an immediate `go_idle` since
 2026-09-03); `handleErrorImpl` now really skips CT_STOP (`OcbmClient.stop(sendStop = false)`) — every
@@ -633,8 +728,14 @@ Traps worth knowing, each hit once:
 The CarPlay home screen now carries a "Carlink" tile, and tapping it brings this app forward. Both
 halves were already supported by the box and unused by us.
 
-**Advertising it** is `oemIconConfig` in the pushed YAML — `images[]` + `label` + `visible`, emitted
-between `limitedUIConfig` and `audio` to match the box's struct order. All THREE of Apple's sizes
+**On the adapter-based path**, advertising it is `oemIconConfig` in the pushed YAML — `images[]` +
+`label` + `visible`, emitted between `limitedUIConfig` and `audio` to match the box's struct order.
+The OCBM app's native receiver does not use that YAML to build its AirPlay `/info`: it serves the
+shared GM diagnostic binary plist. The CarPlay return tile broke when Carlink began using this native
+receiver: the shared plist intentionally has transparent icons and `oemIconVisible=false`, while the
+Carlink manager had not connected the `infoTransformer` hook. Carlink now transforms the plist before
+the first `/info` reply, replacing the hidden artwork with the app's launcher icon and setting
+`oemIconVisible=true`; the GM diagnostic app keeps its hidden default. All THREE of Apple's sizes
 (120/180/256, `AppleCarPlay_AppStub.c:611-637`) are mandatory: the box's notes record a
 device-confirmed finding that iOS renders only the LABEL for a single-size set, so a partial set is
 no icon at all.
@@ -647,13 +748,13 @@ was declared, implemented in `MainScreen`, and never fired. With it wired, the w
 — today the Settings screen (Phones / Control tabs), Reboot Adapter / Reset Connection, and
 `recoverVideoFromOverlay` — stops being dead code.
 
-`BinaryPlist` is a minimal `bplist00` reader for exactly that payload. macOS gets this from
-`PropertyListSerialization`; Android has nothing equivalent, and scanning the bytes for the ASCII
-verb is not sound (a verb name can appear inside a URL). It parses on the OCBM READ THREAD, so it
-returns null rather than throwing on anything malformed — every read is bounds-checked, refs are
-validated, recursion is depth-capped, and a test asserts that every truncation and every single-byte
-corruption of a real payload fails safely. Fixtures come from Apple's own encoder (`plutil -convert
-binary1`), so a shared misreading of the format cannot cancel itself out.
+`BinaryPlist` is a minimal `bplist00` reader for exactly that command payload and also re-encodes the
+shared `/info` dictionary after the OEM-icon transform. macOS gets this from
+`PropertyListSerialization`; Android has nothing equivalent, and scanning the command bytes for the
+ASCII verb is not sound (a verb name can appear inside a URL). `META_CMD` parsing runs on the OCBM
+read thread and returns null rather than throwing on malformed input — reads are bounds-checked,
+references validated, and recursion depth-capped. Tests cover Apple-encoded command fixtures and
+plist round-tripping, including the transformed OEM icon.
 
 **The icon is flattened to [dominant colour + foreground layer], and that is a size decision made
 from measurement.** This app's adaptive background is a detailed image that will not compress: the
@@ -663,6 +764,17 @@ dominant colour and drawing only the logo brings the set to 33,996 B (a 36,059 B
 mark and the palette, and leaves ~20 KB of headroom. The budget itself is DERIVED from
 `MAX_PAYLOAD` rather than chosen — the first hand-picked value was 48 KB and rejected a perfectly
 deliverable 52 KB set on hardware.
+
+The `/info` plist and native receiver declare/negotiate the two GM view areas. The Android UI consumes
+the forwarded `requestViewArea` command and applies
+the matching panel-coordinate crop to the full-screen `SurfaceView` with `SurfaceControl.Transaction`
+(no video rescale), then shows the vehicle system bars for the compact area and restores the selected
+display mode for full view. The rectangles are the GM-proven `2400x960` panel and `1416x842 @ (188,118)`
+app bounds. The pushed subscription YAML is temporarily kept at the previous one-area setting
+(`enablesViewAreas: false`) while diagnosing a handshake regression seen when the second area was
+added there. That regression occurred before CarPlay sent `requestViewArea`, so the crop path itself
+was not reached. This path compiles and is unit-tested, but still needs truck confirmation; it is
+API-31+ and uses the same hardware-composer operation as the GM diagnostic app.
 
 ## Not done yet
 
@@ -674,9 +786,8 @@ deliverable 52 KB set on hardware.
 - **The host-side `mgmtLock` gap.** `mgmtAction`/`mgmtGetInfo` clear the response queue with no lock,
   so two concurrent MGMT actions can steal each other's ACK. Latent today; Phase 3 puts a MGMT verb
   behind a UI tap, which makes it reachable.
-- **`onHostUIPressed` is wired, but `META_CMD` is only partly consumed.** `requestUI` is handled;
-  every other inbound iPhone command is logged once by verb and dropped. `BinaryPlist` can decode
-  them all when a use appears.
+- **`META_CMD` remains partly consumed.** `requestUI` and `requestViewArea` are handled; other inbound
+  iPhone commands are logged once by verb and dropped. `BinaryPlist` can decode them when a use appears.
 - ~~**The FGS microphone type never applies** — the service ran `types=0x2` (mediaPlayback only)
   because the first `startForeground` happened during CONNECTING, before `RECORD_AUDIO` was
   granted, so mic capture worked only while the activity was visible.~~ **RE-CHECKED 2026-09-18,
@@ -962,8 +1073,9 @@ no slot for either, the receiver's `/info` hard-codes `widthPhysical: 0`, and th
 field help says `diagonalInches` is not sent to either phone (its `dpi` is an Android Auto field).
 `CMD_VIEW_AREA` (0x11) is now DEFINED in `OcbmProto.kt`, closing one of `:app`'s two
 `proto_check.py` gaps (the other, `F_BOTH`, is unrelated), but the mid-session push is NOT wired —
-a panel/mode change rebuilds the session instead of pushing a live view-area update; this app still
-declares a single view area with `enablesViewAreas: false`. `WindowMetricsCompat`'s old
+a panel/mode change rebuilds the session instead of pushing a live view-area update; CarPlay's
+Dock-driven switch among the declared main-stream areas is handled separately through
+`requestViewArea`. `WindowMetricsCompat`'s old
 window-only-measurement code path is now callerless, superseded by the three-rectangle version above.
 
 **Also found today, unrelated to layout:** the launcher icon assets are byte-identical (same md5,
@@ -1380,6 +1492,32 @@ only state that matters here. These remain hardware-verified only.
   written, and fixed by the very commit that carried it.** `d842daf` imported `host/CarlinkAndroid/`
   into the repo (~100 tracked files, this document among them), so `git log` / `git blame` /
   `git diff` work here normally.
+
+## Wireless phone-session loss and recovery (2026-10-14)
+
+The Android host treats the phone's native CarPlay control socket as the session-liveness signal;
+media silence by itself is not evidence of disconnect. The shared `CarPlayRx` receiver now mirrors
+the reference receiver's 30-second A/V-idle rule: a quiet control socket stays open while A/V has
+been active within the timeout, and is closed after A/V itself has gone idle (or no A/V ever
+arrived). This prevents an ordinary quiet control channel from tearing down a healthy projection.
+Socket keepalive is enabled as a best-effort hint, but Android's public `Socket` API does not expose
+the reference's 3s/3s/3 probe timing; the A/V-idle rule is the bounded recovery path.
+
+When the last phone control connection ends, Carlink stops the phone-specific microphone uplink,
+clears stale track/device metadata, updates the UI, and retires only the video decoder epoch. It
+keeps the OCBM USB management session, MFi relay, adapter services, media/audio consumers and
+Bluetooth pairing state alive. Session generations fence this deferred cleanup so a rapid incoming
+connection cannot be overwritten by the previous session's teardown.
+
+After six adapter-accepted connection nudges, `CarPlayRx` waits for five seconds with no later
+nudge and no inbound control session before declaring a sustained dial-back stall. This quiet grace
+avoids false alarms when the phone dials back just after the sixth response. Recovery is tiered:
+refresh the host's Bonjour browse/resolve and re-announce; if still idle, rebuild the host-side
+receiver only after its pumps drain; then, at most once for that no-phone interval, issue
+`MGMT_RESTART_WIRELESS` to restart adapter Bluetooth while preserving USB/MFi. A full USB
+`CT_STOP`/clean-slate reset remains a deliberate user action, because a missing dial-back alone is
+not enough evidence to tear down the authenticated adapter session. The current iAP2 peer remains
+pinned throughout recovery so another paired phone cannot win by resolving first.
 
 ## Decisions taken (2026-08-14)
 

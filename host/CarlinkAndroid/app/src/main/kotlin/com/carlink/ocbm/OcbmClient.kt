@@ -56,6 +56,8 @@ class OcbmClient(
         private set
 
     val hasMfi: Boolean get() = (caps and Ocbm.CAP_MFI) != 0
+    /** The box emits peer-keyed iAP2 slot transitions; scalar BT_PHASE is legacy/advisory only. */
+    val hasMultiIap2Slots: Boolean get() = (caps and Ocbm.CAP_MULTI_IAP2) != 0
 
     /** Config blob last sent with CT_SUBSCRIBE; re-sent verbatim if the box drops us. */
     @Volatile private var configBlob: ByteArray = ByteArray(0)
@@ -110,6 +112,9 @@ class OcbmClient(
 
     /** Exact Bluetooth peer whose iAP2 RFCOMM session the adapter accepted; empty clears it. */
     var onActiveBtPeer: ((String) -> Unit)? = null
+
+    /** Per-phone iAP2 slot transition: the phase is BTP_IDLE when that phone's slot is released. */
+    var onIap2Slot: ((mac: String, phase: Byte) -> Unit)? = null
 
     /**
      * Which projection transport OWNS the box right now (CT_PROJ_MODE, one of `PM_*`). Mirrors the
@@ -536,6 +541,20 @@ class OcbmClient(
                 val mac = if (pl.size > 1) String(pl, 1, pl.size - 1, Charsets.US_ASCII).trim().uppercase() else ""
                 log.i(if (mac.isEmpty()) "<< ACTIVE_BT_PEER cleared" else "<< ACTIVE_BT_PEER $mac")
                 onActiveBtPeer?.invoke(mac)
+            }
+            Ocbm.CT_IAP2_SLOT -> {
+                if (pl.size == 19) {
+                    val mac = String(pl, 1, 17, Charsets.US_ASCII).uppercase()
+                    val phase = pl[18]
+                    if (mac.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}"))) {
+                        log.i("<< IAP2_SLOT $mac ${Ocbm.btpName(phase)}")
+                        onIap2Slot?.invoke(mac, phase)
+                    } else {
+                        log.w("!! IAP2_SLOT has invalid Bluetooth address")
+                    }
+                } else {
+                    log.w("!! IAP2_SLOT has invalid payload size ${pl.size}")
+                }
             }
             Ocbm.CT_BT_PHASE -> {
                 if (pl.size >= 2) {

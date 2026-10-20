@@ -61,6 +61,7 @@
 
 // `Read` is needed for `Read::take` on the request reader — without it in scope the
 // method call resolves to `Iterator::take` and fails to compile against BufReader.
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +73,9 @@ use crate::ssp_agent;
 /// Loopback only. Binding every interface would expose device management to the CarPlay SoftAP —
 /// the one network where an untrusted device is by definition present.
 pub const CONTROL_PORT: u16 = 9115;
+/// Keep the accept path bounded even if many bonded phones dial at once.
+pub const MAX_IAP2_SLOTS: usize = 8;
+static PEER_FILE_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Bounds a stuck client so one bad connection cannot hold the single-threaded accept loop.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -198,10 +202,7 @@ fn json_str_array(src: &str, key: &str) -> Option<Vec<String>> {
 /// The typed readers cannot tell "the client omitted this field" from "the field is there and
 /// malformed" — both are `None` — and those two deserve OPPOSITE answers: keep the current value,
 /// versus refuse the request.
-fn json_has_key(
-    src: &str,
-    key: &str,
-) -> bool {
+fn json_has_key(src: &str, key: &str) -> bool {
     let pat = format!("\"{key}\"");
     match src.find(&pat) {
         Some(i) => src[i + pat.len()..].trim_start().starts_with(':'),
@@ -248,7 +249,10 @@ impl Default for Policy {
     fn default() -> Self {
         // Auto-connect on by default: a head unit that needs a tap before it will talk to an
         // already-paired phone is not what a driver expects, and it is what the stock firmware does.
-        Self { auto_connect: true, order: Vec::new() }
+        Self {
+            auto_connect: true,
+            order: Vec::new(),
+        }
     }
 }
 
@@ -268,6 +272,10 @@ pub struct Control {
     /// accept-path session. That is exactly why it must never be the source of truth for "is a
     /// session live".
     session_peer: RwLock<Option<[u8; 6]>>,
+    /// Independently live iAP2 links, keyed by the remote BR/EDR address. The legacy scalar
+    /// `session_peer` below remains a compatibility view of the first live peer; new multi-phone
+    /// reporting must use this set rather than treating that scalar as authoritative.
+    active_peers: Mutex<HashSet<[u8; 6]>>,
     /// The single-session claim, SHARED with `main`'s accept loop and `reconnect`. THIS is what
     /// `active`/`connected` report.
     ///
@@ -340,18 +348,32 @@ impl Control {
         let path = "/tmp/ocbm_active_bt_peer";
         if let Some(a) = addr {
             let body = format!("{}\n", fmt_addr(&a));
-            let tmp = format!("{path}.tmp");
+            let tmp = format!(
+                "{path}.tmp.{}.{}",
+                std::process::id(),
+                PEER_FILE_TMP_ID.fetch_add(1, Ordering::Relaxed)
+            );
             if std::fs::write(&tmp, body).is_ok() {
                 let _ = std::fs::rename(&tmp, path);
             }
         } else {
             let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(format!("{path}.tmp"));
         }
     }
 
     pub fn session_peer(&self) -> Option<[u8; 6]> {
         self.session_peer.read().ok().and_then(|r| *r)
+    }
+
+    /// Snapshot all named iAP2 peers currently holding a session slot.
+    pub fn active_peers(&self) -> Vec<[u8; 6]> {
+        let mut peers = self
+            .active_peers
+            .lock()
+            .map(|s| s.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        peers.sort_unstable();
+        peers
     }
 
     /// Bonded phones in the order reconnect should try them.
@@ -360,8 +382,8 @@ impl Control {
     }
 }
 
-/// RAII holder of the single-session claim. Clears the flag AND the published peer on every exit
-/// from the claimed region.
+/// RAII holder of one named-phone slot (or the exclusive anonymous legacy slot). Keeps the
+/// aggregate activity flag and compatibility peer view correct on every exit from the claim.
 ///
 /// ⚠️ Scope note so nobody over-trusts this: the shipped binaries build `--release` and the
 /// workspace sets `panic = "abort"`, so a panic terminates the process WITHOUT unwinding and this
@@ -371,27 +393,76 @@ impl Control {
 pub struct SessionClaim<'a> {
     flag: &'a AtomicBool,
     ctrl: &'a Control,
+    peer: Option<[u8; 6]>,
 }
 
 impl<'a> SessionClaim<'a> {
-    /// Claim the slot, or `None` if another path owns it. `compare_exchange`, not a store: the
-    /// ~16 s SDP+RFCOMM connect in `reconnect::attempt` can overlap an inbound accept.
+    /// Claim a per-peer slot, or `None` if that same peer is already being handled. Distinct,
+    /// bonded phones may have concurrent iAP2 links. Anonymous claims retain the old exclusive
+    /// behavior because they cannot be safely deduplicated or exposed to the host.
     pub fn try_claim(
         flag: &'a AtomicBool,
         ctrl: &'a Control,
         peer: Option<[u8; 6]>,
     ) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        ctrl.set_session_peer(peer);
-        Some(Self { flag, ctrl })
+        if let Some(peer) = peer {
+            let mut peers = ctrl.active_peers.lock().ok()?;
+            if peers.is_empty() && flag.load(Ordering::Acquire) {
+                // The sole flag is held by an anonymous (legacy/AA) session.
+                return None;
+            }
+            if !peers.insert(peer) {
+                return None;
+            }
+            if peers.len() > MAX_IAP2_SLOTS {
+                peers.remove(&peer);
+                return None;
+            }
+            flag.store(true, Ordering::Release);
+            let primary = peers.iter().copied().min();
+            ctrl.set_session_peer(primary);
+            drop(peers);
+            Some(Self {
+                flag,
+                ctrl,
+                peer: Some(peer),
+            })
+        } else {
+            // Keep unidentifiable sessions exclusive; they cannot safely coexist with slots whose
+            // identity is required for per-phone handoff routing.
+            let peers = ctrl.active_peers.lock().ok()?;
+            if !peers.is_empty() {
+                return None;
+            }
+            flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .ok()?;
+            drop(peers);
+            ctrl.set_session_peer(None);
+            Some(Self {
+                flag,
+                ctrl,
+                peer: None,
+            })
+        }
     }
 }
 
 impl Drop for SessionClaim<'_> {
     fn drop(&mut self) {
-        self.ctrl.set_session_peer(None);
-        self.flag.store(false, Ordering::Release);
+        if let Some(peer) = self.peer {
+            if let Ok(mut peers) = self.ctrl.active_peers.lock() {
+                peers.remove(&peer);
+                self.ctrl.set_session_peer(peers.iter().copied().min());
+            } else {
+                self.ctrl.set_session_peer(None);
+            }
+            self.flag
+                .store(!self.ctrl.active_peers().is_empty(), Ordering::Release);
+        } else {
+            self.ctrl.set_session_peer(None);
+            self.flag
+                .store(!self.ctrl.active_peers().is_empty(), Ordering::Release);
+        }
     }
 }
 
@@ -404,7 +475,11 @@ impl Drop for SessionClaim<'_> {
 ///
 /// Free function so it is testable without touching the on-disk link-key store.
 pub fn order_bonds(bonds: &[[u8; 6]], order: &[[u8; 6]]) -> Vec<[u8; 6]> {
-    let mut out: Vec<[u8; 6]> = order.iter().copied().filter(|a| bonds.contains(a)).collect();
+    let mut out: Vec<[u8; 6]> = order
+        .iter()
+        .copied()
+        .filter(|a| bonds.contains(a))
+        .collect();
     for b in bonds {
         if !out.contains(b) {
             out.push(*b);
@@ -440,18 +515,28 @@ fn load_policy() -> Policy {
         // explicit "off" on every corrupt read — silently, and in the one direction with a
         // real-world consequence.
         log("policy file is unparseable — assuming autoConnect OFF until the app pushes a new one");
-        return Policy { auto_connect: false, order: Vec::new() };
+        return Policy {
+            auto_connect: false,
+            order: Vec::new(),
+        };
     };
     let order = json_str_array(&s, "order")
         .unwrap_or_default()
         .iter()
         .filter_map(|a| parse_addr(a))
         .collect();
-    Policy { auto_connect, order }
+    Policy {
+        auto_connect,
+        order,
+    }
 }
 
 fn save_policy(p: &Policy) {
-    let order: Vec<String> = p.order.iter().map(|a| format!("\"{}\"", fmt_addr(a))).collect();
+    let order: Vec<String> = p
+        .order
+        .iter()
+        .map(|a| format!("\"{}\"", fmt_addr(a)))
+        .collect();
     let body = format!(
         "{{\"autoConnect\":{},\"order\":[{}]}}",
         p.auto_connect,
@@ -550,7 +635,10 @@ pub fn handle_request(ctrl: &Control, line: &str) -> String {
                         .to_string()
                 }
             };
-            let p = Policy { auto_connect, order };
+            let p = Policy {
+                auto_connect,
+                order,
+            };
             log(&format!(
                 "policy: autoConnect={} order={} device(s)",
                 p.auto_connect,
@@ -576,7 +664,9 @@ pub fn handle_request(ctrl: &Control, line: &str) -> String {
                 ));
                 r#"{"ok":true}"#.to_string()
             }
-            None => r#"{"ok":false,"error":"pair_answer: accept must be true or false"}"#.to_string(),
+            None => {
+                r#"{"ok":false,"error":"pair_answer: accept must be true or false"}"#.to_string()
+            }
         },
         "forget" => match json_str(line, "address").as_deref().and_then(parse_addr) {
             Some(a) => {
@@ -594,7 +684,10 @@ pub fn handle_request(ctrl: &Control, line: &str) -> String {
             r#"{"ok":false,"error":"unsupported: no session cancellation hook in bt_driver"}"#
                 .to_string()
         }
-        other => format!(r#"{{"ok":false,"error":"unknown cmd {}"}}"#, json_escape(other)),
+        other => format!(
+            r#"{{"ok":false,"error":"unknown cmd {}"}}"#,
+            json_escape(other)
+        ),
     }
 }
 
@@ -626,7 +719,9 @@ pub fn serve(ctrl: Arc<Control>) {
                 // Non-fatal by design: the accessory stack works without a UI, and refusing to
                 // start the whole daemon because a management port is taken would be a worse
                 // failure than losing the device screen.
-                log(&format!("bind 127.0.0.1:{CONTROL_PORT} failed: {e} — device management unavailable"));
+                log(&format!(
+                    "bind 127.0.0.1:{CONTROL_PORT} failed: {e} — device management unavailable"
+                ));
                 return;
             }
         };
@@ -679,7 +774,10 @@ mod tests {
 
     #[test]
     fn parse_addr_accepts_dashes_and_lowercase_and_rejects_junk() {
-        assert_eq!(parse_addr("aa-bb-cc-dd-ee-ff"), parse_addr("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(
+            parse_addr("aa-bb-cc-dd-ee-ff"),
+            parse_addr("AA:BB:CC:DD:EE:FF")
+        );
         assert_eq!(parse_addr("AA:BB:CC:DD:EE"), None);
         assert_eq!(parse_addr("ZZ:BB:CC:DD:EE:FF"), None);
         assert_eq!(parse_addr(""), None);
@@ -707,7 +805,10 @@ mod tests {
         // the JSON the app is mid-parse on and it reports a JSONException instead of our error.
         let c = Control::default();
         let r = handle_request(&c, "{\"cmd\":\"a\rb\"}");
-        assert!(!r.contains('\r') && !r.contains('\n'), "raw control char in response: {r:?}");
+        assert!(
+            !r.contains('\r') && !r.contains('\n'),
+            "raw control char in response: {r:?}"
+        );
         assert!(r.contains("\\r"), "CR should be escaped: {r}");
     }
 
@@ -744,7 +845,11 @@ mod tests {
         let before = c.policy();
         let r = handle_request(&c, r#"{"cmd":"policy","autoConnect":"maybe","order":[]}"#);
         assert!(r.contains("\"ok\":false"), "{r}");
-        assert_eq!(c.policy(), before, "a refused request must not mutate the policy");
+        assert_eq!(
+            c.policy(),
+            before,
+            "a refused request must not mutate the policy"
+        );
     }
 
     #[test]
@@ -753,10 +858,19 @@ mod tests {
         // first-to-connect order. An omitted field must therefore keep its stored value — sending
         // an empty array would wipe an order the UI never showed the user.
         let c = Control::default();
-        c.set_policy(Policy { auto_connect: true, order: vec![[1, 0, 0, 0, 0, 0]] });
-        assert!(handle_request(&c, r#"{"cmd":"policy","autoConnect":false}"#).contains("\"ok\":true"));
+        c.set_policy(Policy {
+            auto_connect: true,
+            order: vec![[1, 0, 0, 0, 0, 0]],
+        });
+        assert!(
+            handle_request(&c, r#"{"cmd":"policy","autoConnect":false}"#).contains("\"ok\":true")
+        );
         assert!(!c.policy().auto_connect);
-        assert_eq!(c.policy().order.len(), 1, "an omitted order must not wipe the stored one");
+        assert_eq!(
+            c.policy().order.len(),
+            1,
+            "an omitted order must not wipe the stored one"
+        );
     }
 
     #[test]
@@ -779,15 +893,22 @@ mod tests {
     #[test]
     fn connect_with_an_address_parses_into_mgmt_order() {
         let c = Control::default();
-        assert!(handle_request(&c, r#"{"cmd":"connect","address":"66:55:44:33:22:11"}"#)
-            .contains("\"ok\":true"));
-        assert_eq!(c.take_request(), Some(Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66])));
+        assert!(
+            handle_request(&c, r#"{"cmd":"connect","address":"66:55:44:33:22:11"}"#)
+                .contains("\"ok\":true")
+        );
+        assert_eq!(
+            c.take_request(),
+            Some(Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]))
+        );
     }
 
     #[test]
     fn connect_with_a_bad_address_does_not_queue_anything() {
         let c = Control::default();
-        assert!(handle_request(&c, r#"{"cmd":"connect","address":"nope"}"#).contains("\"ok\":false"));
+        assert!(
+            handle_request(&c, r#"{"cmd":"connect","address":"nope"}"#).contains("\"ok\":false")
+        );
         assert_eq!(c.take_request(), None);
     }
 
@@ -795,9 +916,13 @@ mod tests {
     fn a_pair_answer_reaches_the_slot_the_ssp_agent_polls() {
         let c = Control::new(Arc::new(AtomicBool::new(false)));
         let slot = c.pair_answer();
-        assert!(handle_request(&c, r#"{"cmd":"pair_answer","accept":true}"#).contains("\"ok\":true"));
+        assert!(
+            handle_request(&c, r#"{"cmd":"pair_answer","accept":true}"#).contains("\"ok\":true")
+        );
         assert_eq!(slot.take(), Some(true));
-        assert!(handle_request(&c, r#"{"cmd":"pair_answer","accept":false}"#).contains("\"ok\":true"));
+        assert!(
+            handle_request(&c, r#"{"cmd":"pair_answer","accept":false}"#).contains("\"ok\":true")
+        );
         assert_eq!(slot.take(), Some(false));
         assert_eq!(slot.take(), None);
     }
@@ -808,7 +933,9 @@ mod tests {
         // approved, which is the whole reason this path exists.
         let c = Control::new(Arc::new(AtomicBool::new(false)));
         let slot = c.pair_answer();
-        assert!(handle_request(&c, r#"{"cmd":"pair_answer","accept":"yes"}"#).contains("\"ok\":false"));
+        assert!(
+            handle_request(&c, r#"{"cmd":"pair_answer","accept":"yes"}"#).contains("\"ok\":false")
+        );
         assert!(handle_request(&c, r#"{"cmd":"pair_answer"}"#).contains("\"ok\":false"));
         assert_eq!(slot.take(), None);
     }
@@ -839,7 +966,10 @@ mod tests {
         flag.store(true, Ordering::Release);
         let r = handle_request(&c, r#"{"cmd":"status"}"#);
         assert!(r.contains(r#""active":true"#), "{r}");
-        assert!(r.contains(r#""address":"""#), "no peer is known, so address stays empty: {r}");
+        assert!(
+            r.contains(r#""address":"""#),
+            "no peer is known, so address stays empty: {r}"
+        );
     }
 
     /// The claim is released on EVERY exit from the guarded region, and a second claimer is refused
@@ -858,7 +988,66 @@ mod tests {
             );
         }
         assert!(!flag.load(Ordering::Acquire), "claim not released");
-        assert_eq!(c.session_peer(), None, "peer not cleared — the screen would name a dead session");
+        assert_eq!(
+            c.session_peer(),
+            None,
+            "peer not cleared — the screen would name a dead session"
+        );
+    }
+
+    #[test]
+    fn distinct_phones_can_hold_independent_iap2_slots() {
+        let flag = AtomicBool::new(false);
+        let c = Control::default();
+        let a = [1, 2, 3, 4, 5, 6];
+        let b = [6, 5, 4, 3, 2, 1];
+        let first = SessionClaim::try_claim(&flag, &c, Some(a)).unwrap();
+        let second = SessionClaim::try_claim(&flag, &c, Some(b)).unwrap();
+        assert!(
+            SessionClaim::try_claim(&flag, &c, Some(a)).is_none(),
+            "same phone claimed twice"
+        );
+        assert!(
+            flag.load(Ordering::Acquire),
+            "aggregate activity must remain set"
+        );
+        assert_eq!(c.active_peers().len(), 2);
+
+        drop(first);
+        assert!(
+            flag.load(Ordering::Acquire),
+            "one live phone must keep aggregate activity set"
+        );
+        assert_eq!(c.active_peers(), vec![b]);
+        assert_eq!(c.session_peer(), Some(b));
+        drop(second);
+        assert!(!flag.load(Ordering::Acquire));
+        assert!(c.active_peers().is_empty());
+        assert_eq!(c.session_peer(), None);
+    }
+
+    #[test]
+    fn iap2_slots_have_a_hard_upper_bound() {
+        let flag = AtomicBool::new(false);
+        let c = Control::default();
+        let claims = (0..MAX_IAP2_SLOTS)
+            .map(|n| SessionClaim::try_claim(&flag, &c, Some([n as u8, 1, 2, 3, 4, 5])).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(c.active_peers().len(), MAX_IAP2_SLOTS);
+        assert!(SessionClaim::try_claim(&flag, &c, Some([0xFE, 1, 2, 3, 4, 5])).is_none());
+        assert_eq!(c.active_peers().len(), MAX_IAP2_SLOTS);
+        drop(claims);
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn anonymous_session_remains_exclusive_with_named_slots() {
+        let flag = AtomicBool::new(false);
+        let c = Control::default();
+        let anonymous = SessionClaim::try_claim(&flag, &c, None).unwrap();
+        assert!(SessionClaim::try_claim(&flag, &c, Some([1, 2, 3, 4, 5, 6])).is_none());
+        drop(anonymous);
+        assert!(SessionClaim::try_claim(&flag, &c, Some([1, 2, 3, 4, 5, 6])).is_some());
     }
 
     #[test]
@@ -877,5 +1066,4 @@ mod tests {
             vec![[3, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0]]
         );
     }
-
 }

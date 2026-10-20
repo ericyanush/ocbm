@@ -36,7 +36,9 @@ fn i2c_fd() -> i32 {
     // open handle to the MFi chip's I2C bus and keep it for as long as they live.
     let fd = unsafe { libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
-        eprintln!("[mfi-local] cannot open /dev/i2c-1 (MFi chip) -- retrying on the next transaction");
+        eprintln!(
+            "[mfi-local] cannot open /dev/i2c-1 (MFi chip) -- retrying on the next transaction"
+        );
         return fd;
     }
     *cached = fd;
@@ -292,6 +294,10 @@ pub fn cert() -> Option<Vec<u8>> {
         return None;
     }
     let n = ((lb[0] as usize) << 8) | lb[1] as usize;
+    eprintln!(
+        "[mfi-local] copy_certificate length-register raw={:02x}:{:02x} length={n}",
+        lb[0], lb[1]
+    );
     if n == 0 || n > 2048 {
         return None;
     }

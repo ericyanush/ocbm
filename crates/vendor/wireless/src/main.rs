@@ -117,11 +117,7 @@ fn log_radio_caps() {
 /// Dispatch to whichever RFCOMM implementation this host can use. Both have the identical
 /// signature, including `Ok(None)` on timeout, so the caller is unchanged.
 /// Outbound counterpart of [`rfcomm_accept`], used by `reconnect` for an already-bonded phone.
-fn rfcomm_connect(
-    peer: [u8; 6],
-    channel: u8,
-    timeout_secs: i64,
-) -> std::io::Result<std::fs::File> {
+fn rfcomm_connect(peer: [u8; 6], channel: u8, timeout_secs: i64) -> std::io::Result<std::fs::File> {
     if rfcomm_uspace::selected() {
         rfcomm_uspace::connect_to(peer, channel, timeout_secs)
     } else {
@@ -157,8 +153,10 @@ fn aa_ap_params() -> aa_wireless::wpp::ApParams {
     let bssid = std::fs::read_to_string("/tmp/radio_caps")
         .ok()
         .and_then(|caps| {
-            caps.lines()
-                .find_map(|l| l.strip_prefix("RADIO_WLAN_MAC=").map(|v| v.trim().to_string()))
+            caps.lines().find_map(|l| {
+                l.strip_prefix("RADIO_WLAN_MAC=")
+                    .map(|v| v.trim().to_string())
+            })
         })
         .unwrap_or_default()
         .to_uppercase();
@@ -208,7 +206,11 @@ fn hold_aa_channel(sock: &std::fs::File, shutdown: &AtomicBool) {
         if box_common::flags::owner() != box_common::flags::ProjectionOwner::WirelessAa {
             break "owner flag changed";
         }
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
@@ -226,7 +228,10 @@ fn hold_aa_channel(sock: &std::fs::File, shutdown: &AtomicBool) {
         }
         if r < 0 {
             let e = std::io::Error::last_os_error();
-            if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
                 continue;
             }
             break "read error";
@@ -330,7 +335,12 @@ fn run_active_session(
         // that exits leaves the box discoverable but unable to pair for the rest of the session.
         while !t.load(Ordering::Relaxed) {
             let on_pair_rejected = || bt_driver::publish_bt_phase(ocbm_proto::BTP_PAIR_REJECTED);
-            match ssp_agent::run(CONTROLLER_INDEX, &t, Some(&on_pair_rejected), Some(&pair_answer)) {
+            match ssp_agent::run(
+                CONTROLLER_INDEX,
+                &t,
+                Some(&on_pair_rejected),
+                Some(&pair_answer),
+            ) {
                 Ok(()) => break,
                 Err(e) => {
                     log(&format!("SSP agent exited: {e} -- restarting"));
@@ -386,9 +396,10 @@ fn run_active_session(
         }
     });
 
-    // One transport is ever an active connection target at a time. `session_active` lets the
-    // additive Model-B reconnect path (below) stand down whenever the accept path — or a prior
-    // reconnect — already owns a live iAP2 session, so the two never fight over the phone.
+    // The projection arbiter still permits one active A/V transport. Within wireless CarPlay,
+    // distinct phone-initiated iAP2 sessions may hold independent bounded slots. `session_active` lets the
+    // The reconnect path and inbound accept path share per-peer slot claims: distinct phones may
+    // progress concurrently, while an inbound retry for a peer being dialled is rejected.
     // `session_active` and `ctrl` are owned by main() and passed in — both are PROCESS-lifetime, not
     // per-session. See control::serve for why a per-session Control orphaned itself.
     // Belt and braces after an abnormal previous session: nothing should be claimed at entry.
@@ -396,7 +407,7 @@ fn run_active_session(
 
     let rfcomm_shutdown = Arc::new(AtomicBool::new(false));
     let t = rfcomm_shutdown.clone();
-    let rfcomm_name = accessory_name.clone(); // moved into the accept thread for the iAP2 identify
+    let rfcomm_name = accessory_name.clone();
     let accept_active = session_active.clone();
     let accept_ctrl = ctrl.clone();
     let rfcomm_handle = thread::spawn(move || loop {
@@ -406,26 +417,29 @@ fn run_active_session(
         match rfcomm_accept(RFCOMM_CHANNEL, &t) {
             Ok(Some((sock, peer))) => {
                 log("RFCOMM client connected -- starting iAP2 handshake");
-                // Claim the single-session slot ATOMICALLY (compare_exchange, not a plain store) so the
-                // accept path and the Model-B reconnect path can never run two concurrent bt_driver::run
-                // sessions against the same phone, and neither clobbers the other's flag. If a reconnect
-                // attempt already owns the slot, drop this inbound connect and let the phone retry once the
-                // live session ends.
-                // `_claim` also publishes the session to the device screen and releases BOTH the
-                // flag and the peer on every exit from this block.
-                //
-                // NB `_claim`, not `_`: `let _ = ...` drops the guard IMMEDIATELY and would release
-                // the claim before the driver even starts.
-                let Some(_claim) =
-                    control::SessionClaim::try_claim(&accept_active, &accept_ctrl, Some(peer))
-                else {
-                    log("session already active (reconnect in progress) -- dropping inbound connect");
-                    continue;
-                };
-                // `accept_one` captures the remote bdaddr from accept(2), so publish the exact
-                // iAP2 peer before authentication/handoff phases reach the host.
-                bt_driver::run(sock, &rfcomm_name, &t);
-                log("RFCOMM session ended");
+                let worker_shutdown = t.clone();
+                let worker_ctrl = accept_ctrl.clone();
+                let worker_active = accept_active.clone();
+                let worker_name = rfcomm_name.clone();
+                thread::spawn(move || {
+                    // Keep the accept loop live while this phone's iAP2 session remains open. The
+                    // claim is per Bluetooth peer, so a distinct phone can occupy another slot but
+                    // a duplicate inbound/outbound connection for this peer cannot race it.
+                    let Some(_claim) =
+                        control::SessionClaim::try_claim(&worker_active, &worker_ctrl, Some(peer))
+                    else {
+                        log(&format!(
+                            "duplicate iAP2 session for {} -- dropping inbound connect",
+                            control::fmt_addr(&peer)
+                        ));
+                        return;
+                    };
+                    bt_driver::run(sock, &worker_name, peer, &worker_shutdown);
+                    log(&format!(
+                        "RFCOMM session ended for {}",
+                        control::fmt_addr(&peer)
+                    ));
+                });
             }
             Ok(None) => break, // shutdown
             Err(e) => {

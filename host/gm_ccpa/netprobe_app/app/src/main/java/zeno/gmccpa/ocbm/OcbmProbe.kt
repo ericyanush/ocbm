@@ -72,14 +72,14 @@ class OcbmProbe(context: Context) {
         return c to generation
     }
 
-    private fun <T> relayMfi(operation: String, call: (OcbmClient) -> T?): T {
+    private fun <T> relayMfi(operation: String, requester: String, call: (OcbmClient) -> T?): T {
         val (c, generation) = readyMfiClient()
-        log.i("relay $operation start generation=$generation")
+        log.i("relay $operation start requester=$requester generation=$generation")
         val result = call(c) ?: throw java.io.IOException("CH_MFI $operation failed (generation=$generation)")
         if (client !== c || linkGeneration != generation || mfiReadyGeneration != generation || c.stopped) {
             throw java.io.IOException("CH_MFI $operation crossed adapter generation boundary (generation=$generation)")
         }
-        log.i("relay $operation complete generation=$generation")
+        log.i("relay $operation complete requester=$requester generation=$generation")
         return result
     }
 
@@ -890,7 +890,9 @@ class OcbmProbe(context: Context) {
             throw java.io.IOException("CH_MFI $what")
         }
         override fun copyCertificate(): ByteArray {
-            val r = runCatching { relayMfi("copy_certificate") { it.mfiCertificate() } }.getOrElse {
+            val r = runCatching { relayMfi("copy_certificate", "airplay-auth-setup") {
+                it.mfiCertificate(OcbmClient.MFI_CERT_TIMEOUT_MS, "airplay-auth-setup")
+            } }.getOrElse {
                 zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay cert: transport/readiness failure")
                 relayFail(it.message ?: "cert transport failure")
             }
@@ -901,7 +903,9 @@ class OcbmProbe(context: Context) {
             return r.payload
         }
         override fun createSignature(digest: ByteArray): ByteArray {
-            val r = runCatching { relayMfi("create_signature") { it.mfiSign(digest) } }.getOrElse {
+            val r = runCatching { relayMfi("create_signature", "airplay-auth-setup") {
+                it.mfiSign(digest, OcbmClient.MFI_SIGN_TIMEOUT_MS, "airplay-auth-setup")
+            } }.getOrElse {
                 zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay sign: transport/readiness failure")
                 relayFail(it.message ?: "sign transport failure")
             }
@@ -916,7 +920,9 @@ class OcbmProbe(context: Context) {
         // behind another. The phone-side request timeout it has to fit inside is unmeasured (nearest
         // sourced figure is CarKit's disassembly-confirmed 30 s — see audit 4.8 verdict).
         override fun copyCertificateFast(): ByteArray {
-            val r = runCatching { relayMfi("copy_certificate_fast") { it.mfiCertificate(4_000) } }.getOrElse {
+            val r = runCatching { relayMfi("copy_certificate_fast", "iap2-tunnel") {
+                it.mfiCertificate(4_000, "iap2-tunnel")
+            } }.getOrElse {
                 zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay cert (fast): transport/readiness failure")
                 relayFail(it.message ?: "fast cert transport failure")
             }
@@ -927,7 +933,9 @@ class OcbmProbe(context: Context) {
             return r.payload
         }
         override fun createSignatureFast(digest: ByteArray): ByteArray {
-            val r = runCatching { relayMfi("create_signature_fast") { it.mfiSign(digest, 4_000) } }.getOrElse {
+            val r = runCatching { relayMfi("create_signature_fast", "iap2-tunnel") {
+                it.mfiSign(digest, 4_000, "iap2-tunnel")
+            } }.getOrElse {
                 zeno.gmccpa.logging.SessionSummary.current()?.onMfiFailure("relay sign (fast): transport/readiness failure")
                 relayFail(it.message ?: "fast sign transport failure")
             }

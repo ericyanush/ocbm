@@ -32,6 +32,8 @@ use std::time::{Duration, Instant};
 /// no handle on the OCBM link (different process), the flag is last-write-wins so a missed update
 /// is self-correcting, and a write failure can never affect the handshake it is reporting on.
 const BT_PHASE_FILE: &str = "/tmp/bt_phase";
+const IAP2_SLOT_DIR: &str = "/tmp/ocbm_iap2_slots";
+static PHASE_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Best-effort: reporting must never perturb what it reports.
 ///
@@ -40,10 +42,36 @@ const BT_PHASE_FILE: &str = "/tmp/bt_phase";
 /// window reads "" and parses as no phase at all. Rename is atomic, so a reader sees the previous
 /// phase or the new one. The pid keeps two writers off one temp name.
 pub(crate) fn publish_bt_phase(phase: u8) {
-    let tmp = format!("{BT_PHASE_FILE}.tmp.{}", std::process::id());
-    if std::fs::write(&tmp, phase.to_string()).is_ok() && std::fs::rename(&tmp, BT_PHASE_FILE).is_err() {
+    let tmp = format!(
+        "{BT_PHASE_FILE}.tmp.{}.{}",
+        std::process::id(),
+        PHASE_TMP_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    if std::fs::write(&tmp, phase.to_string()).is_ok()
+        && std::fs::rename(&tmp, BT_PHASE_FILE).is_err()
+    {
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// Publish this link's phase separately so concurrent iPhones cannot overwrite one another's
+/// status. The scalar phase remains as a legacy dashboard hint; OCBM multi-phone clients consume
+/// the per-peer files via `CT_IAP2_SLOT`.
+fn publish_peer_phase(peer: &[u8; 6], phase: u8) {
+    let address = crate::control::fmt_addr(peer).to_ascii_lowercase();
+    if std::fs::create_dir_all(IAP2_SLOT_DIR).is_err() {
+        return;
+    }
+    let path = format!("{IAP2_SLOT_DIR}/{address}");
+    let tmp = format!(
+        "{path}.tmp.{}.{}",
+        std::process::id(),
+        PHASE_TMP_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    if std::fs::write(&tmp, phase.to_string()).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    publish_bt_phase(phase);
 }
 
 /// Map the iAP2 handshake state onto the wire-visible phase. Deliberately coarse: the host uses it
@@ -178,8 +206,8 @@ const MAX_REASSEMBLY: usize = 8192;
 ///
 /// A thin wrapper over [`session`] purely so the phase mirror is un-latched on EVERY exit, including
 /// the three early returns that never enter the loop. See the `publish_bt_phase` call below.
-pub fn run(sock: File, name: &str, shutdown: &AtomicBool) {
-    session(sock, name, shutdown);
+pub fn run(sock: File, name: &str, peer: [u8; 6], shutdown: &AtomicBool) {
+    session(sock, name, peer, shutdown);
     // Un-latch the phase mirror (audit 3.3). `/tmp/bt_phase` is last-write-wins with no unlink, so
     // without this the deepest phase reached since boot stays readable forever and `ocbmd` re-emits
     // it to every fresh subscriber -- the host sees a phantom "phone detected" long after the phone
@@ -189,10 +217,13 @@ pub fn run(sock: File, name: &str, shutdown: &AtomicBool) {
     // (detect-write, initial-SYN-write, setsockopt) that leave before the loop is entered. Those
     // paths are exactly the ones that fire when a phone drops the RFCOMM link during bring-up, so
     // they are the last place the latch should survive.
+    let address = crate::control::fmt_addr(&peer).to_ascii_lowercase();
+    let path = format!("{IAP2_SLOT_DIR}/{address}");
+    let _ = std::fs::remove_file(path);
     publish_bt_phase(ocbm_proto::BTP_IDLE);
 }
 
-fn session(mut sock: File, name: &str, shutdown: &AtomicBool) {
+fn session(mut sock: File, name: &str, peer: [u8; 6], shutdown: &AtomicBool) {
     let budget = Duration::from_secs(120); // pre-Identify handshake budget, matching the wired driver
     let start = Instant::now();
     // A stalled pre-Identify WRITE must honor the budget too, not just shutdown (audit B5): a peer that opens
@@ -293,7 +324,16 @@ fn session(mut sock: File, name: &str, shutdown: &AtomicBool) {
                 // complete frames and RETAINS the partial tail for the next read (the old code passed a
                 // fresh `&buf[..n]` each read, dropping any split frame + everything behind it).
                 acc.extend_from_slice(&buf[..n]);
-                if process(&mut acc, &mut link, &mut st, &mut sock, name, &abort, &identified_flag) {
+                if process(
+                    &mut acc,
+                    &mut link,
+                    &mut st,
+                    &mut sock,
+                    name,
+                    &peer,
+                    &abort,
+                    &identified_flag,
+                ) {
                     break; // Abort
                 }
             }
@@ -363,6 +403,7 @@ fn process(
     st: &mut State,
     sock: &mut File,
     name: &str,
+    peer: &[u8; 6],
     abort: &dyn Fn() -> bool,
     identified: &AtomicBool,
 ) -> bool {
@@ -371,7 +412,16 @@ fn process(
         match link::packet_len(&acc[off..]) {
             // A complete valid-SOP frame at `off` -- dispatch it and advance past it.
             Some(plen) => {
-                if process_one(&acc[off..off + plen], link, st, sock, name, abort, identified) {
+                if process_one(
+                    &acc[off..off + plen],
+                    link,
+                    st,
+                    sock,
+                    name,
+                    peer,
+                    abort,
+                    identified,
+                ) {
                     acc.drain(..off + plen); // drop everything consumed incl. the aborting frame
                     return true; // Abort propagates immediately
                 }
@@ -402,9 +452,9 @@ fn process(
         }
     }
     acc.drain(..off); // drop consumed frames + skipped non-frame bytes; RETAIN any partial tail (#21)
-    // Belt-and-suspenders: after resync, `acc` holds at most one genuine partial frame (< advertised
-    // MaxRcvPacketLength 4096). If a corrupt-length `FF 5A` frame declares a size that never arrives and
-    // pushes it past the cap, drop it and let retransmit / re-SYN recover.
+                      // Belt-and-suspenders: after resync, `acc` holds at most one genuine partial frame (< advertised
+                      // MaxRcvPacketLength 4096). If a corrupt-length `FF 5A` frame declares a size that never arrives and
+                      // pushes it past the cap, drop it and let retransmit / re-SYN recover.
     if acc.len() > MAX_REASSEMBLY {
         log(&format!(
             "RFCOMM reassembly: dropping {} desynced bytes (no frame boundary)",
@@ -422,6 +472,7 @@ fn process_one(
     st: &mut State,
     sock: &mut File,
     name: &str,
+    peer: &[u8; 6],
     abort: &dyn Fn() -> bool,
     identified: &AtomicBool,
 ) -> bool {
@@ -430,7 +481,7 @@ fn process_one(
     };
     if rx.is_syn_ack() {
         log("SYN-ACK -- link up");
-        publish_bt_phase(ocbm_proto::BTP_LINK_UP);
+        publish_peer_phase(peer, ocbm_proto::BTP_LINK_UP);
         return !write_interruptible(sock, &link.build_ack(), abort);
     }
     if rx.payload.is_empty() {
@@ -466,7 +517,7 @@ fn process_one(
             "RX 0x5702 RequestAccessoryWiFiConfig -> replying 0x5703 (ssid={:?} ch={:?} sec={:?})",
             cfg.ssid, cfg.channel, cfg.security_type
         ));
-        publish_bt_phase(ocbm_proto::BTP_WIFI_HANDOFF);
+        publish_peer_phase(peer, ocbm_proto::BTP_WIFI_HANDOFF);
         let body = crate::wifi_handoff::build_accessory_wifi_configuration_information(&cfg);
         let security_code = cfg.security_type.map(|v| v as u8);
         // 0x5703 has only SSID, passphrase, security type and channel; it does not carry a
@@ -582,7 +633,7 @@ fn process_one(
         ));
     }
     let (next, action) = state::on_message(*st, msg_id, &rx.payload);
-    match execute(action, link, sock, name, abort) {
+    match execute(action, link, sock, name, peer, abort) {
         ExecResult::Commit => {
             *st = next;
             // Latch HERE, not at the next loop top, so `abort` stops applying the pre-Identify
@@ -592,7 +643,7 @@ fn process_one(
             if *st >= State::Identified {
                 identified.store(true, Ordering::Relaxed);
             }
-            publish_bt_phase(phase_for(*st));
+            publish_peer_phase(peer, phase_for(*st));
             log(&format!("RX 0x{msg_id:04X} -> {st:?}"));
             false
         }
@@ -634,41 +685,60 @@ fn execute(
     link: &mut Link,
     sock: &mut File,
     name: &str,
+    peer: &[u8; 6],
     abort: &dyn Fn() -> bool,
 ) -> ExecResult {
     match action {
-        Action::SendCert => match mfi_retry("cert", mfi::cert) {
-            Some(cert) => {
-                // AuthenticationCertificate (0xAA01, Source::Accessory): param 0 = AuthenticationCertificate (blob).
-                let body = message::group_one(0x0000, &cert);
-                if write_interruptible(
-                    sock,
-                    &link.build_msg(1, spec::MSG_AUTHENTICATION_CERTIFICATE, &body),
-                    abort,
-                ) {
-                    ExecResult::Commit
-                } else {
-                    ExecResult::Abort
+        Action::SendCert => {
+            let peer_mac = crate::control::fmt_addr(peer);
+            log(&format!(
+                "MFi request source=bluetooth-iap2 op=copy_certificate peer={peer_mac}"
+            ));
+            match mfi_retry("cert", mfi::cert) {
+                Some(cert) => {
+                    log(&format!("MFi result source=bluetooth-iap2 op=copy_certificate peer={peer_mac} status=ok bytes={}", cert.len()));
+                    // AuthenticationCertificate (0xAA01, Source::Accessory): param 0 = AuthenticationCertificate (blob).
+                    let body = message::group_one(0x0000, &cert);
+                    if write_interruptible(
+                        sock,
+                        &link.build_msg(1, spec::MSG_AUTHENTICATION_CERTIFICATE, &body),
+                        abort,
+                    ) {
+                        ExecResult::Commit
+                    } else {
+                        ExecResult::Abort
+                    }
+                }
+                None => {
+                    log(&format!("MFi result source=bluetooth-iap2 op=copy_certificate peer={peer_mac} status=failed"));
+                    ExecResult::NoCommit
                 }
             }
-            None => ExecResult::NoCommit,
-        },
-        Action::SignChallenge(chal) => match mfi_retry("sign", || mfi::sign(&chal)) {
-            Some(sig) => {
-                // AuthenticationResponse (0xAA03, Source::Accessory): param 0 = AuthenticationResponse (blob).
-                let body = message::group_one(0x0000, &sig);
-                if write_interruptible(
-                    sock,
-                    &link.build_msg(1, spec::MSG_AUTHENTICATION_RESPONSE, &body),
-                    abort,
-                ) {
-                    ExecResult::Commit
-                } else {
-                    ExecResult::Abort
+        }
+        Action::SignChallenge(chal) => {
+            let peer_mac = crate::control::fmt_addr(peer);
+            log(&format!("MFi request source=bluetooth-iap2 op=create_signature peer={peer_mac} digest_bytes={}", chal.len()));
+            match mfi_retry("sign", || mfi::sign(&chal)) {
+                Some(sig) => {
+                    log(&format!("MFi result source=bluetooth-iap2 op=create_signature peer={peer_mac} status=ok bytes={}", sig.len()));
+                    // AuthenticationResponse (0xAA03, Source::Accessory): param 0 = AuthenticationResponse (blob).
+                    let body = message::group_one(0x0000, &sig);
+                    if write_interruptible(
+                        sock,
+                        &link.build_msg(1, spec::MSG_AUTHENTICATION_RESPONSE, &body),
+                        abort,
+                    ) {
+                        ExecResult::Commit
+                    } else {
+                        ExecResult::Abort
+                    }
+                }
+                None => {
+                    log(&format!("MFi result source=bluetooth-iap2 op=create_signature peer={peer_mac} status=failed"));
+                    ExecResult::NoCommit
                 }
             }
-            None => ExecResult::NoCommit,
-        },
+        }
         Action::SendIdentify => {
             let ib = message::build_ident_info(
                 name,
@@ -782,12 +852,30 @@ mod tests {
         let mut st = State::Init;
         let flag = AtomicBool::new(false);
         let mut acc: Vec<u8> = vec![link::SOP1, link::SOP2, 0x00, 0x05, 1, 2, 3, 4, 5];
-        assert!(!process(&mut acc, &mut link, &mut st, &mut sock, "test", &|| false, &flag));
+        assert!(!process(
+            &mut acc,
+            &mut link,
+            &mut st,
+            &mut sock,
+            "test",
+            &[1, 2, 3, 4, 5, 6],
+            &|| false,
+            &flag
+        ));
         assert!(acc.is_empty(), "corrupt head retained: {acc:02X?}");
 
         // A genuinely partial frame (declared length >= 9, bytes still arriving) is still retained.
         let mut acc: Vec<u8> = vec![link::SOP1, link::SOP2, 0x00, 0x20, 1, 2, 3, 4, 5];
-        assert!(!process(&mut acc, &mut link, &mut st, &mut sock, "test", &|| false, &flag));
+        assert!(!process(
+            &mut acc,
+            &mut link,
+            &mut st,
+            &mut sock,
+            "test",
+            &[1, 2, 3, 4, 5, 6],
+            &|| false,
+            &flag
+        ));
         assert_eq!(acc.len(), 9, "partial frame must be retained");
     }
 
@@ -796,14 +884,21 @@ mod tests {
     /// mgmt little-endian into the display order `build_ident_info` writes.
     #[test]
     fn accessory_bt_mac_is_this_units_own_address_or_a_locally_administered_placeholder() {
-        assert_eq!(PLACEHOLDER_BT_MAC[0] & 0x02, 0x02, "not locally administered");
+        assert_eq!(
+            PLACEHOLDER_BT_MAC[0] & 0x02,
+            0x02,
+            "not locally administered"
+        );
         let mut a = crate::control::parse_addr("11:22:33:44:55:66").unwrap();
         a.reverse();
         assert_eq!(a, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
     }
 
     fn count_syns(stream: &[u8]) -> usize {
-        stream.windows(link::SYN_PARAMS.len()).filter(|w| *w == link::SYN_PARAMS).count()
+        stream
+            .windows(link::SYN_PARAMS.len())
+            .filter(|w| *w == link::SYN_PARAMS)
+            .count()
     }
 
     /// THE CAP THAT KEEPS THE SESSION ALIVE. Apple's device link counts RECEIVED SYNs and fires
@@ -824,7 +919,10 @@ mod tests {
             let mut b = [0u8; 4096];
             let deadline = Instant::now() + Duration::from_secs(13);
             unsafe {
-                let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
+                let tv = libc::timeval {
+                    tv_sec: 1,
+                    tv_usec: 0,
+                };
                 libc::setsockopt(
                     std::os::unix::io::AsRawFd::as_raw_fd(&peer),
                     libc::SOL_SOCKET,
@@ -844,7 +942,7 @@ mod tests {
         });
 
         std::thread::scope(|sc| {
-            sc.spawn(|| run(acc, "test-accessory", &shutdown));
+            sc.spawn(|| run(acc, "test-accessory", [1, 2, 3, 4, 5, 6], &shutdown));
             std::thread::sleep(Duration::from_secs(13));
             shutdown.store(true, Ordering::Relaxed);
         });
@@ -856,7 +954,10 @@ mod tests {
             "sent {syns} SYNs in 13 s -- Apple disconnects at the {APPLE_DISCONNECT_AT}th; \
              the resend budget in `run` is missing or too large"
         );
-        assert!(syns >= 2, "expected the initial SYN plus at least one resend, got {syns}");
+        assert!(
+            syns >= 2,
+            "expected the initial SYN plus at least one resend, got {syns}"
+        );
         assert!(
             seen.starts_with(&link::DETECT),
             "the detect prelude must still lead the stream"
@@ -875,7 +976,7 @@ mod tests {
         drop(peer);
         publish_bt_phase(ocbm_proto::BTP_IDENTIFIED); // pretend a previous session got deep
         let shutdown = AtomicBool::new(false);
-        run(acc, "test-accessory", &shutdown);
+        run(acc, "test-accessory", [1, 2, 3, 4, 5, 6], &shutdown);
         assert_eq!(
             std::fs::read_to_string(BT_PHASE_FILE).unwrap().trim(),
             ocbm_proto::BTP_IDLE.to_string(),
@@ -886,7 +987,7 @@ mod tests {
         let (acc2, peer2) = pair();
         publish_bt_phase(ocbm_proto::BTP_IDENTIFIED);
         std::thread::scope(|sc| {
-            let h = sc.spawn(|| run(acc2, "test-accessory", &shutdown));
+            let h = sc.spawn(|| run(acc2, "test-accessory", [1, 2, 3, 4, 5, 6], &shutdown));
             drop(peer2);
             h.join().unwrap();
         });

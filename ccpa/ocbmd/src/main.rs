@@ -558,6 +558,10 @@ impl Mfi {
         let mut lb = [0u8; 2];
         self.rd(0x30, &mut lb)?;
         let n = ((lb[0] as usize) << 8) | lb[1] as usize;
+        eprintln!(
+            "[mfi] copy_certificate length-register raw={:02x}:{:02x} length={n}",
+            lb[0], lb[1]
+        );
         if n == 0 || n > 2048 {
             return Err(MfiError::InvalidLength {
                 what: "certificate",
@@ -722,6 +726,10 @@ struct Daemon {
     /// Accepted Bluetooth/iAP2 phone from btd, mirrored before handoff so hosts can target only it.
     active_bt_peer: Option<String>,
     last_active_bt_peer_check: Option<std::time::Instant>,
+    /// Per-phone wireless iAP2 slot phases. Unlike `bt_phase`, this map is authoritative when
+    /// multiple paired phones hold independent links.
+    iap2_slots: HashMap<String, u8>,
+    last_iap2_slot_check: Option<std::time::Instant>,
     /// Last `CT_BOX_HEALTH` bitmask sent. None until the first tick, and reset on a fresh SUBSCRIBE
     /// so a newly attached host is told the current health without waiting for it to change.
     box_health: Option<u8>,
@@ -758,6 +766,7 @@ const HB_UNSUBSCRIBED_NUDGE: Duration = Duration::from_secs(30);
 /// ocbmd does not link that crate).
 const PHONE_IDENT_FILE: &str = "/tmp/phone_identity";
 const ACTIVE_BT_PEER_FILE: &str = "/tmp/ocbm_active_bt_peer";
+const IAP2_SLOT_DIR: &str = "/tmp/ocbm_iap2_slots";
 
 fn valid_bt_mac(s: &str) -> bool {
     let mut parts = s.split(':');
@@ -2227,6 +2236,7 @@ impl Daemon {
         self.pairing_code_tick(now);
         // This must be queued before BTP_WIFI_HANDOFF, which permits host-side discovery/nudging.
         self.active_bt_peer_tick(now);
+        self.iap2_slot_tick(now);
         self.bt_phase_tick(now);
         self.proj_mode_tick(now);
         self.phone_ident_tick(now);
@@ -2429,6 +2439,62 @@ impl Daemon {
                 if now.is_empty() { "unknown" } else { &now }
             );
         }
+    }
+
+    /// Mirror all live per-peer iAP2 slots from btd. A slot event is `[type][MAC:17][phase]`;
+    /// phase zero removes that peer. The source is a directory of atomically replaced files so
+    /// concurrent handshake threads never overwrite one another's phase.
+    fn iap2_slot_tick(&mut self, now_t: Instant) {
+        if !self.subscribed
+            || self.last_iap2_slot_check.is_some_and(|t| now_t.duration_since(t) < Duration::from_millis(250))
+        {
+            return;
+        }
+        let replay = self.last_iap2_slot_check.is_none();
+        self.last_iap2_slot_check = Some(now_t);
+
+        let mut current = HashMap::<String, u8>::new();
+        if let Ok(entries) = std::fs::read_dir(IAP2_SLOT_DIR) {
+            for entry in entries.flatten() {
+                let Some(mac) = entry.file_name().to_str().map(str::to_ascii_uppercase) else {
+                    continue;
+                };
+                if !valid_bt_mac(&mac) {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                let Ok(phase) = raw.trim().parse::<u8>() else {
+                    continue;
+                };
+                if phase != p::BTP_IDLE {
+                    current.insert(mac, phase);
+                }
+            }
+        }
+
+        let mut updates = current
+            .iter()
+            .filter(|(mac, phase)| self.iap2_slots.get(*mac) != Some(*phase))
+            .map(|(mac, phase)| (mac.clone(), *phase))
+            .collect::<Vec<_>>();
+        updates.extend(
+            self.iap2_slots
+                .keys()
+                .filter(|mac| !current.contains_key(*mac))
+                .map(|mac| (mac.clone(), p::BTP_IDLE)),
+        );
+        updates.sort_by(|a, b| a.0.cmp(&b.0));
+        for (mac, phase) in updates {
+            let mut payload = Vec::with_capacity(19);
+            payload.push(p::CT_IAP2_SLOT);
+            payload.extend_from_slice(mac.as_bytes());
+            payload.push(phase);
+            self.send(p::CH_CTRL, mirror_flags(replay), &payload);
+            eprintln!("[ocbmd] iAP2 slot {mac} -> phase {phase}");
+        }
+        self.iap2_slots = current;
     }
 
     /// Mirror the ssp_agent's `/tmp/pairing_code` flag to the host as a `CT_PAIRING_CODE` message on each
@@ -3124,6 +3190,22 @@ impl Daemon {
         } else {
             None
         };
+        let op_name = match op {
+            0x01 => "copy_certificate",
+            0x02 => "create_signature",
+            _ => "unknown",
+        };
+        let active_peer = self.active_bt_peer.as_deref().unwrap_or("none");
+        let slots = self
+            .iap2_slots
+            .iter()
+            .map(|(mac, phase)| format!("{mac}:{phase}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "[mfi] request source=ocbm-host op={op_name} tag={} active_bt_peer={active_peer} iap2_slots=[{slots}]",
+            tag.map(|t| format!("{t:02x}")).unwrap_or_else(|| "none".into())
+        );
         let start = Instant::now();
         let result: Result<Vec<u8>, MfiError> = match op {
             0x01 => self.ensure_mfi().and_then(Mfi::cert),
@@ -3680,9 +3762,13 @@ impl Daemon {
             p::MGMT_ENTER_NCM => {
                 // Arm the persistent NCM flag BEFORE acking so a host that sees status 0 knows the
                 // next boot IS NCM even if the reboot spawn below were to fail. Sticky: the operator
-                // returns the box over ssh (`rm /script/ncm_only; reboot`). Same file effects as
-                // `tools/ocbm_install.sh revert`.
+                // returns the box over ssh by clearing both NCM mode flags and rebooting. Clear a
+                // stale Wi-Fi-backstop flag after ncm_only is safely armed; otherwise NCM remains
+                // active after the return path removes only ncm_only.
                 let armed = std::fs::write("/script/ncm_only", b"").is_ok();
+                if armed {
+                    let _ = std::fs::remove_file("/script/ncm_wifi");
+                }
                 let _ = std::fs::remove_file("/script/ocbm_trial");
                 eprintln!("[ocbmd] mgmt: ENTER_NCM requested by host — flag armed={armed}; rebooting into NCM");
                 self.mgmt_ack(verb, if armed { 0 } else { 1 });
@@ -3875,8 +3961,12 @@ impl Daemon {
                         self.conns.clear();
                         self.hello_cleared_conns = true;
                     }
-                    let mut caps =
-                        p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH;
+                    let mut caps = p::CAP_CONSOLE
+                        | p::CAP_ECHO
+                        | p::CAP_IP
+                        | p::CAP_FILE
+                        | p::CAP_ETH
+                        | p::CAP_MULTI_IAP2;
                     if self.mfi.is_some() {
                         caps |= p::CAP_MFI;
                     }
@@ -4034,6 +4124,8 @@ impl Daemon {
                     self.phone_ident = None; // re-emit who the phone is to this (fresh) host
                     self.active_bt_peer = None; // replay accepted RFCOMM peer before BT phase
                     self.last_active_bt_peer_check = None;
+                    self.iap2_slots.clear();
+                    self.last_iap2_slot_check = None;
                     self.bt_phase = None; // and re-emit the current BT phase, so a host attaching
                                           // mid-handshake is not blind until the next transition
                                           // (which may never come).
@@ -4474,6 +4566,8 @@ fn main() {
         last_phone_ident_check: None,
         active_bt_peer: None,
         last_active_bt_peer_check: None,
+        iap2_slots: HashMap::new(),
+        last_iap2_slot_check: None,
         host_replaced: false,
         cfg: Vec::new(),
         input_sock: None,
@@ -5021,6 +5115,8 @@ mod tests {
             last_phone_ident_check: None,
             active_bt_peer: None,
             last_active_bt_peer_check: None,
+            iap2_slots: HashMap::new(),
+            last_iap2_slot_check: None,
             host_replaced: false,
             cfg: Vec::new(),
             input_sock: None,

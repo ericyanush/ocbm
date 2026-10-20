@@ -337,7 +337,11 @@ pub fn ensure_av_layer() {
                 break;
             }
             if i == 9 {
-                let _ = Command::new("pkill").arg("-9").arg("-x").arg("carplayd").status();
+                let _ = Command::new("pkill")
+                    .arg("-9")
+                    .arg("-x")
+                    .arg("carplayd")
+                    .status();
             }
             std::thread::sleep(Duration::from_millis(100));
         }
