@@ -30,7 +30,7 @@ include(":app")
 //
 // :app talks OCBM to a CCPA over USB. :projection consumes the same seam bytes straight off
 // localhost on the Pi. Different transport, same seam — see ProjectionSeamServer.
-include(":projection")
+//include(":projection")
 
 // Compile-only @SystemApi declarations for android.car. The public SDK stub strips every
 // projection API; see car-system-stubs/src/main/java/android/car/CarProjectionManager.java.
