@@ -99,6 +99,32 @@ pub fn group_one(pid: u16, value: &[u8]) -> Vec<u8> {
     g.0
 }
 
+/// Add the wireless StartSession capability pair without selecting a USB bearer.
+pub fn with_wireless_start_session(ident: Vec<u8>) -> Vec<u8> {
+    let mut result = Vec::with_capacity(ident.len() + 4);
+    let mut offset = 0;
+    while offset + 4 <= ident.len() {
+        let len = u16::from_be_bytes([ident[offset], ident[offset + 1]]) as usize;
+        assert!(len >= 4 && offset + len <= ident.len(), "invalid locally generated identification");
+        let pid = u16::from_be_bytes([ident[offset + 2], ident[offset + 3]]);
+        let extra = match pid { 6 => Some(0x4301u16), 7 => Some(0x4300u16), _ => None };
+        if let Some(id) = extra {
+            if ident[offset + 4..offset + len].chunks_exact(2).any(|v| v == id.to_be_bytes()) {
+                result.extend_from_slice(&ident[offset..offset + len]);
+                offset += len;
+                continue;
+            }
+            let size = u16::try_from(len + 2).expect("identification message list too long");
+            result.extend_from_slice(&size.to_be_bytes());
+            result.extend_from_slice(&ident[offset + 2..offset + len]);
+            result.extend_from_slice(&id.to_be_bytes());
+        } else { result.extend_from_slice(&ident[offset..offset + len]); }
+        offset += len;
+    }
+    assert_eq!(offset, ident.len());
+    result
+}
+
 /// A raw BE16 list (used for the sent/received message-id lists inside params 6/7).
 fn be16_list(ids: &[u16]) -> Vec<u8> {
     let mut v = Vec::with_capacity(ids.len() * 2);
@@ -1062,6 +1088,35 @@ pub fn build_location_information_component(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_session_declarations_are_opt_in_idempotent_and_preserve_other_groups() {
+        let baseline = proven_ident_body("CarLink", TransportComponent::Wireless { bt_mac: [1, 2, 3, 4, 5, 6] });
+        let experimental = with_wireless_start_session(baseline.clone());
+        assert_eq!(with_wireless_start_session(experimental.clone()), experimental);
+        let groups = |bytes: &[u8]| {
+            let mut groups = Vec::new();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+                let id = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]);
+                groups.push((id, bytes[offset + 4..offset + len].to_vec()));
+                offset += len;
+            }
+            groups
+        };
+        let old = groups(&baseline);
+        let new = groups(&experimental);
+        assert_eq!(old.len(), new.len());
+        for ((id, before), (after_id, after)) in old.iter().zip(&new) {
+            assert_eq!(id, after_id);
+            if *id == 6 || *id == 7 {
+                let extra = if *id == 6 { 0x4301u16 } else { 0x4300u16 };
+                assert!(!before.chunks_exact(2).any(|v| v == extra.to_be_bytes()));
+                assert_eq!(after, &[before.as_slice(), &extra.to_be_bytes()].concat());
+            } else { assert_eq!(before, after); }
+        }
+    }
 
     /// Build an Identify body with the compiled-default proven policy + empty skip PINNED explicitly,
     /// so a byte-pinning test is hermetic against `/tmp/carplay_metadata` / `CARPLAY_METADATA*` (audit

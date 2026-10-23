@@ -14,3 +14,4 @@ carplay-metadata = { path = "../metadata" }
 # daemons are ever consolidated into a single multi-applet binary.
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+carplay-start-session = { path = "../../carplay-start-session" }

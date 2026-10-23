@@ -61,6 +61,7 @@ name = "carplay-iap2-core"
 version = "0.1.0"
 dependencies = [
  "carplay-metadata",
+ "carplay-start-session",
  "portable-atomic",
  "serde",
  "serde_yaml",
@@ -82,6 +83,14 @@ name = "carplay-metadata"
 version = "0.1.0"
 dependencies = [
  "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "carplay-start-session"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

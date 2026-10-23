@@ -325,6 +325,18 @@ pub fn parse_msg_id(payload: &[u8]) -> Option<u16> {
     Some(((payload[4] as u16) << 8) | payload[5] as u16)
 }
 
+/// Extract the declared control-message body, excluding the link checksum retained in
+/// `Rx.payload`. Call only after `Link::parse` has verified the frame.
+/// The message length includes its six-byte header, but excludes the link checksum.
+pub fn parse_msg_body(payload: &[u8]) -> Option<&[u8]> {
+    parse_msg_id(payload)?;
+    let declared = u16::from_be_bytes([payload[2], payload[3]]) as usize;
+    if declared < 6 || payload.len() != declared + 1 {
+        return None;
+    }
+    Some(&payload[6..declared])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +402,27 @@ mod tests {
         assert_eq!(pl, vec![0x40, 0x40, 0x00, 0x09, 0xAA, 0x01, 1, 2, 3]);
         assert_eq!(parse_msg_id(&pl), Some(0xAA01));
         assert_eq!(parse_msg_id(&[0x40, 0x41]), None);
+    }
+
+    #[test]
+    fn framed_availability_body_excludes_link_checksum() {
+        // WirelessAttributes { Available=true }. Link::parse intentionally retains the checksum.
+        let body = [0, 9, 0, 1, 0, 5, 0, 0, 1];
+        let packet = Link::new().build_msg(1, 0x4300, &body);
+        let rx = Link::new().parse(&packet).unwrap();
+        assert_eq!(rx.payload.len(), 6 + body.len() + 1);
+        assert!(crate::session::parse_carplay_availability(&rx.payload[6..]).is_err());
+        let extracted = parse_msg_body(&rx.payload).unwrap();
+        assert_eq!(extracted, body);
+        let parsed = crate::session::parse_carplay_availability(extracted).unwrap();
+        assert_eq!(parsed.wireless.unwrap().available, Some(true));
+        assert!(parse_msg_body(&msg_payload(0x4300, &body)).is_none());
+        // A valid link checksum does not excuse an invalid control-message length.
+        let mut bad = rx.payload.clone();
+        bad[3] += 1;
+        assert!(parse_msg_body(&bad).is_none());
+        bad[3] = 5;
+        assert!(parse_msg_body(&bad).is_none());
     }
 
     #[test]

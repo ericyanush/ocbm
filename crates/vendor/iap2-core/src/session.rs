@@ -14,12 +14,11 @@
 //!   IP/security), Port, DeviceIdentifier, PublicKey, versions, AssetInformation, and the
 //!   SupportsMutualAuthentication flag. We BUILD this.
 //!
-//! The live drivers do not send this message. Previous tests declared the session-start pair
-//! without implementing the resulting handshake and stalled session setup (see `message.rs`
-//! and docs/carplay/02_SESSION_LIFECYCLE.md). The current wired bearer uses the USB transport's
-//! `TransportSupportsCarPlay` flag; wireless uses the 0x5702/0x5703 credential exchange and mDNS.
-//! Completing this serializer does not enable either driver's 0x4301 handshake. Those historical
-//! declaration-only tests do not establish that a complete wireless StartSession flow cannot work.
+//! The wired driver remains unchanged. Wireless defaults to the proven credential/mDNS path;
+//! the optional native AAOS StartSession flow is owned by `wireless::native_start`, not this
+//! codec. That flow waits for identified wireless availability and a host-selected endpoint.
+//! Earlier declaration-only experiments did not implement the complete handshake; see
+//! docs/wireless/NATIVE_START_SESSION.md for the opt-in implementation and rollout.
 //!
 //! Param ids below are Apple's; they are not (yet) mirrored in `spec.rs` (which only carries the
 //! IdentificationInformation / NowPlaying / RouteGuidance / CallState param submodules) — see the
@@ -382,6 +381,7 @@ pub struct CarPlayAvailability {
 pub enum ParseError {
     /// A TLV group's declared length is < 4 or overruns the buffer at the given offset.
     Truncated(usize),
+    InvalidAvailability,
 }
 
 /// Walk a flat TLV buffer (`[group_len BE16][pid BE16][value(group_len-4)]`…) yielding
@@ -398,12 +398,13 @@ fn walk_tlvs(buf: &[u8]) -> Result<Vec<(u16, &[u8])>, ParseError> {
         out.push((pid, &buf[i + 4..i + glen]));
         i += glen;
     }
+    if i != buf.len() { return Err(ParseError::Truncated(i)); }
     Ok(out)
 }
 
-/// Decode an iAP2 `bool` value (single byte, non-zero = true). Empty value decodes as `None`.
-fn decode_bool(v: &[u8]) -> Option<bool> {
-    v.first().map(|&b| b != 0)
+/// A present availability flag must contain exactly one canonical Boolean byte.
+fn decode_bool(v: &[u8]) -> Result<bool, ParseError> {
+    match v { [0] => Ok(false), [1] => Ok(true), _ => Err(ParseError::InvalidAvailability) }
 }
 
 /// Decode an iAP2 NUL-terminated `utf8` value into an owned `String` (lossy on invalid UTF-8),
@@ -420,38 +421,48 @@ pub fn parse_carplay_availability(body: &[u8]) -> Result<CarPlayAvailability, Pa
     for (pid, value) in walk_tlvs(body)? {
         match pid {
             availability::WIRED_ATTRIBUTES => {
+                if out.wired.is_some() { return Err(ParseError::InvalidAvailability); }
                 let mut b = BearerAvailability::default();
                 for (sub, sv) in walk_tlvs(value)? {
                     match sub {
-                        availability::wired::AVAILABLE => b.available = decode_bool(sv),
+                        availability::wired::AVAILABLE => {
+                            if b.available.replace(decode_bool(sv)?).is_some() { return Err(ParseError::InvalidAvailability); }
+                        }
                         availability::wired::USB_TRANSPORT_IDENTIFIER => {
                             b.transport_identifier = Some(decode_str(sv))
                         }
                         _ => {}
                     }
                 }
+                if b.available.is_none() { return Err(ParseError::InvalidAvailability); }
                 out.wired = Some(b);
             }
             availability::WIRELESS_ATTRIBUTES => {
+                if out.wireless.is_some() { return Err(ParseError::InvalidAvailability); }
                 let mut b = BearerAvailability::default();
                 for (sub, sv) in walk_tlvs(value)? {
                     match sub {
-                        availability::wireless::AVAILABLE => b.available = decode_bool(sv),
+                        availability::wireless::AVAILABLE => {
+                            if b.available.replace(decode_bool(sv)?).is_some() { return Err(ParseError::InvalidAvailability); }
+                        }
                         availability::wireless::BLUETOOTH_TRANSPORT_IDENTIFIER => {
                             b.transport_identifier = Some(decode_str(sv))
                         }
                         _ => {}
                     }
                 }
+                if b.available.is_none() { return Err(ParseError::InvalidAvailability); }
                 out.wireless = Some(b);
             }
             availability::THEME_ASSETS_ATTRIBUTES => {
+                if out.theme_assets.is_some() { return Err(ParseError::InvalidAvailability); }
                 let mut b = BearerAvailability::default();
                 for (sub, sv) in walk_tlvs(value)? {
                     if sub == availability::theme_assets::AVAILABLE {
-                        b.available = decode_bool(sv);
+                        if b.available.replace(decode_bool(sv)?).is_some() { return Err(ParseError::InvalidAvailability); }
                     }
                 }
+                if b.available.is_none() { return Err(ParseError::InvalidAvailability); }
                 out.theme_assets = Some(b);
             }
             _ => {}
@@ -739,5 +750,26 @@ mod tests {
         body.u16v(0x00FF, 0x1234); // unknown top-level param
         let parsed = parse_carplay_availability(&body.0).unwrap();
         assert_eq!(parsed, CarPlayAvailability::default());
+    }
+
+    #[test]
+    fn availability_rejects_missing_duplicate_and_noncanonical_flags() {
+        for flag in [vec![], vec![2], vec![1, 0]] {
+            let mut group = Tlv::new();
+            group.bytes(availability::wireless::AVAILABLE, &flag);
+            let mut body = Tlv::new();
+            body.bytes(availability::WIRELESS_ATTRIBUTES, &group.0);
+            assert!(parse_carplay_availability(&body.0).is_err());
+        }
+        let mut missing = Tlv::new();
+        missing.bytes(availability::WIRELESS_ATTRIBUTES, &[]);
+        assert!(parse_carplay_availability(&missing.0).is_err());
+        let mut group = Tlv::new();
+        group.boolv(availability::wireless::AVAILABLE, false);
+        group.boolv(availability::wireless::AVAILABLE, true);
+        let mut duplicate = Tlv::new();
+        duplicate.bytes(availability::WIRELESS_ATTRIBUTES, &group.0);
+        assert!(parse_carplay_availability(&duplicate.0).is_err());
+        assert!(parse_carplay_availability(&[0]).is_err());
     }
 }

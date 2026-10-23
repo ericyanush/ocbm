@@ -729,6 +729,8 @@ struct Daemon {
     /// Per-phone wireless iAP2 slot phases. Unlike `bt_phase`, this map is authoritative when
     /// multiple paired phones hold independent links.
     iap2_slots: HashMap<String, u8>,
+    start_events: HashMap<String, Vec<u8>>,
+    last_start_check: Option<Instant>,
     last_iap2_slot_check: Option<std::time::Instant>,
     /// Last `CT_BOX_HEALTH` bitmask sent. None until the first tick, and reset on a fresh SUBSCRIBE
     /// so a newly attached host is told the current health without waiting for it to change.
@@ -2044,6 +2046,7 @@ impl Daemon {
             return;
         }
         self.present = present;
+        if !present { let _ = std::fs::remove_file(carplay_start_session::REQUEST); }
         write_flag_atomic(HOST_PRESENT_FLAG, present);
         if !present {
             self.present_cleared_at = Some(std::time::Instant::now());
@@ -2142,6 +2145,7 @@ impl Daemon {
     /// HELLO_ACK within 8 ms, which the app reads as "the box dropped us" on a link that just came
     /// up. `CT_HELLO`'s queue-clear cannot retract it. So: go idle silently.
     fn go_idle(&mut self, notify_host: bool) {
+        let _ = std::fs::remove_file(carplay_start_session::REQUEST);
         if notify_host {
             self.set_present(false);
         } else if self.present {
@@ -2237,6 +2241,7 @@ impl Daemon {
         // This must be queued before BTP_WIFI_HANDOFF, which permits host-side discovery/nudging.
         self.active_bt_peer_tick(now);
         self.iap2_slot_tick(now);
+        self.start_session_tick();
         self.bt_phase_tick(now);
         self.proj_mode_tick(now);
         self.phone_ident_tick(now);
@@ -2444,6 +2449,54 @@ impl Daemon {
     /// Mirror all live per-peer iAP2 slots from btd. A slot event is `[type][MAC:17][phase]`;
     /// phase zero removes that peer. The source is a directory of atomically replaced files so
     /// concurrent handshake threads never overwrite one another's phase.
+    fn start_session_tick(&mut self) {
+        if !self.subscribed || self.last_start_check.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) { return; }
+        self.last_start_check = Some(Instant::now());
+        let Ok(entries) = std::fs::read_dir(carplay_start_session::DIR) else { return; };
+        for entry in entries.flatten().take(32) {
+            let path = entry.path();
+            let Some(mac) = path.file_stem().and_then(|s| s.to_str()) else { continue; };
+            if !carplay_start_session::valid_mac(mac) { continue; }
+            let Ok(bytes) = std::fs::read(&path) else { continue; };
+            if bytes.len() > carplay_start_session::MAX_BYTES || serde_json::from_slice::<carplay_start_session::Event>(&bytes).is_err() { continue; }
+            if self.start_events.get(mac) == Some(&bytes) { continue; }
+            self.start_events.insert(mac.to_string(), bytes.clone());
+            let mut payload = vec![p::CT_CARPLAY_START_SESSION_EVENT];
+            payload.extend(bytes);
+            self.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &payload);
+        }
+    }
+
+    fn start_session_request(&mut self, bytes: &[u8]) {
+        use carplay_start_session::{Event, Request};
+        let parsed = Request::parse(bytes);
+        let mut event = Event { version: 1, peer_mac: String::new(), slot_id: String::new(), request_id: String::new(),
+            receiver_epoch: String::new(), stage: "failed".into(), reason: String::new(), available: false };
+        if let Ok(r) = &parsed {
+            event.peer_mac = r.peer_mac.clone(); event.slot_id = r.slot_id.clone();
+            event.request_id = r.request_id.clone(); event.receiver_epoch = r.receiver_epoch.clone();
+        }
+        event.reason = if !self.subscribed || !self.present { "host not subscribed".into() }
+        else if let Err(reason) = parsed { reason.into() }
+        else {
+            let r = parsed.unwrap();
+            if r.action == "cancel" && !std::fs::read(carplay_start_session::REQUEST).ok()
+                .and_then(|v| Request::parse(&v).ok()).is_some_and(|latest|
+                    latest.request_id == r.request_id && latest.slot_id == r.slot_id && latest.receiver_epoch == r.receiver_epoch) {
+                return; // A delayed cancellation must not overwrite a newer phone's request.
+            }
+            let slot = std::fs::read(carplay_start_session::event_path(&r.peer_mac)).ok()
+                .and_then(|v| serde_json::from_slice::<Event>(&v).ok());
+            if !slot.is_some_and(|e| e.slot_id == r.slot_id && !matches!(e.stage.as_str(), "ended" | "failed" | "unsupported")) { "stale or unavailable iAP2 slot".into() }
+            else if carplay_start_session::write_atomic(std::path::Path::new(carplay_start_session::REQUEST), bytes).is_err() { "cannot queue request".into() }
+            else { event.stage = "queued".into(); String::new() }
+        };
+        eprintln!("[ocbmd] StartSession stage={} peer={} request={} reason={}", event.stage, event.peer_mac, event.request_id, event.reason);
+        let mut payload = vec![p::CT_CARPLAY_START_SESSION_EVENT];
+        payload.extend(serde_json::to_vec(&event).unwrap());
+        self.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &payload);
+    }
+
     fn iap2_slot_tick(&mut self, now_t: Instant) {
         if !self.subscribed
             || self.last_iap2_slot_check.is_some_and(|t| now_t.duration_since(t) < Duration::from_millis(250))
@@ -3867,7 +3920,11 @@ impl Daemon {
     fn handle(&mut self, ch: u16, flags: u8, pl: &[u8]) {
         match ch {
             p::CH_CTRL => {
-                if pl.first() == Some(&p::CT_HELLO) {
+                if pl.first() == Some(&p::CT_CARPLAY_START_SESSION) {
+                    self.start_session_request(&pl[1..]);
+                } else if pl.first() == Some(&p::CT_HELLO) {
+                    let _ = std::fs::remove_file(carplay_start_session::REQUEST);
+                    self.start_events.clear();
                     // Host instance nonce (trailing u32 LE, 0 = not supplied). A DIFFERENT nonce while
                     // we still think a host is present means the previous one died without CT_STOP:
                     // its carplayd went with it, but presence never dropped, so nothing would re-ARM.
@@ -3966,7 +4023,8 @@ impl Daemon {
                         | p::CAP_IP
                         | p::CAP_FILE
                         | p::CAP_ETH
-                        | p::CAP_MULTI_IAP2;
+                        | p::CAP_MULTI_IAP2
+                        | p::CAP_CARPLAY_START_SESSION;
                     if self.mfi.is_some() {
                         caps |= p::CAP_MFI;
                     }
@@ -4416,6 +4474,7 @@ fn write_alive_stamp() -> std::io::Result<()> {
 /// file effects `go_idle` and `main()`'s startup perform; the `SEV_HOST_GONE` frame is deliberately
 /// NOT sent, because the accessory fd that would carry it is precisely what just died.
 fn clear_session_state_for_exit() {
+    let _ = std::fs::remove_file(carplay_start_session::REQUEST);
     write_flag_atomic(HOST_PRESENT_FLAG, false);
     clear_cfg_file();
     let _ = std::fs::remove_file(RADIO_OFF_FLAG);
@@ -4446,6 +4505,7 @@ fn main() {
     // panic = "abort" workspace-wide, so a panic is the last thing this process ever does and the
     // hook's output is the only record of it. Chain rather than replace: the default hook carries
     // the location and any RUST_BACKTRACE.
+    let _ = std::fs::remove_file(carplay_start_session::REQUEST);
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         eprintln!("[ocbmd] PANIC: {info}");
@@ -4567,6 +4627,8 @@ fn main() {
         active_bt_peer: None,
         last_active_bt_peer_check: None,
         iap2_slots: HashMap::new(),
+        start_events: HashMap::new(),
+        last_start_check: None,
         last_iap2_slot_check: None,
         host_replaced: false,
         cfg: Vec::new(),
@@ -5116,6 +5178,8 @@ mod tests {
             active_bt_peer: None,
             last_active_bt_peer_check: None,
             iap2_slots: HashMap::new(),
+            start_events: HashMap::new(),
+            last_start_check: None,
             last_iap2_slot_check: None,
             host_replaced: false,
             cfg: Vec::new(),

@@ -180,7 +180,7 @@ fn accessory_bt_mac() -> [u8; 6] {
 /// Write `data` fully to `w`, checking `should_abort` between attempts -- same discipline as the
 /// wired driver's `write_interruptible`, generic over `Write` for the same reason (unit-testable
 /// without real hardware).
-fn write_interruptible<W: Write>(w: &mut W, data: &[u8], should_abort: &dyn Fn() -> bool) -> bool {
+pub(crate) fn write_interruptible<W: Write>(w: &mut W, data: &[u8], should_abort: &dyn Fn() -> bool) -> bool {
     let mut written = 0;
     while written < data.len() {
         if should_abort() {
@@ -207,7 +207,9 @@ const MAX_REASSEMBLY: usize = 8192;
 /// A thin wrapper over [`session`] purely so the phase mirror is un-latched on EVERY exit, including
 /// the three early returns that never enter the loop. See the `publish_bt_phase` call below.
 pub fn run(sock: File, name: &str, peer: [u8; 6], shutdown: &AtomicBool) {
+    if !crate::native_start::begin(&peer) { return; }
     session(sock, name, peer, shutdown);
+    crate::native_start::finish();
     // Un-latch the phase mirror (audit 3.3). `/tmp/bt_phase` is last-write-wins with no unlink, so
     // without this the deepest phase reached since boot stays readable forever and `ocbmd` re-emits
     // it to every fresh subscriber -- the host sees a phantom "phone detected" long after the phone
@@ -304,6 +306,7 @@ fn session(mut sock: File, name: &str, peer: [u8; 6], shutdown: &AtomicBool) {
     loop {
         // Shutdown-only here (audit B5): the pre-Identify budget is the explicit check just below, and
         // folding it into this top-of-loop check would terminate a healthy post-Identify session at 120 s.
+        if crate::native_start::poll(&mut sock, &mut link, &abort, identified_flag.load(Ordering::Relaxed)) { break; }
         if shutdown.load(Ordering::Relaxed) {
             log("shutdown requested -- closing RFCOMM session");
             break;
@@ -496,6 +499,14 @@ fn process_one(
     if !write_interruptible(sock, &link.build_ack(), abort) {
         return true;
     }
+    if crate::native_start::enabled() && matches!(msg_id, 0x4300 | 0x1D03) {
+        // Rx.payload includes the already-verified link checksum. It is NOT a TLV byte.
+        let Some(body) = link::parse_msg_body(&rx.payload) else {
+            log(&format!("RX 0x{msg_id:04X} invalid control-message length ({} B)", rx.payload.len()));
+            return true;
+        };
+        if crate::native_start::incoming(msg_id, body) { return true; }
+    }
 
     // Phase A3 — WiFi credential handoff (device→accessory path). The iPhone asks the accessory to
     // describe the AP it hosts (`RequestAccessoryWiFiConfigurationInformation` 0x5702, no params); we
@@ -509,7 +520,11 @@ fn process_one(
         // to join a network that does not exist, AND publish the handoff phase, spawn the A/V layer
         // and claim /tmp/carplay_transport for a session that can never arrive — suppressing the
         // wired supervisor with it.
-        let Some(cfg) = crate::wifi_handoff::read_hostapd_ap_config() else {
+        let config = if let Some(e) = crate::native_start::endpoint() {
+            Some(crate::wifi_handoff::AccessoryWiFiConfig { ssid: e.ssid, passphrase: Some(e.passphrase),
+                channel: Some(e.channel), security_type: Some(crate::wifi_handoff::AccessoryWiFiSecurityType::Wpa2OrWpa3Personal) })
+        } else { crate::wifi_handoff::read_hostapd_ap_config() };
+        let Some(cfg) = config else {
             log("RX 0x5702 RequestAccessoryWiFiConfig -- no AP config readable; not replying");
             return false;
         };
@@ -517,7 +532,6 @@ fn process_one(
             "RX 0x5702 RequestAccessoryWiFiConfig -> replying 0x5703 (ssid={:?} ch={:?} sec={:?})",
             cfg.ssid, cfg.channel, cfg.security_type
         ));
-        publish_peer_phase(peer, ocbm_proto::BTP_WIFI_HANDOFF);
         let body = crate::wifi_handoff::build_accessory_wifi_configuration_information(&cfg);
         let security_code = cfg.security_type.map(|v| v as u8);
         // 0x5703 has only SSID, passphrase, security type and channel; it does not carry a
@@ -562,6 +576,7 @@ fn process_one(
             body.len()
         ));
         if sent && !abort() {
+            publish_peer_phase(peer, ocbm_proto::BTP_WIFI_HANDOFF);
             // The iPhone now has the AP credentials and will associate to wlan0, then look for the
             // AirPlay receiver via mDNS. Bring up that layer (carplayd RTSP :5000 + rx-connect
             // advertise/browse/connect-out on wlan0) so it's discoverable the moment the phone joins.
@@ -571,7 +586,7 @@ fn process_one(
             // signalled while we were writing 0x5703, spawning here would race the teardown and orphan
             // carplayd. The main loop also joins this thread before teardown_av_layer(), so
             // this guard is belt-and-suspenders against that ordering.
-            crate::av::ensure_av_layer();
+            if !crate::native_start::enabled() { crate::av::ensure_av_layer(); }
         }
         return !sent;
     }
@@ -748,6 +763,7 @@ fn execute(
                 false,
             );
             // IdentificationInformation (0x1D01, Source::Accessory). The wireless bearer is declared
+            let ib = if crate::native_start::enabled() { message::with_wireless_start_session(ib) } else { ib };
             // via param 24 WirelessCarPlayTransportComponent (+ companion param 17
             // BluetoothTransportComponent) inside `build_ident_info`'s Wireless arm.
             if !write_interruptible(
@@ -776,6 +792,7 @@ fn execute(
                 false,
                 &excluded,
             );
+            let ib = if crate::native_start::enabled() { message::with_wireless_start_session(ib) } else { ib };
             if !write_interruptible(
                 sock,
                 &link.build_msg(1, spec::MSG_IDENTIFICATION_INFORMATION, &ib),

@@ -12,3 +12,5 @@ path = "src/main.rs"
 ocbm-proto = { path = "../../crates/ocbm-proto" }
 box-common = { path = "../../crates/box-common" }
 libc = "0.2"
+carplay-start-session = { path = "../../crates/carplay-start-session" }
+serde_json = "1"

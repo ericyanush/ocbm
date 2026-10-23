@@ -28,6 +28,7 @@ mod reconnect;
 mod sco_audio;
 mod sdp_client;
 mod wifi_handoff;
+mod native_start;
 
 // The Bluetooth primitives moved to `bt-common` (2026-09-01) so wireless Android Auto can use the
 // same radio machinery instead of a second copy. Re-exported at the crate root, so every existing

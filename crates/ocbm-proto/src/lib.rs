@@ -363,6 +363,9 @@ pub const CAP_IP: u32 = 0x0000_0008;
 pub const CAP_FILE: u32 = 0x0000_0010;
 pub const CAP_ETH: u32 = 0x0000_0020; // box can bridge a raw-ethernet netdev (ncm0) over CH_ETH
 pub const CAP_MULTI_IAP2: u32 = 0x0000_0040; // box reports independently tracked per-phone iAP2 slots
+pub const CAP_CARPLAY_START_SESSION: u32 = 0x0000_0080;
+pub const CT_CARPLAY_START_SESSION: u8 = 0x20; // host -> box: versioned native receiver request JSON
+pub const CT_CARPLAY_START_SESSION_EVENT: u8 = 0x21; // box -> host: per-slot bootstrap event JSON
 
 // OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
 // AAOS has no NCM, so L3 is done in userspace over this channel (no kernel TUN needed).

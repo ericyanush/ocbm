@@ -46,6 +46,11 @@ pub struct Iap2Config {
 /// `iapConfig:` — vehicle identity for Identify params 20/21 (docs/carplay/04_CAPABILITIES_AND_CONFIG.md C6).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct IapConfigSection {
+    /// Opt-in native AAOS receiver bootstrap; absent retains byte-exact legacy declarations.
+    #[serde(rename = "wirelessStartSession", default)]
+    pub wireless_start_session: bool,
+    #[serde(rename = "nativeReceiverEndpoint", default)]
+    pub native_receiver_endpoint: Option<carplay_start_session::Endpoint>,
     #[serde(rename = "vehicleInfo", default)]
     pub vehicle_info: Option<VehicleInfoConfig>,
     /// PRESENCE of this block is what arms param 21 at all — an absent block leaves the historical
@@ -489,6 +494,23 @@ impl Iap2Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_start_session_config_is_explicit_and_accepts_inline_json_endpoint() {
+        let legacy: super::Iap2Config = serde_yaml::from_str("wireless: true\n").unwrap();
+        assert!(!legacy.iap_config.wireless_start_session);
+        assert!(legacy.iap_config.native_receiver_endpoint.is_none());
+        let config: super::Iap2Config = serde_yaml::from_str(r#"
+iapConfig:
+  wirelessStartSession: true
+  nativeReceiverEndpoint: {"port":7011,"deviceId":"B2:D6:2A:9F:C9:30","pairingId":"stable-pi","publicKey":"abababababababababababababababababababababababababababababababab","sourceVersion":"320.17","interface":"br0","addresses":["192.168.5.1","fe80::1"],"ssid":"Truck","passphrase":"password","channel":149,"security":3}
+"#).unwrap();
+        assert!(config.iap_config.wireless_start_session);
+        let endpoint = config.iap_config.native_receiver_endpoint.unwrap();
+        assert!(endpoint.validate().is_ok());
+        assert_eq!(endpoint.addresses.len(), 2);
+        assert_eq!(endpoint.security, 3);
+        assert!(!format!("{endpoint:?}").contains("password"));
+    }
     use super::*;
 
     /// The shared-fixture guard: this is the exact `metadata:` shape the macOS app emits, asserted

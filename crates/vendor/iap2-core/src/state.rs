@@ -15,12 +15,10 @@
 //! distinct from the MFi coprocessor-auth plane in `mfi.rs`, which fetches the cert / signs the
 //! challenge that we then emit as 0xAA01 / 0xAA03.)
 //!
-//! NOTE ON 0x4300/0x4301. `0x4300` (CarPlayAvailability, device-source) is only ever received when
-//! we declared wired in IdentifyInfo (which we do NOT — see message.rs). We deliberately reply to it
-//! with nothing but a log (`Action::Note`): sending the `0x4301 CarPlayStartSession` (accessory-
-//! source) the iPhone would then wait for is a proven dead end (the reference resolves the endpoint
-//! but never connects to :5000). The working session-start is the mDNS path (rx-connect), not a
-//! wired 0x4301 reply.
+//! `0x4300` remains a note in this transport-independent auth/identify state machine. The optional
+//! native AAOS wireless StartSession coordinator consumes it separately, gates it on a selected
+//! phone/receiver generation and sends `0x4301` from the RFCOMM owner. The default and wired
+//! startup paths do not declare the pair. See docs/wireless/NATIVE_START_SESSION.md.
 
 /// Authentication/identification progress. Ordering mirrors the C's integer `state` (0..=5) so
 /// `state >= Authenticated` reproduces the `state>=3` guard.

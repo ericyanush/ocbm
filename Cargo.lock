@@ -102,9 +102,11 @@ dependencies = [
  "box-common",
  "bt-common",
  "carplay-iap2-core",
+ "carplay-start-session",
  "libc",
  "mfi-wire",
  "ocbm-proto",
+ "serde_json",
  "sha2",
  "signal-hook",
 ]
@@ -121,6 +123,7 @@ name = "carplay-iap2-core"
 version = "0.1.0"
 dependencies = [
  "carplay-metadata",
+ "carplay-start-session",
  "portable-atomic",
  "serde",
  "serde_yaml",
@@ -131,6 +134,14 @@ name = "carplay-metadata"
 version = "0.1.0"
 dependencies = [
  "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "carplay-start-session"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]
@@ -619,8 +630,10 @@ name = "ocbmd"
 version = "0.1.0"
 dependencies = [
  "box-common",
+ "carplay-start-session",
  "libc",
  "ocbm-proto",
+ "serde_json",
 ]
 
 [[package]]
