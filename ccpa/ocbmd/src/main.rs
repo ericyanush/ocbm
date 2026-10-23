@@ -5204,12 +5204,12 @@ mod tests {
 
     #[test]
     fn active_bt_peer_mac_validation_is_strict() {
-        assert!(valid_bt_mac("04:41:A5:B8:26:B1"));
-        assert!(valid_bt_mac("04:41:a5:b8:26:b1"));
-        assert!(!valid_bt_mac("04:41:A5:B8:26"));
-        assert!(!valid_bt_mac("04:41:A5:B8:26:BZ"));
-        assert!(!valid_bt_mac("04-41-A5-B8-26-B1"));
-        assert!(!valid_bt_mac("04:41:A5:B8:26:B1:00"));
+        assert!(valid_bt_mac("02:00:00:AA:BB:01"));
+        assert!(valid_bt_mac("02:00:00:aa:bb:01"));
+        assert!(!valid_bt_mac("02:00:00:AA:BB"));
+        assert!(!valid_bt_mac("02:00:00:AA:BB:BZ"));
+        assert!(!valid_bt_mac("02-00-00-AA-BB-01"));
+        assert!(!valid_bt_mac("02:00:00:AA:BB:01:00"));
     }
 
     /// Pop everything queued on the priority (CTRL/MFI/RTSP) queue as `(channel, flags, payload)`,

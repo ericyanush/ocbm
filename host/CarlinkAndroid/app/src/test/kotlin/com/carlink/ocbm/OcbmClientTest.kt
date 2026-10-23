@@ -298,10 +298,10 @@ class OcbmClientTest {
         val seen = ArrayList<String>()
         c.onActiveBtPeer = { seen.add(it) }
 
-        t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_ACTIVE_BT_PEER) + "04:41:A5:B8:26:B1".toByteArray())
+        t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_ACTIVE_BT_PEER) + "02:00:00:AA:BB:01".toByteArray())
         t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_ACTIVE_BT_PEER))
 
-        assertEquals(listOf("04:41:A5:B8:26:B1", ""), seen)
+        assertEquals(listOf("02:00:00:AA:BB:01", ""), seen)
     }
 
     @Test
@@ -313,12 +313,12 @@ class OcbmClientTest {
 
         val seen = ArrayList<Pair<String, Byte>>()
         c.onIap2Slot = { mac, phase -> seen.add(mac to phase) }
-        val mac = "04:41:A5:B8:26:B1".toByteArray(Charsets.US_ASCII)
+        val mac = "02:00:00:AA:BB:01".toByteArray(Charsets.US_ASCII)
         t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_IAP2_SLOT) + mac + byteArrayOf(Ocbm.BTP_WIFI_HANDOFF))
         t.deliver(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_IAP2_SLOT) + mac + byteArrayOf(Ocbm.BTP_IDLE))
 
         assertEquals(
-            listOf("04:41:A5:B8:26:B1" to Ocbm.BTP_WIFI_HANDOFF, "04:41:A5:B8:26:B1" to Ocbm.BTP_IDLE),
+            listOf("02:00:00:AA:BB:01" to Ocbm.BTP_WIFI_HANDOFF, "02:00:00:AA:BB:01" to Ocbm.BTP_IDLE),
             seen,
         )
     }
