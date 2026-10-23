@@ -107,6 +107,7 @@ internal fun ControlTabContent(
     val connected = connectionState != CarlinkManager.State.DISCONNECTED
     val context = LocalContext.current
     var gpsEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.gpsForwardingEnabled) }
+    var startSessionEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.startSessionExperimentEnabled) }
     val locationPermission =
         rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission(),
@@ -138,6 +139,19 @@ internal fun ControlTabContent(
             } else {
                 AdapterCard(carlinkManager, connected, Modifier.fillMaxWidth())
                 AppControlCard(carlinkManager, connected, displayMode, onDisplayModeSelected, Modifier.fillMaxWidth())
+            }
+            ControlCard(title = "CarPlay StartSession (experimental)", icon = Icons.Default.Wifi) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Use iAP2 StartSession", style = MaterialTheme.typography.titleMedium)
+                        Text("Requires updated adapter firmware. Disables HTTP connection nudges. " +
+                            "Takes effect after a complete session restart; saving does not stop playback.",
+                            style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Switch(checked = startSessionEnabled, onCheckedChange = {
+                        startSessionEnabled = it; carlinkManager.setStartSessionExperimentEnabled(it)
+                    })
+                }
             }
             ControlCard(title = "Vehicle location", icon = Icons.Default.LocationOn) {
                 Row(

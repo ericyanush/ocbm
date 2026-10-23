@@ -11,6 +11,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
+import androidx.compose.foundation.layout.Row
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -41,6 +43,7 @@ internal fun HotspotTabContent(carlinkManager: CarlinkManager) {
     var ssid by remember { mutableStateOf(saved.ssid) }
     var password by remember { mutableStateOf(saved.password) }
     var channel by remember { mutableStateOf(saved.channel) }
+    var security by remember { mutableStateOf(saved.security) }
     var passwordVisible by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var saving by remember { mutableStateOf(false) }
@@ -100,6 +103,13 @@ internal fun HotspotTabContent(carlinkManager: CarlinkManager) {
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
             )
+            Text("Hotspot security", style = MaterialTheme.typography.titleMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                listOf(2 to "WPA2", 3 to "WPA2/WPA3", 4 to "WPA3").forEach { (value, label) ->
+                    FilterChip(selected = security == value, onClick = { security = value },
+                        enabled = !saving, label = { Text(label) })
+                }
+            }
             message?.let {
                 Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
@@ -110,7 +120,7 @@ internal fun HotspotTabContent(carlinkManager: CarlinkManager) {
                     scope.launch {
                         val error =
                             withContext(Dispatchers.IO) {
-                                store.save(VehicleHotspotStore.Fields(ssid, password, channel))
+                                store.save(VehicleHotspotStore.Fields(ssid, password, channel, security))
                             }
                         if (error != null) {
                             message = error

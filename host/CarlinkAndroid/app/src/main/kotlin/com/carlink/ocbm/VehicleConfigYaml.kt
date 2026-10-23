@@ -50,6 +50,7 @@ data class VehicleConfigSpec(
     val wifiSsid: String? = null,
     val wifiPass: String? = null,
     val wifiChannel: Int? = null,
+    val nativeStartEndpoint: org.json.JSONObject? = null,
     val pairing: String = "just_works",
     val enablesHevc: Boolean = true,
     /** Steering-wheel media keys reach CarPlay through this HID, not a steering-wheel device. */
@@ -261,6 +262,11 @@ object VehicleConfigYaml {
         s.wifiSsid?.let { line("wifi_ssid: $it") }
         s.wifiPass?.let { line("wifi_pass: $it") }
         s.wifiChannel?.let { line("wifi_channel: $it") }
+        s.nativeStartEndpoint?.let {
+            line("iapConfig:")
+            line("  wirelessStartSession: true")
+            line("  nativeReceiverEndpoint: $it")
+        }
         line("rightHandDrive: false")
         // Emitted for shape parity with the pinned fixture; the box does not read it. Night mode is a
         // runtime /command (CMD_NIGHT_MODE), not a config value.

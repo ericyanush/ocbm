@@ -128,7 +128,40 @@ class CarPlayRx(
     private val infoTransformer: ((ByteArray) -> ByteArray)? = null,
     /** Diagnostic switch: leave only the framework-managed NsdManager AirPlay advertisement active. */
     private val selfHostedMdnsEnabled: Boolean = true,
+    private val startSessionOnly: Boolean = false,
 ) {
+    val receiverEpoch: String = java.util.UUID.randomUUID().toString()
+    @Volatile private var startSessionPeer: String? = null
+    @Volatile private var startSessionInterface: String? = null
+    @Volatile private var startSessionDeadlineNs: Long = 0
+
+    fun startSessionIdentity(): org.json.JSONObject {
+        check(running.get() && server?.isClosed == false && infoBlob() != null) { "Receiver listener/info not ready" }
+        return org.json.JSONObject().put("port", port).put("deviceId", deviceId).put("pairingId", pi)
+            .put("publicKey", NativeCore.publicKeyHex(pi, edSeed)).put("sourceVersion", SRCVERS)
+    }
+
+    fun authorizeStartSession(peer: String, interfaceName: String) {
+        check(startSessionOnly)
+        setHandoffTarget(peer, true)
+        startSessionInterface = interfaceName
+        startSessionDeadlineNs = System.nanoTime() + 40_000_000_000L
+        startSessionPeer = peer.uppercase()
+    }
+
+    fun revokeStartSession() { startSessionPeer = null; startSessionDeadlineNs = 0 }
+
+    private fun startSessionInboundAllowed(c: Socket, selectedPeer: String?, claimed: Boolean = false): Boolean {
+        if (selectedPeer == null || selectedPeer != startSessionPeer || (!claimed && liveConnections.get() > 0) ||
+            System.nanoTime() > startSessionDeadlineNs) return false
+        val iface = runCatching { java.net.NetworkInterface.getByName(startSessionInterface) }.getOrNull() ?: return false
+        val local = c.localAddress?.address ?: return false
+        if (iface.inetAddresses.toList().none { it.address.contentEquals(local) }) return false
+        val remote = c.inetAddress.hostAddress?.substringBefore('%') ?: return false
+        // A direct callback may beat mDNS. Native SETUP verifies its selected Bluetooth identity
+        // before allocating media sockets; already-known addresses of another phone fail early.
+        return peerAddressesByMac.none { (mac, addresses) -> mac != selectedPeer && remote in addresses }
+    }
     /**
      * The SAME device id, decimal. This asymmetry is deliberate and is the thing that was broken:
      * TXT `deviceid` and /info `deviceID` carry the colon MAC, but the
@@ -1189,6 +1222,7 @@ class CarPlayRx(
         selectedPeer: String?,
         selectedGeneration: Long,
     ) {
+        if (startSessionOnly) { log.i("HTTP nudge disabled: StartSession-only experiment"); return }
         if (!isCurrentHandoff(selectedPeer, selectedGeneration)) {
             log.i("connect-out cancelled before start — stale handoff generation=$selectedGeneration peer=${selectedPeer ?: "unidentified"}")
             return
@@ -1343,6 +1377,7 @@ class CarPlayRx(
     }
 
     private fun connectOut(host: InetAddress, peerPort: Int): Boolean {
+        if (startSessionOnly) return false
         var connected = false
         try {
             Socket().use { s ->
@@ -1458,7 +1493,11 @@ class CarPlayRx(
                 log.i(">>> INBOUND CONTROL CONNECTION local=${c.localAddress?.hostAddress}:${c.localPort} peer=${c.inetAddress?.hostAddress}:${c.port}")
                 val selectedPeer = pinnedPhoneMac.get()
                 val selectedGeneration = handoffGeneration.get()
-                if (handoffReady.get() && selectedPeer != null) {
+                if (startSessionOnly && !startSessionInboundAllowed(c, selectedPeer)) {
+                    log.w("StartSession inbound rejected: no current request, wrong hotspot interface, or another phone owns address")
+                    runCatching { c.close() }; continue
+                }
+                if (!startSessionOnly && handoffReady.get() && selectedPeer != null) {
                     val expected = peerAddressesByMac[selectedPeer]?.toSet().orEmpty()
                     val remote = c.inetAddress?.hostAddress.orEmpty()
                     if (expected.isEmpty() || !isExpectedInboundPeer(remote, expected)) {
@@ -1540,6 +1579,12 @@ class CarPlayRx(
             // Prefer the ported receiver core. It owns the RTSP state machine, pairing (including the
             // Ed25519/X25519 that API 32 cannot do), the ChaCha20-Poly1305 channel, /auth-setup and
             // SETUP/RECORD. Kotlin only shuttles bytes.
+            if (startSessionOnly && (currentSocket !== c || !startSessionInboundAllowed(c, selectedPeer, claimed = true))) {
+                log.i("discarding accepted StartSession socket: request revoked before native start")
+                runCatching { c.close() }
+                if (currentSocket === c) currentSocket = null
+                return
+            }
             if (handoffReady.get() && selectedPeer != null && !isCurrentHandoff(selectedPeer, selectedGeneration)) {
                 log.i("discarding accepted socket before native start: stale handoff peer=$selectedPeer generation=$selectedGeneration")
                 try { c.close() } catch (_: Throwable) {}
@@ -1557,6 +1602,12 @@ class CarPlayRx(
                 return
             }
             if (h != 0L) { handleNative(c, h); return }
+            if (startSessionOnly) {
+                log.w("StartSession native core unavailable — closing callback")
+                runCatching { c.close() }
+                if (currentSocket === c) currentSocket = null
+                return
+            }
             log.w("native core unavailable — Kotlin stub path (pair-setup M1..M4 only)")
             handleStub(c)
         } finally {
@@ -1596,7 +1647,7 @@ class CarPlayRx(
         // encrypted channel, but the native core must come back out to the relay for the two chip
         // ops, and those calls are the step. See [TracedRelay].
         val traced = TracedRelay(relay, addr, phoneMac ?: pinnedPhoneMac.get() ?: "unknown")
-        val h = NativeCore.start(pi, edSeed, info, peers, addr, traced)
+        val h = NativeCore.start(pi, edSeed, info, peers, addr, traced, if (startSessionOnly) phoneMac.orEmpty() else "")
         if (h == NativeCore.BUSY) return h   // the caller closes; do NOT report a session up
         if (h != 0L) {
             traced.gen = h

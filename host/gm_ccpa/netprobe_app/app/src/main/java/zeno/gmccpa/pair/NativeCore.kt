@@ -38,9 +38,16 @@ object NativeCore {
      * @param mfiRelay    the OCBM `CH_MFI` bridge (already device-proven)
      */
     fun start(pi: String, edSeed: ByteArray, infoPlist: ByteArray, peerFile: String,
-              peerAddr: String, mfiRelay: MfiRelay): Long {
+              peerAddr: String, mfiRelay: MfiRelay, expectedPhone: String = ""): Long {
         if (!available) return 0
-        return nativeInit(pi, edSeed, infoPlist, peerFile, peerAddr, mfiRelay)
+        return nativeInit(pi, edSeed, infoPlist, peerFile, peerAddr, mfiRelay, expectedPhone)
+    }
+
+    fun publicKeyHex(pi: String, edSeed: ByteArray): String {
+        check(available) { "Native receiver unavailable" }
+        val key = nativePublicKey(pi, edSeed) ?: error("Receiver identity could not be exported")
+        check(key.size == 32) { "Invalid receiver public key length" }
+        return key.joinToString("") { "%02x".format(it.toInt() and 255) }
     }
 
     /**
@@ -154,8 +161,9 @@ object NativeCore {
 
     private external fun nativeInit(
         pi: String, edSeed: ByteArray, infoPlist: ByteArray, peerFile: String,
-        peerAddr: String, mfiRelay: MfiRelay
+        peerAddr: String, mfiRelay: MfiRelay, expectedPhone: String
     ): Long
+    private external fun nativePublicKey(pi: String, edSeed: ByteArray): ByteArray?
     private external fun nativeFeed(handle: Long, input: ByteArray): ByteArray?
     private external fun nativeIsEncrypted(handle: Long): Boolean
     private external fun nativeAvIdleMs(handle: Long): Long

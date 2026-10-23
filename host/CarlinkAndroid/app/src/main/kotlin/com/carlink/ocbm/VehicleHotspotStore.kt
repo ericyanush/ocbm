@@ -15,6 +15,7 @@ data class VehicleHotspotCredentials(
     val ssid: String,
     val password: String,
     val channel: Int,
+    val security: Int = 2,
 ) {
     fun validationError(): String? {
         if (ssid.isBlank() || ssid != ssid.trim()) return "Enter the hotspot SSID without leading or trailing spaces."
@@ -22,6 +23,7 @@ data class VehicleHotspotCredentials(
         val passBytes = password.toByteArray(Charsets.UTF_8).size
         if (passBytes !in 8..63) return "The hotspot password must be 8–63 bytes."
         if (channel !in 1..196) return "Enter a valid Wi-Fi channel number."
+        if (security !in 2..4) return "Choose WPA2, WPA2/WPA3 transition, or WPA3."
         // The adapter's small shell parser reads these as raw YAML scalars. Reject line breaks and
         // YAML delimiters that could corrupt the config or make the adapter read a different value.
         val unsafe =
@@ -49,6 +51,7 @@ class VehicleHotspotStore(
         val ssid: String = "",
         val password: String = "",
         val channel: String = "",
+        val security: Int = 2,
     )
 
     fun fields(): Fields =
@@ -56,12 +59,13 @@ class VehicleHotspotStore(
             ssid = prefs.getString(KEY_SSID, "").orEmpty(),
             password = runCatching { decryptPassword() }.getOrNull().orEmpty(),
             channel = prefs.getString(KEY_CHANNEL, "").orEmpty(),
+            security = prefs.getInt("security", 2),
         )
 
     fun credentials(): VehicleHotspotCredentials? {
         val fields = fields()
         val channel = fields.channel.toIntOrNull() ?: return null
-        val credentials = VehicleHotspotCredentials(fields.ssid, fields.password, channel)
+        val credentials = VehicleHotspotCredentials(fields.ssid, fields.password, channel, fields.security)
         return credentials.takeIf { it.validationError() == null }
     }
 
@@ -70,7 +74,7 @@ class VehicleHotspotStore(
         val channel =
             fields.channel.toIntOrNull()
                 ?: return "Enter the hotspot Wi-Fi channel as a number."
-        val credentials = VehicleHotspotCredentials(fields.ssid, fields.password, channel)
+        val credentials = VehicleHotspotCredentials(fields.ssid, fields.password, channel, fields.security)
         credentials.validationError()?.let { return it }
         val protectedPassword =
             runCatching { encryptPassword(credentials.password) }
@@ -82,6 +86,7 @@ class VehicleHotspotStore(
                 .putString(KEY_PASSWORD_CIPHERTEXT, protectedPassword.first)
                 .putString(KEY_PASSWORD_IV, protectedPassword.second)
                 .putString(KEY_CHANNEL, credentials.channel.toString())
+                .putInt("security", credentials.security)
                 .commit()
         return if (saved) null else "Could not save hotspot settings. Please try again."
     }

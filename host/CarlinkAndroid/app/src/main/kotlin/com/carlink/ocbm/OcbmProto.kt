@@ -7,6 +7,9 @@ package com.carlink.ocbm
  * 16-bit length inside a CH_MFI payload, which is BIG-endian (see [Mfi]).
  */
 object Ocbm {
+    const val CAP_CARPLAY_START_SESSION: Int = 0x80
+    const val CT_CARPLAY_START_SESSION: Byte = 0x20
+    const val CT_CARPLAY_START_SESSION_EVENT: Byte = 0x21
     // ---- envelope ---------------------------------------------------------------------------
 
     /** `0x4F43424D` — on the wire, little-endian, this is the byte sequence 4D 42 43 4F. */

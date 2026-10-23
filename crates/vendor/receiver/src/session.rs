@@ -301,6 +301,14 @@ fn publish_phone_identity(d: &Dictionary) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetupError;
 
+fn selected_phone_matches_setup(expected: Option<&str>, confirmed: bool, has_streams: bool, device_id: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(_) if has_streams => confirmed,
+        Some(expected) => device_id.is_some_and(|id| id.eq_ignore_ascii_case(expected)),
+    }
+}
+
 /// Handles the session-bound control requests after pair-verify (the encrypted ones).
 pub trait SessionDelegate: Send {
     /// Called once when pair-verify succeeds, handing over the ECDH shared secret (stream/event keys).
@@ -345,6 +353,8 @@ impl SessionDelegate for NoSession {
 
 /// The real A/V session. Forwards decoded streams to carlink_linux's IPC ports.
 pub struct AvSession {
+    expected_phone: Option<String>,
+    identity_confirmed: bool,
     /// Native control-generation token supplied by the JNI owner. Used only to correlate logs
     /// across phone switches; it does not alter protocol state.
     generation: u64,
@@ -459,6 +469,8 @@ fn parse_control_plist(body: &[u8]) -> Option<Value> {
 impl AvSession {
     pub fn new() -> Self {
         Self {
+            expected_phone: None,
+            identity_confirmed: false,
             generation: 0,
             shared: None,
             control_setup: AtomicBool::new(false),
@@ -478,6 +490,12 @@ impl AvSession {
     /// Attach the owning native control generation for diagnostic correlation.
     pub fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
+    }
+
+    /// Native StartSession binds media to the selected Bluetooth phone, independently of IP family.
+    pub fn set_expected_phone(&mut self, phone: Option<String>) {
+        self.expected_phone = phone;
+        self.identity_confirmed = false;
     }
 
     /// Allocate a fresh liveness flag for an A/V stream of type `ty`, first stopping any prior thread
@@ -1857,6 +1875,12 @@ impl SessionDelegate for AvSession {
             .as_ref()
             .map(|d| d.contains_key("streams"))
             .unwrap_or(false);
+        let setup_device_id = dict.as_ref().and_then(|d| d.get("deviceID")).and_then(|v| v.as_string());
+        if !selected_phone_matches_setup(self.expected_phone.as_deref(), self.identity_confirmed, has_streams, setup_device_id) {
+            eprintln!("[session] rejected SETUP identity for selected phone={:?} gen={}", self.expected_phone, self.generation);
+            return Err(SetupError);
+        }
+        if self.expected_phone.is_some() && !has_streams { self.identity_confirmed = true; }
         // Phase 1 only (no `streams`): the phone tells us who it is, once per session. Publish it for
         // ocbmd to mirror to the host app — see `PHONE_IDENT_FILE`.
         if !has_streams {
@@ -3123,6 +3147,17 @@ fn ntp_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_callback_must_identify_selected_phone_before_media_setup() {
+        let selected = Some("02:00:00:AA:BB:01");
+        assert!(selected_phone_matches_setup(selected, false, false, Some("02:00:00:aa:bb:01")));
+        assert!(!selected_phone_matches_setup(selected, false, false, Some("02:00:00:AA:BB:02")));
+        assert!(!selected_phone_matches_setup(selected, false, false, None));
+        assert!(!selected_phone_matches_setup(selected, false, true, None));
+        assert!(selected_phone_matches_setup(selected, true, true, None));
+        assert!(selected_phone_matches_setup(None, false, true, None));
+    }
 
     /// The audio seam's control messages must be MAGIC-tagged and exactly the lengths the host's
     /// resync treats as structural (45 / 21). Both ends hardcode those numbers; this is the only

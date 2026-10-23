@@ -16,6 +16,14 @@ import org.junit.Test
  * **If you change the emitter, change this literal in the same commit.**
  */
 class VehicleConfigYamlTest {
+    @Test
+    fun `native StartSession config is only emitted for the experimental connection`() {
+        assertFalse(VehicleConfigYaml.render(VehicleConfigSpec()).contains("wirelessStartSession"))
+        val endpoint = org.json.JSONObject().put("port", 7011).put("interface", "br0")
+        val doc = VehicleConfigYaml.render(VehicleConfigSpec(nativeStartEndpoint = endpoint))
+        assertEquals(1, Regex("iapConfig:").findAll(doc).count())
+        assertTrue(doc.contains("iapConfig:\n  wirelessStartSession: true\n  nativeReceiverEndpoint: $endpoint\n"))
+    }
     private val expected =
         """
 name: "CarLink GM 2400x960"

@@ -115,6 +115,12 @@ class OcbmClient(
 
     /** Per-phone iAP2 slot transition: the phase is BTP_IDLE when that phone's slot is released. */
     var onIap2Slot: ((mac: String, phase: Byte) -> Unit)? = null
+    var onStartSessionEvent: ((org.json.JSONObject) -> Unit)? = null
+    val hasStartSession: Boolean get() = (caps and Ocbm.CAP_CARPLAY_START_SESSION) != 0
+    fun startSessionRequest(request: org.json.JSONObject): Boolean {
+        val bytes = request.toString().toByteArray(Charsets.UTF_8)
+        return hasStartSession && bytes.size <= 8192 && send(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_CARPLAY_START_SESSION) + bytes)
+    }
 
     /**
      * Which projection transport OWNS the box right now (CT_PROJ_MODE, one of `PM_*`). Mirrors the
@@ -472,6 +478,11 @@ class OcbmClient(
     private fun handleCtrl(pl: ByteArray) {
         if (pl.isEmpty()) return
         when (pl[0]) {
+            Ocbm.CT_CARPLAY_START_SESSION_EVENT -> {
+                if (pl.size <= 8193) runCatching { org.json.JSONObject(String(pl, 1, pl.size - 1, Charsets.UTF_8)) }
+                    .onSuccess { onStartSessionEvent?.invoke(it) }
+                    .onFailure { log.w("invalid StartSession event JSON") }
+            }
             Ocbm.CT_HELLO_ACK -> {
                 if (pl.size >= 6) {
                     caps = (pl[2].toInt() and 0xFF) or ((pl[3].toInt() and 0xFF) shl 8) or
@@ -961,7 +972,12 @@ class OcbmClient(
         log.i(">> CT_SUBSCRIBE (${config.size}B config) — this is the radio-wake edge")
         if (config.isNotEmpty()) {
             config.toString(Charsets.UTF_8).trim().lines().forEach { line ->
-                val safeLine = WIFI_PASSWORD_LINE.replace(line) { match -> "${match.groupValues[1]}<redacted>" }
+                val safeLine = if (line.trimStart().startsWith("nativeReceiverEndpoint:")) {
+                    val endpoint = runCatching {
+                        org.json.JSONObject(line.substringAfter(':')).put("passphrase", "<redacted>").toString()
+                    }.getOrDefault("<redacted endpoint>")
+                    "${line.substringBefore(':')}: $endpoint"
+                } else WIFI_PASSWORD_LINE.replace(line) { match -> "${match.groupValues[1]}<redacted>" }
                 log.i("     | $safeLine")
             }
         }

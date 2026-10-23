@@ -318,6 +318,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        carlinkManager?.refreshStartSessionNetwork()
         // Re-assert the display mode — the system may have shown bars while backgrounded.
         applyDisplayMode()
     }

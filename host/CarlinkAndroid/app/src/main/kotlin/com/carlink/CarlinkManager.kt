@@ -603,6 +603,21 @@ class CarlinkManager(
     private val carPlaySessionGeneration = AtomicLong(0)
     /** One adapter-radio recovery attempt per continuous no-phone interval; never reboot USB/box. */
     private val wirelessRecoveryAttempted = AtomicBoolean(false)
+    private var nativeStartForConnection = false
+    private var nativeStartEndpoint: JSONObject? = null
+    private val startSessionPrefs by lazy { context.getSharedPreferences("carplay_start_session", Context.MODE_PRIVATE) }
+    val startSessionExperimentEnabled: Boolean get() = startSessionPrefs.getBoolean("enabled", false)
+    fun setStartSessionExperimentEnabled(enabled: Boolean) {
+        startSessionPrefs.edit().putBoolean("enabled", enabled).apply()
+    }
+    fun refreshStartSessionNetwork() { if (nativeStartForConnection) nativeStart.refreshNetwork() }
+    private val nativeStart by lazy {
+        com.carlink.ocbm.NativeStartSession(
+            scope, receiver = { carPlayReceiver }, send = { client?.startSessionRequest(it) == true },
+            hotspot = { VehicleHotspotStore(context).credentials() }, status = { setStatusText(it) },
+            log = { logInfo("[START_SESSION] $it", tag = Logger.Tags.PHONE) },
+        )
+    }
 
     // ---- microphone -------------------------------------------------------------------------
     private var microphoneManager: MicrophoneCaptureManager? = null
@@ -1109,6 +1124,9 @@ class CarlinkManager(
         // Tear down any existing session BEFORE entering CONNECTING, so the FGS started at
         // CONNECTING isn't immediately stopped by the teardown's DISCONNECTED transition.
         if (client != null) stopImpl()
+        if (carPlayReceiver?.sessionLive != true) nativeStartForConnection = startSessionExperimentEnabled
+        nativeStart.enabled = nativeStartForConnection
+        nativeStartEndpoint = null
 
         val generation = connectionGeneration.incrementAndGet()
         carPlayMfiRelay.clear()
@@ -1140,6 +1158,38 @@ class CarlinkManager(
         // SETTIME ack does not mean the link is bad.
         c.setTime()
 
+        if (nativeStartForConnection) {
+            if (!c.hasStartSession) {
+                stopImpl()
+                setStatusText("Update adapter firmware to use experimental StartSession")
+                return
+            }
+            val prepared = runCatching {
+                startCarPlayReceiver()
+                withContext(Dispatchers.IO) {
+                    kotlinx.coroutines.withTimeout(60_000) {
+                        nativeStart.awaitEndpoint { !released && client === c && connectionGeneration.get() == generation }
+                    }
+                    check(carPlayReceiver?.awaitAdvertRegistered(5000) == true) { "Receiver advertisement not ready" }
+                    kotlinx.coroutines.withTimeout(60_000) {
+                        nativeStart.awaitEndpoint { !released && client === c && connectionGeneration.get() == generation }
+                    }
+                }
+            }
+            if (prepared.isFailure) {
+                val failure = prepared.exceptionOrNull()
+                if (released || client !== c || connectionGeneration.get() != generation) return
+                if (failure is kotlinx.coroutines.CancellationException && failure !is kotlinx.coroutines.TimeoutCancellationException) throw failure
+                val waitingForHotspot = failure is kotlinx.coroutines.TimeoutCancellationException
+                stopImpl()
+                setStatusText(if (waitingForHotspot) "Vehicle hotspot still unavailable — retrying..." else "StartSession unavailable: ${failure?.message}")
+                if (waitingForHotspot) scheduleReconnect()
+                return
+            }
+            if (released || client !== c || connectionGeneration.get() != generation) return
+            nativeStartEndpoint = prepared.getOrThrow()
+        }
+
         // THE APP IS THE IGNITION: this is the presence latch that brings the box's radios up.
         setStatusText("Starting projection...")
         if (!c.subscribe(VehicleConfigYaml.renderBytes(vehicleConfigSpec(hotspot)))) {
@@ -1166,7 +1216,7 @@ class CarlinkManager(
             setState(State.DEVICE_CONNECTED)
             setStatusText("Phone connected — restoring CarPlay...")
         } else {
-            setStatusText("Waiting for phone...")
+            setStatusText(if (nativeStartForConnection) nativeStart.progressText ?: "Waiting for phone..." else "Waiting for phone...")
         }
     }
 
@@ -1259,12 +1309,14 @@ class CarlinkManager(
             },
             // Diagnostic test: publish only NsdManager's gm-ccpa record, not gmccpa-rx.local.
             selfHostedMdnsEnabled = false,
+            startSessionOnly = nativeStartForConnection,
         )
         receiver.onPhoneDiscovered = { name, deviceId ->
             scope.launch { rememberDiscoveredPhone(name, deviceId) }
         }
         logInfo("[CP_RX] using shared GM /info with Carlink return-icon customization", tag = Logger.Tags.ADAPTR)
         receiver.onSessionUp = {
+            if (nativeStartForConnection) nativeStart.connected()
             val sessionGeneration = carPlaySessionGeneration.incrementAndGet()
             val controlGeneration = receiver.activeControlGeneration
             streamingPhoneMac = null
@@ -1327,6 +1379,7 @@ class CarlinkManager(
                     return@launch
                 }
                 carPlayMicUplink?.stop("CarPlay control session ended")
+                if (nativeStartForConnection) nativeStart.connectionEnded()
                 carPlayMicUplink = null
                 streamingPhoneMac = null
                 mediaConfirmationGeneration = 0L
@@ -1350,8 +1403,11 @@ class CarlinkManager(
             }
         }
         receiver.onStalled = { count ->
+            if (nativeStartForConnection) {
+                logWarn("[START_SESSION] HTTP-nudge recovery suppressed in strict experiment", tag = Logger.Tags.PHONE)
+            } else
             logWarn("[CP_RX] sustained dial-back stall: $count accepted nudges, with no inbound connection during the grace window", tag = Logger.Tags.ADAPTR)
-            if (wirelessRecoveryAttempted.compareAndSet(false, true)) {
+            if (!nativeStartForConnection && wirelessRecoveryAttempted.compareAndSet(false, true)) {
                 scope.launch {
                     var recoveryReceiver = receiver
                     val activeClient = client
@@ -1472,6 +1528,7 @@ class CarlinkManager(
                 wifiSsid = hotspot.ssid,
                 wifiPass = hotspot.password,
                 wifiChannel = hotspot.channel,
+                nativeStartEndpoint = nativeStartEndpoint,
                 name = config.boxName,
                 width = g.width,
                 height = g.height,
@@ -1518,6 +1575,8 @@ class CarlinkManager(
         reboot: Boolean = false,
         preserveEscalation: Boolean = false,
     ) {
+        nativeStart.cancel()
+        nativeStartEndpoint = null
         // Invalidate receiver/MFi work before stopping the receiver and USB pipe. Native control
         // callbacks can already be queued on another thread when teardown begins.
         connectionGeneration.incrementAndGet()
@@ -2458,7 +2517,8 @@ class CarlinkManager(
                 // on screen with touch still live and this very status text invisible behind it.
                 // The OCBM session itself stays up by design; only the UI state reflects reality.
                 if (state == State.STREAMING) setState(State.DEVICE_CONNECTED)
-                setStatusText("Waiting for phone...")
+                // The adapter's USB phone bit cannot replace native wireless bootstrap progress.
+                setStatusText(if (nativeStartForConnection) nativeStart.progressText ?: "Waiting for phone..." else "Waiting for phone...")
             }
         }
 
@@ -2522,12 +2582,31 @@ class CarlinkManager(
             carPlayReceiver?.setActiveBluetoothPeer(mac)
         }
 
+        c.onStartSessionEvent = { event ->
+            scope.launch {
+                if (client !== c || connectionGeneration.get() != ownerGeneration || !nativeStartForConnection) return@launch
+                val result = nativeStart.event(event) ?: return@launch
+                val (peer, ready) = result
+                val slots = iap2SlotPhases.toMutableMap()
+                if (event.optString("stage") == "ended") slots.remove(peer)
+                else slots[peer] = if (ready) Ocbm.BTP_WIFI_HANDOFF else Ocbm.BTP_IDENTIFIED
+                iap2SlotPhases = slots
+                schedulePreferredPhoneFallback(c)
+                syncMultiPhoneReceiverTarget(c, peer)
+                rebuildDeviceList()
+            }
+        }
         c.onIap2Slot = { mac, phase ->
             if (client === c && connectionGeneration.get() == ownerGeneration) {
                 scope.launch {
                     val slots = iap2SlotPhases.toMutableMap()
                     val address = mac.uppercase()
-                    if (phase == Ocbm.BTP_IDLE) slots.remove(address) else slots[address] = phase
+                    if (phase == Ocbm.BTP_IDLE) slots.remove(address)
+                    else if (!nativeStartForConnection || slots[address] != Ocbm.BTP_WIFI_HANDOFF) {
+                        // In strict mode only a 0x4300 availability event authorizes this slot.
+                        // The earlier 0x5703 credential exchange is insufficient for selection.
+                        slots[address] = if (nativeStartForConnection && phase == Ocbm.BTP_WIFI_HANDOFF) Ocbm.BTP_IDENTIFIED else phase
+                    }
                     iap2SlotPhases = slots
                     schedulePreferredPhoneFallback(c)
                     // Slot teardown is peer-scoped. An idle/reject for a different phone must
@@ -3021,6 +3100,7 @@ class CarlinkManager(
                 val restoreMac = requireNotNull(restore)
                 logWarn("[MULTI_PHONE] switch to $target timed out before media; re-targeting prior phone $restoreMac", tag = Logger.Tags.PHONE)
                 receiver.setHandoffTarget(restoreMac, ready = true)
+                if (nativeStartForConnection) nativeStart.select(restoreMac)
                 receiver.refreshPhoneDiscovery()
                 setStatusText("Switch failed — reconnecting ${phoneNames[restoreMac.lowercase()] ?: restoreMac}...")
             } else {
@@ -3111,6 +3191,7 @@ class CarlinkManager(
         if (target == null) {
             adapterActiveBtPeer = null
             receiver.setHandoffTarget(null, ready = false)
+            if (nativeStartForConnection) nativeStart.select(null)
             return
         }
 
@@ -3128,6 +3209,7 @@ class CarlinkManager(
         // clears the target globally and makes the later matching handoff impossible to identify.
         adapterActiveBtPeer = target
         receiver.setHandoffTarget(target, ready = phase == Ocbm.BTP_WIFI_HANDOFF)
+        if (nativeStartForConnection) nativeStart.select(target)
     }
 
     private fun onMetadata(

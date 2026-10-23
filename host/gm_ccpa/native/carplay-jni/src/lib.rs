@@ -455,7 +455,30 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut libc::c_void) -> j
     })
 }
 
-/// `nativeInit(pi, edSeed, infoPlist, peerFile, peerAddr, mfiRelay) -> handle`
+/// Export only the public half of the exact process identity used by pair verification.
+#[no_mangle]
+pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativePublicKey<'l>(
+    mut env: JNIEnv<'l>, _class: JClass<'l>, pi: JString<'l>, seed: JByteArray<'l>,
+) -> jni::sys::jbyteArray {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = (|| -> Result<jni::sys::jbyteArray, String> {
+            let pi: String = env.get_string(&pi).map_err(|e| e.to_string())?.into();
+            let seed: [u8; 32] = env.convert_byte_array(&seed).map_err(|e| e.to_string())?
+                .try_into().map_err(|_| "invalid identity seed length")?;
+            let id = identity(&pi, seed);
+            if IDENTITY_PARAMS.get().is_some_and(|(p, s)| p != &pi || s != &seed) {
+                return Err("process identity differs from requested identity".into());
+            }
+            env.byte_array_from_slice(&id.public_key()).map(|a| a.into_raw()).map_err(|e| e.to_string())
+        })();
+        result.unwrap_or_else(|e| {
+            eprintln!("[jni] public identity export failed: {e}");
+            let _ = env.exception_clear(); std::ptr::null_mut()
+        })
+    })).unwrap_or(std::ptr::null_mut())
+}
+
+/// `nativeInit(pi, edSeed, infoPlist, peerFile, peerAddr, mfiRelay, expectedPhone) -> handle`
 #[no_mangle]
 pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
     mut env: JNIEnv<'l>,
@@ -466,6 +489,7 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
     peer_file: JString<'l>,
     peer_addr: JString<'l>,
     mfi_relay: JObject<'l>,
+    expected_phone: JString<'l>,
 ) -> jlong {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let pi: String = env.get_string(&pi).map_err(|e| e.to_string())?.into();
@@ -479,6 +503,7 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
         let info = env.convert_byte_array(&info_plist).map_err(|e| e.to_string())?;
         let relay = env.new_global_ref(mfi_relay).map_err(|e| e.to_string())?;
         let peer: String = env.get_string(&peer_addr).map_err(|e| e.to_string())?.into();
+        let expected_phone: String = env.get_string(&expected_phone).map_err(|e| e.to_string())?.into();
 
         // Take the slot FIRST, bounded (see INIT_LOCK_BUDGET), before anything with a Drop side
         // effect exists. `AvSession::drop` -> `reset()` -> `events::clear()` + `clear_sinks()` act on
@@ -559,6 +584,7 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
         // which is exactly what MediaCodec consumes, so the decode path needs no JNI at all.
         let gen = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         let mut av = receiver::session::AvSession::new();
+        av.set_expected_phone((!expected_phone.is_empty()).then_some(expected_phone));
         av.set_generation(gen);
         match peer.parse::<std::net::SocketAddr>() {
             Ok(a) => { av.set_peer_addr(a); println!("[jni] session peer {a}"); }
