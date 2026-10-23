@@ -1100,6 +1100,36 @@ wireless_down() {
   fi
 }
 
+wireless_reconcile() {
+  # A successful presence edge is not proof that the detached bring-up survived. In particular,
+  # a delayed old teardown can terminate btd AFTER a new SUBSCRIBE without another presence edge.
+  # Respect all normal ownership/inhibit gates, including an explicitly scheduled radio settle.
+  if [ "${p:-0}" != 1 ] || radio_off || ! wireless_enabled || aa_owns_session \
+     || { ! hot_handover_enabled && phone_on_bus && ! wireless_owns_session; } \
+     || { android_phone_on_bus && aa_enabled; } \
+     || [ -n "${wireless_rebring_at:-}" ]; then
+    wireless_missing_since=""
+    return
+  fi
+  # This also sees the detached launch wrapper until it execs btd, so a slow attach cannot
+  # launch duplicate wrappers. Never restart a healthy advertiser or an active phone slot.
+  if wireless_running; then
+    wireless_missing_since=""
+    return
+  fi
+  _wrc_now=$(now)
+  if [ -z "${wireless_missing_since:-}" ]; then
+    wireless_missing_since="$_wrc_now"
+    echo "[sup] host PRESENT but wireless advertiser missing — watching for recovery"
+  fi
+  if [ $((_wrc_now - wireless_missing_since)) -ge 5 ] \
+     && [ "$_wrc_now" -ge "${wireless_retry_at:-0}" ]; then
+    wireless_retry_at=$((_wrc_now + 15))
+    echo "[sup] wireless advertiser still missing after 5s — reconciling bring-up (15s retry limit)"
+    wireless_up
+  fi
+}
+
 write_healthy 0
 echo "[sup] up; IDLE — gating the CarPlay session on $FLAG (waiting for a host app)"
 WIRELESS_RESTART_FLAG=/tmp/wireless_restart   # ocbmd touches this on the CCPA tab's Restart-wireless / Forget
@@ -1297,6 +1327,7 @@ while :; do
       # wireless_up() reaches arm_aa_wireless only on a genuine bring-up (its own `wireless_running`
       # idempotence guard returns first otherwise), so without this a crashed pump would stay dead
       # until the next app reconnect. Internally silent + pgrep-guarded, so a tick costs one pgrep.
+      wireless_reconcile
       wireless_running && arm_aa_wireless
       if aa_owns_session; then
         # Android Auto owns ci_hdrc.0 right now (aa-bridge holds a live AOAP link + the wired-aa owner
