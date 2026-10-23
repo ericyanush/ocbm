@@ -126,6 +126,8 @@ class CarPlayRx(
     private val edSeed: ByteArray = ByteArray(32) { (it * 31 + 7).toByte() },
     /** Optional app-specific `/info` customization; null preserves the shared GM test asset. */
     private val infoTransformer: ((ByteArray) -> ByteArray)? = null,
+    /** Diagnostic switch: leave only the framework-managed NsdManager AirPlay advertisement active. */
+    private val selfHostedMdnsEnabled: Boolean = true,
 ) {
     /**
      * The SAME device id, decimal. This asymmetry is deliberate and is the thing that was broken:
@@ -267,6 +269,48 @@ class CarPlayRx(
             log.i("handoff target pinned to Bluetooth peer $normalized")
             log.i("handoff generation=$generation invalidated by peer change ${previous ?: "none"} -> $normalized")
             refreshDiscoveryForSelection()
+        }
+    }
+
+    /**
+     * Set the selected peer and its handoff readiness independently.
+     *
+     * Multi-slot adapters can report a preferred phone before that phone has completed iAP2
+     * handoff, while another phone may already be ready. The receiver must retain the selected
+     * identity in that state, but must not dial any Bonjour candidate until the selected phone is
+     * ready. The legacy [setBluetoothPhase] API intentionally keeps its single-slot semantics
+     * (IDLE ends and clears the current peer); callers handling per-peer slots should use this.
+     * Passing null explicitly clears the selection.
+     */
+    @Synchronized
+    fun setHandoffTarget(mac: String?, ready: Boolean) {
+        val normalized = mac?.trim()?.uppercase().orEmpty()
+        if (normalized.isNotEmpty() && !normalized.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}"))) {
+            log.w("ignoring malformed handoff target '$mac'")
+            return
+        }
+
+        val target = normalized.takeIf { it.isNotEmpty() }
+        val previousTarget = pinnedPhoneMac.get()
+        if (previousTarget != target) {
+            pinnedPhoneMac.set(target)
+            // A new peer can never inherit the previous peer's readiness.
+            handoffReady.set(false)
+            val generation = handoffGeneration.incrementAndGet()
+            log.i("handoff generation=$generation target changed ${previousTarget ?: "none"} -> ${target ?: "none"}")
+            if (target != null) refreshDiscoveryForSelection()
+        }
+
+        val effectiveReady = target != null && ready
+        if (handoffReady.getAndSet(effectiveReady) != effectiveReady) {
+            val generation = handoffGeneration.incrementAndGet()
+            log.i("handoff generation=$generation readiness changed for peer=${target ?: "none"} ready=$effectiveReady")
+            if (effectiveReady) {
+                NetworkDiagnostics.snapshot("Bluetooth reported Wi-Fi handoff")
+                NetworkDiagnostics.snapshotAfter("Bluetooth Wi-Fi handoff settle", 1500)
+                NetworkDiagnostics.snapshotAfter("Bluetooth Wi-Fi handoff follow-up", 5000)
+                refreshDiscoveryForSelection()
+            }
         }
     }
 
@@ -790,6 +834,12 @@ class CarPlayRx(
             "registerService('$ACCESSORY_NAME' _airplay._tcp:$listenPort) was requested and no " +
             "onServiceRegistered/onRegistrationFailed callback has arrived — iOS cannot index an " +
             "advert that is not live, so no connect-out can succeed")
+
+        if (!selfHostedMdnsEnabled) {
+            log.i("self-hosted advert disabled — NsdManager advert stands alone")
+            SessionTrace.Board.down(B_ADVERT_SELF, "disabled for diagnostic test")
+            return
+        }
 
         // ---- second advert, on a hostname WE own -------------------------------------------------
         // iOS keys its Wi-Fi CarPlay endpoint index by HOST, one endpoint per host, and whichever

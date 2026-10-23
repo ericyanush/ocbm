@@ -177,6 +177,8 @@ host → box:  MODE_SELECT { mode }        (only when the host wants a non-defau
 | `0x19` | `CT_PROJ_MODE` | box→host | `[PM_* u8]` — WHICH projection transport owns the box right now: `0x00` `PM_NONE` (idle), `0x01` `PM_WIRED_CP`, `0x02` `PM_WIRELESS_CP`, `0x03` `PM_WIRED_AA`, `0x04` `PM_WIRELESS_AA` (reserved, unbuilt). Mirrors the box's single-owner arbitration flag `/tmp/projection_owner` (docs/androidauto/02_ARBITRATION.md). Sent only while subscribed, on **change** only, re-emitted after each `CT_SUBSCRIBE`. Advisory: an unknown value means "some transport owns the box" — never gate on ordering |
 | `0x1A` | `CT_BOX_HEALTH` | box→host | `[BH_* bitmask u8]` — the box's own readiness. Sent only while subscribed, on **change** only, re-emitted after each `CT_SUBSCRIBE`. See below |
 | `0x1B` | `CT_LOG_CTL` | host→box | `[enabled u8][cap_kb u16 LE]` — arm/disarm the box→host `CH_LOG` stream. `cap_kb` 0 = the built-in default (256). **Default is OFF**, and it resets to off on `CT_STOP` / host-gone like every other per-session state. Enabling streams from **offset 0** of every source — that IS the backfill, there is no separate dump opcode — then follows EOF. Every line that existed on disk at the moment a source is (re)opened for that offset-0 pass carries `LOG_F_BACKFILL` (see §CH_LOG), so a host can tell "already happened" replay from what happens next. A payload shorter than 2 bytes reads as *disable*: an unparseable request must never leave a stream running the host does not know about. See §CH_LOG |
+| `0x1D` | `CT_ACTIVE_BT_PEER` | box→host | `[UTF-8 Bluetooth MAC \| empty]` — the remote peer accepted by the active RFCOMM/iAP2 session. Emitted before the corresponding `CT_BT_PHASE=BTP_WIFI_HANDOFF` update, and replayed after `CT_SUBSCRIBE`; hosts should pin `_carplay-ctrl` discovery/nudge to this peer. Empty means identity is unavailable; hosts must not guess among multiple peers |
+| `0x1E` | `CT_IAP2_SLOT` | box→host | `[17-byte uppercase ASCII Bluetooth MAC][BTP_* u8]` — per-phone iAP2 slot transition; `BTP_IDLE` removes that peer's slot. Replayed for each live slot after `CT_SUBSCRIBE`. Requires `CAP_MULTI_IAP2` (`0x40`) in `HELLO_ACK`; when present, this stream is authoritative and scalar `CT_BT_PHASE` / `CT_ACTIVE_BT_PEER` are legacy hints only |
 
 ### `CT_BOX_HEALTH` (`0x1A`) — the box's own readiness (added 2026-08-27)
 
@@ -321,6 +323,20 @@ failure can never perturb the handshake it is reporting on.
 handler's `else` arm logs and drops it), and an older box simply never sends it — a host must
 therefore treat "no `CT_BT_PHASE` ever arrives" as normal and keep whatever fallback it had.
 
+### Multi-phone iAP2 slots (`CAP_MULTI_IAP2` / `CT_IAP2_SLOT`)
+
+The adapter can retain independent RFCOMM/iAP2 sessions for distinct bonded phone addresses (up to
+eight); duplicate links from the same phone remain excluded. Each slot completes its own MFi and
+Wi-Fi-handoff exchange. This does **not** mean multiple CarPlay A/V streams: the AAOS receiver still
+owns one stream. It uses the per-phone slot report to choose exactly one eligible phone for its
+connect-out/nudge. The app's preferred phone is sticky; without a preference it selects a handoff-
+ready slot, and it never replaces a live CarPlay stream just because another phone becomes ready.
+
+Hosts advertising `CAP_MULTI_IAP2` must not use the scalar phase or active-peer messages to select a
+phone: concurrent writers make those values inherently last-writer-wins. Older hosts continue to
+use the scalar messages as before. The slot report is a volatile snapshot, not persistent pairing
+state; the adapter's bond store remains authoritative for which phones are paired.
+
 
 ### The `:9003` voice seam tag (legacy / on-box-decrypt mode)
 
@@ -423,7 +439,7 @@ explicitly requests `CONSOLE`. New modes are pure additions — no rewrite.
 | `0x0024` | ALT_VIDEO | box→host: the ALT / navigation (instrument-cluster) screen stream, decoded host-side on a **dedicated** decoder (box seam `:9005`) | projection |
 | `0x0030` | INPUT | host→box: **binary `INPUT_*` sub-frames** — `INPUT_TOUCH 0x01` (normalized u16 coords) / `INPUT_KEYFRAME 0x02` / `INPUT_MEDIA_BTN 0x03` (Consumer-Control HID uid 2) / `INPUT_COMMAND 0x04` / `INPUT_NAV 0x05` (D-Pad HID uid 3, `NAV_*`) / `INPUT_KEYFRAME_ALT 0x06` (re-IDRs the ALT/cluster stream **specifically**; a bare `INPUT_KEYFRAME` only re-IDRs main) / `INPUT_KNOB 0x07` (Knob HID uid 4) / `INPUT_TELEPHONY 0x08` (Telephony HID). `INPUT_COMMAND`'s payload is the `CMD_*` set — `CMD_REQUEST_UI 0x01`, `CMD_REQUEST_SIRI 0x02` *(deprecated, iOS ignores it)*, `CMD_SIRI_DOWN 0x03` / `CMD_SIRI_UP 0x04`, `CMD_NAV_START 0x05` / `CMD_NAV_STOP 0x06` / `CMD_NAV_CARD 0x07` / `CMD_NAV_APP 0x0A`, `CMD_LIMITED_UI_ON 0x08` / `CMD_LIMITED_UI_OFF 0x09`, `CMD_NAV_APPEARANCE 0x0B`, `CMD_NAV_ZOOM_IN 0x0C` / `CMD_NAV_ZOOM_OUT 0x0D`, `CMD_UI_APPEARANCE 0x0E` / `CMD_MAP_APPEARANCE 0x0F` / `CMD_NIGHT_MODE 0x10`, `CMD_VIEW_AREA 0x11` (`[cmd][index]` → `updateViewArea` for the MAIN display, refused if `/info` never declared the index; 2026-09-07). ocbmd relays every sub-frame opaquely to carplayd; carplayd taps the iPhone HID devices for touch/media/nav/knob/telephony, dispatches `INPUT_COMMAND` as an AirPlay `/command`, and turns `INPUT_KEYFRAME` / `INPUT_KEYFRAME_ALT` into a `forceKeyFrame` on the event channel (main / `VideoStream.Alt1`). Constants are authoritative in `crates/ocbm-proto/src/lib.rs` | all |
 | `0x0031` | MIC | host→box: mic-uplink PCM (S16LE at the CT_UPLINK-negotiated rate/ch); ocbmd relays to carplayd's mic-ingest seam → RTP uplink to the iPhone | projection |
-| `0x0040` | MGMT | box management, request/response (the app's "CCPA" tab): host→box `MGMT_GET_INFO 0x01` / `MGMT_REBOOT 0x02` / `MGMT_FORGET_ALL 0x03` / `MGMT_FORGET_DEVICE 0x04` / `MGMT_RESTART_WIRELESS 0x05` / `MGMT_ENTER_NCM 0x06` (added 2026-09-03: box arms the persistent `/script/ncm_only` flag, drops any `/script/ocbm_trial` dead-man, ACKs, reboots into NCM maintenance mode; sticky — return over ssh with `rm /script/ncm_only; reboot`. Reachable from the app's CCPA tab (confirmed) and from `open -a <carlink_macOS.app> carlink://box/enter-ncm` while the app holds the USB interface (the `-a` form is required for a bundle in a build directory: LaunchServices does not bind the `carlink` scheme for it, so a bare `open carlink://…` fails with kLSApplicationNotFoundErr)); box→host `MGMT_INFO 0x81` / `MGMT_ACK 0x82` | all |
+| `0x0040` | MGMT | box management, request/response (the app's "CCPA" tab): host→box `MGMT_GET_INFO 0x01` / `MGMT_REBOOT 0x02` / `MGMT_FORGET_ALL 0x03` / `MGMT_FORGET_DEVICE 0x04` / `MGMT_RESTART_WIRELESS 0x05` / `MGMT_ENTER_NCM 0x06` (added 2026-09-03: box arms persistent `/script/ncm_only`, removes stale `/script/ncm_wifi` and `/script/ocbm_trial`, ACKs, then reboots into NCM maintenance mode; sticky — return over SSH by clearing both `/script/ncm_only` and `/script/ncm_wifi`, then reboot. `tools/box_deploy.sh --return-only` performs this return. Reachable from the app's CCPA tab (confirmed) and from `open -a <carlink_macOS.app> carlink://box/enter-ncm` while the app holds the USB interface (the `-a` form is required for a bundle in a build directory: LaunchServices does not bind the `carlink` scheme for it, so a bare `open carlink://…` fails with kLSApplicationNotFoundErr)); box→host `MGMT_INFO 0x81` / `MGMT_ACK 0x82` | all |
 | `0x0041` | RTSP | box↔host: the **app-driven SETUP relay** (box seam `:9106`, `receiver::relay`). ocbmd is a dumb byte pipe; the endpoint framing is `[u32 BE "RTSP"][u32 BE len][msg]` (len ≤ 512 KiB, magic-resync) carrying the `RS_*` messages below. Rides **out_hi** with the control plane (timing-critical pair/SETUP/RECORD phase) | projection |
 | `0x0042` | LOG | **box→host only:** the box's own logs, streamed live. Payload = one or more back-to-back entries, `[source u8][flags u8][seq u16 LE][unix_ms u64 LE][len u16 LE][text]`, packed up to a 4096 B payload per frame. Off until the host sends `CT_LOG_CTL`. See below | all |
 | `0x00FF` | ECHO | benchmark echo / CT_SRC flood target | all |
@@ -741,7 +757,7 @@ rcS" gotcha. This is the incremental, always-available cousin of the `FIRMWARE_U
 **There is no `STREAM_OPEN`/`STREAM_CLOSE`, on CTRL or anywhere else.** An earlier draft of this
 document sketched a `STREAM_OPEN { streamId, streamType, codec, params (TLV) }` on CH_CTRL. It was
 never implemented: no such opcode exists in `crates/ocbm-proto/src/lib.rs` (the `CT_*` space,
-`0x01`-`0x1B`, is handshake, session lifecycle, box->host status and the log-stream arm only), and nothing in the
+`0x01`-`0x1D`, is handshake, session lifecycle, box->host status and the log-stream arm only), and nothing in the
 workspace emits or parses one. The sketch is recorded here as history so it is not re-derived;
 **do not implement against it.**
 

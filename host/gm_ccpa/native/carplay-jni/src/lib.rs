@@ -807,6 +807,37 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeRequestSiriPress(
     .unwrap_or(0)
 }
 
+/// Configure optional iAP2 location forwarding. This affects Identify capability advertisement on
+/// the next native receiver session; the default remains disabled for existing callers.
+#[no_mangle]
+pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeSetLocationForwardingEnabled(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jni::sys::jboolean,
+) -> jni::sys::jboolean {
+    std::panic::catch_unwind(|| {
+        receiver::iap_tunnel::set_location_forwarding_enabled(enabled != 0);
+        1
+    })
+    .unwrap_or(0)
+}
+
+/// Push a fresh vehicle NMEA fix into the active wireless iAP2 control tunnel. The receiver filters
+/// it against the phone's StartLocationInformation request and sends it over RCS/DataStream.
+#[no_mangle]
+pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeUpdateVehicleLocation(
+    mut env: JNIEnv,
+    _class: JClass,
+    nmea: JString,
+) -> jni::sys::jboolean {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(nmea) = env.get_string(&nmea) else { return 0 };
+        let nmea: String = nmea.into();
+        u8::from(receiver::iap_tunnel::update_vehicle_location(&nmea))
+    }))
+    .unwrap_or(0)
+}
+
 /// `setLimitedUI` — tell iOS to restrict the CarPlay UI for driving, and to release it when parked.
 ///
 /// Wraps [`receiver::events::send_set_limited_ui`], which emits

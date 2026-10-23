@@ -40,7 +40,7 @@ use iap2_core::{
     spec,
     state::{self, Action, State},
 };
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 // Only the local chip path retries with a backoff; without `local-mfi` nothing here sleeps.
 #[cfg(feature = "local-mfi")]
@@ -125,6 +125,8 @@ const HANDSHAKE_BUDGET: Duration = Duration::from_secs(120);
 /// cap we wait for a modesChanged nudge or AirPlay teardown (`reset()` re-arms the counter). audit Fix #20.
 const MAX_HANDSHAKE_REBUILDS: u32 = 3;
 static HANDSHAKE_REBUILDS: AtomicU32 = AtomicU32::new(0);
+static LOCATION_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(false);
+static LOCATION_SUBSCRIPTIONS: AtomicU8 = AtomicU8::new(0);
 
 struct Session {
     link: Link,
@@ -292,6 +294,127 @@ pub fn tick() {
 pub fn reset() {
     *crate::plock(&SESSION) = None;
     HANDSHAKE_REBUILDS.store(0, Ordering::Relaxed); // re-arm the budget retry cap for the next session
+    LOCATION_SUBSCRIPTIONS.store(0, Ordering::Release);
+}
+
+/// Configure whether the next iAP2 Identify advertises the optional vehicle location component.
+/// This is set by the app before accepting a CarPlay control connection and defaults off.
+pub fn set_location_forwarding_enabled(enabled: bool) {
+    LOCATION_FORWARDING_ENABLED.store(enabled, Ordering::Release);
+    if !enabled {
+        LOCATION_SUBSCRIPTIONS.store(0, Ordering::Release);
+    }
+}
+
+/// Consume the app's current NMEA fix and send only sentence types requested by the phone.
+/// `send_iap_message` selects the active RCS/DataStream transport (or the receiver's fallback).
+pub fn update_vehicle_location(nmea: &str) -> bool {
+    if !LOCATION_FORWARDING_ENABLED.load(Ordering::Acquire) {
+        return false;
+    }
+    let wanted = LOCATION_SUBSCRIPTIONS.load(Ordering::Acquire);
+    if wanted == 0 {
+        return false;
+    }
+    let mut sent_any = false;
+    for sentence in requested_location_sentences(nmea, wanted) {
+        let mut params = message::Tlv::new();
+        params.str(0, sentence);
+        let mut guard = crate::plock(&SESSION);
+        let Some(sess) = guard.as_mut() else { return false };
+        if sess.state < State::Identified {
+            return false;
+        }
+        let frame = sess.link.build_msg(1, spec::MSG_LOCATION_INFORMATION, &params.0);
+        if !crate::events::send_iap_message(&frame) {
+            log("WARN LocationInformation send failed (no active iAP2 transport)");
+            return sent_any;
+        }
+        drop(guard);
+        sent_any = true;
+    }
+    sent_any
+}
+
+/// Handle phone-originated location subscription messages after tunnel framing is removed.
+/// Returns true when `msg_id` belongs to this location path.
+pub(crate) fn handle_location_message(msg_id: u16, body: &[u8]) -> bool {
+    match msg_id {
+        spec::MSG_START_LOCATION_INFORMATION => {
+            let flags = parse_location_request(body);
+            if LOCATION_FORWARDING_ENABLED.load(Ordering::Acquire) {
+                LOCATION_SUBSCRIPTIONS.store(flags, Ordering::Release);
+            } else {
+                LOCATION_SUBSCRIPTIONS.store(0, Ordering::Release);
+            }
+            log(&format!("location subscription: GPGGA={} GPRMC={} enabled={}",
+                flags & 1 != 0, flags & 2 != 0,
+                LOCATION_FORWARDING_ENABLED.load(Ordering::Acquire)));
+            true
+        }
+        spec::MSG_STOP_LOCATION_INFORMATION => {
+            LOCATION_SUBSCRIPTIONS.store(0, Ordering::Release);
+            log("location subscription stopped");
+            true
+        }
+        _ => false,
+    }
+}
+
+fn identify_body(excluded: &[u16]) -> Vec<u8> {
+    identify_body_with_setting(excluded, LOCATION_FORWARDING_ENABLED.load(Ordering::Acquire))
+}
+
+fn identify_body_with_setting(excluded: &[u16], location_enabled: bool) -> Vec<u8> {
+    let mut body = message::build_ident_info_excluding(
+        "CarLink",
+        message::TransportComponent::AirPlayTunnel { bt_mac: accessory_bt_mac() },
+        false,
+        excluded,
+    );
+    if location_enabled
+        && !excluded.contains(&spec::ident::LOCATION_INFORMATION_COMPONENT)
+    {
+        body.extend_from_slice(&message::build_location_information_component(
+            3,
+            "Vehicle GPS",
+            &[
+                message::location_info::GLOBAL_POSITIONING_SYSTEM_FIX_DATA,
+                message::location_info::RECOMMENDED_MINIMUM_SPECIFIC_GPS_TRANSIT_DATA,
+            ],
+        ));
+    }
+    body
+}
+
+fn parse_location_request(body: &[u8]) -> u8 {
+    let mut flags = 0u8;
+    let mut offset = 0usize;
+    while offset + 4 <= body.len() {
+        let len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        let id = u16::from_be_bytes([body[offset + 2], body[offset + 3]]);
+        if len < 4 || offset + len > body.len() {
+            log("WARN malformed StartLocationInformation TLV; ignoring remaining parameters");
+            break;
+        }
+        match id {
+            1 => flags |= 0x01, // GPGGA GPS fix
+            2 => flags |= 0x02, // GPRMC recommended minimum
+            _ => {}
+        }
+        offset += len;
+    }
+    flags
+}
+
+fn requested_location_sentences(nmea: &str, wanted: u8) -> Vec<&str> {
+    nmea.lines()
+        .map(str::trim)
+        .filter(|sentence| {
+            (sentence.starts_with("$GPGGA") && wanted & 0x01 != 0)
+                || (sentence.starts_with("$GPRMC") && wanted & 0x02 != 0)
+        })
+        .collect()
 }
 
 /// Build and send ONE metadata subscribe on the established tunnel link, taking the SESSION lock for
@@ -789,13 +912,7 @@ fn execute(action: Action, link: &mut Link) -> ExecOutcome {
             None => ExecOutcome::NoCommit,
         },
         Action::SendIdentify => {
-            let ib = message::build_ident_info(
-                "CarLink",
-                message::TransportComponent::AirPlayTunnel {
-                    bt_mac: accessory_bt_mac(),
-                },
-                false,
-            );
+            let ib = identify_body(&[]);
             let sent = crate::events::send_iap_message(&link.build_msg(
                 1,
                 spec::MSG_IDENTIFICATION_INFORMATION,
@@ -812,14 +929,7 @@ fn execute(action: Action, link: &mut Link) -> ExecOutcome {
             }
         }
         Action::RetryIdentify(excluded) => {
-            let ib = message::build_ident_info_excluding(
-                "CarLink",
-                message::TransportComponent::AirPlayTunnel {
-                    bt_mac: accessory_bt_mac(),
-                },
-                false,
-                &excluded,
-            );
+            let ib = identify_body(&excluded);
             let sent = crate::events::send_iap_message(&link.build_msg(
                 1,
                 spec::MSG_IDENTIFICATION_INFORMATION,
@@ -871,6 +981,55 @@ mod bt_mac_tests {
         assert_eq!(parse_bd_addr("11:22:33:44:55:66:77"), None);
         assert_eq!(parse_bd_addr(""), None);
         assert_eq!(PLACEHOLDER_BT_MAC[0] & 0x02, 0x02, "not locally administered");
+    }
+}
+
+#[cfg(test)]
+mod location_forwarding_tests {
+    use super::*;
+
+    fn top_level_ids(body: &[u8]) -> Vec<u16> {
+        let mut ids = Vec::new();
+        let mut offset = 0;
+        while offset + 4 <= body.len() {
+            let len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+            assert!(len >= 4 && offset + len <= body.len());
+            ids.push(u16::from_be_bytes([body[offset + 2], body[offset + 3]]));
+            offset += len;
+        }
+        assert_eq!(offset, body.len());
+        ids
+    }
+
+    #[test]
+    fn location_component_is_opt_in_and_can_be_stripped_on_identify_retry() {
+        let excluded = spec::ident::LOCATION_INFORMATION_COMPONENT;
+        let disabled = identify_body_with_setting(&[], false);
+        let enabled = identify_body_with_setting(&[], true);
+        let retry = identify_body_with_setting(&[excluded], true);
+        assert!(!top_level_ids(&disabled).contains(&excluded));
+        assert!(top_level_ids(&enabled).contains(&excluded));
+        assert!(!top_level_ids(&retry).contains(&excluded));
+    }
+
+    #[test]
+    fn start_request_selects_gga_and_rmc_and_ignores_unknown_types() {
+        let body = [
+            0, 4, 0, 1, // GPS fix (GGA)
+            0, 4, 0, 2, // recommended minimum (RMC)
+            0, 4, 0, 3, // satellites (not advertised/supported by this source)
+        ];
+        assert_eq!(parse_location_request(&body), 0x03);
+        assert_eq!(parse_location_request(&[0, 8, 0, 1, 0]), 0);
+    }
+
+    #[test]
+    fn only_phone_requested_nmea_sentence_types_are_forwarded() {
+        let nmea = "$GPGGA,fix*00\r\n$GPRMC,move*00\r\n$GPGSV,sky*00\r\n";
+        assert_eq!(requested_location_sentences(nmea, 0x01), ["$GPGGA,fix*00"]);
+        assert_eq!(requested_location_sentences(nmea, 0x02), ["$GPRMC,move*00"]);
+        assert_eq!(requested_location_sentences(nmea, 0x03), ["$GPGGA,fix*00", "$GPRMC,move*00"]);
+        assert!(requested_location_sentences(nmea, 0).is_empty());
     }
 }
 

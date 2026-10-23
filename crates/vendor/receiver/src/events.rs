@@ -677,6 +677,9 @@ pub(crate) fn dispatch_iap_tunnel_message(data: &[u8]) {
     let msg_id = u16::from_be_bytes([payload[4], payload[5]]);
     let body = &payload[6..];
     eprintln!("[events] iAP tunnel msg 0x{msg_id:04x} ({} B body)", body.len());
+    if crate::iap_tunnel::handle_location_message(msg_id, body) {
+        return;
+    }
     // One dispatcher, shared with the wired driver (`iap2_core::metadata::dispatch`). These two
     // paths diverged once — 0x4171 ListUpdate was handled wired and silently dropped here — and the
     // shared function exists so they cannot again.

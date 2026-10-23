@@ -1,5 +1,9 @@
 package com.carlink.ui.settings
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +22,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.DisplaySettings
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.PhoneDisabled
 import androidx.compose.material.icons.filled.PowerOff
 import androidx.compose.material.icons.filled.RestartAlt
@@ -29,6 +34,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -40,9 +46,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.carlink.CarlinkManager
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
@@ -97,6 +105,20 @@ internal fun ControlTabContent(
     // Sized like carlink_native: 75 % of the window, clamped to a legible range.
     val maxContentWidth = (window.widthDp * 0.75f).dp.coerceIn(400.dp, 1200.dp)
     val connected = connectionState != CarlinkManager.State.DISCONNECTED
+    val context = LocalContext.current
+    var gpsEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.gpsForwardingEnabled) }
+    val locationPermission =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { granted ->
+            if (granted) {
+                gpsEnabled = true
+                carlinkManager.setGpsForwardingEnabled(true)
+            } else {
+                gpsEnabled = false
+                carlinkManager.setGpsForwardingEnabled(false)
+            }
+        }
 
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         Column(
@@ -116,6 +138,45 @@ internal fun ControlTabContent(
             } else {
                 AdapterCard(carlinkManager, connected, Modifier.fillMaxWidth())
                 AppControlCard(carlinkManager, connected, displayMode, onDisplayModeSelected, Modifier.fillMaxWidth())
+            }
+            ControlCard(title = "Vehicle location", icon = Icons.Default.LocationOn) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(20.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Forward vehicle GPS to CarPlay", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Uses the head unit's GPS provider and sends location only over the native CarPlay session. " +
+                                "The adapter does not receive GPS data.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = gpsEnabled,
+                        onCheckedChange = { checked ->
+                            if (!checked) {
+                                gpsEnabled = false
+                                carlinkManager.setGpsForwardingEnabled(false)
+                            } else if (
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                                PackageManager.PERMISSION_GRANTED
+                            ) {
+                                gpsEnabled = true
+                                carlinkManager.setGpsForwardingEnabled(true)
+                            } else {
+                                locationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                            }
+                        },
+                    )
+                }
+                Text(
+                    "Changes to the advertised iAP2 capability take effect on the next CarPlay connection.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

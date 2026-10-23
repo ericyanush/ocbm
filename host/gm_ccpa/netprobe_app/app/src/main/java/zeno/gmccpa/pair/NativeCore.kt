@@ -111,6 +111,13 @@ object NativeCore {
     /** Blocking Siri hold pair on the active wireless CarPlay event channel; call off the UI thread. */
     fun requestSiriPress(): Boolean = available && nativeRequestSiriPress()
 
+    /** Enable/disable the optional native-CarPlay iAP2 vehicle-location capability for new sessions. */
+    fun setLocationForwardingEnabled(enabled: Boolean): Boolean =
+        available && nativeSetLocationForwardingEnabled(enabled)
+
+    /** Offer a fresh NMEA fix to the active native iAP2 tunnel; false is normal when unsubscribed. */
+    fun updateVehicleLocation(nmea: String): Boolean = available && nativeUpdateVehicleLocation(nmea)
+
     /**
      * Restrict ([limit] = true) or release the CarPlay UI for driving.
      *
@@ -160,6 +167,8 @@ object NativeCore {
     ): Boolean
     private external fun nativeMediaButton(index: Int): Boolean
     private external fun nativeRequestSiriPress(): Boolean
+    private external fun nativeSetLocationForwardingEnabled(enabled: Boolean): Boolean
+    private external fun nativeUpdateVehicleLocation(nmea: String): Boolean
     private external fun nativeSetLimitedUI(limit: Boolean): Boolean
     private external fun nativeSetNightMode(night: Boolean): Boolean
     private external fun nativeForceKeyFrame(): Boolean

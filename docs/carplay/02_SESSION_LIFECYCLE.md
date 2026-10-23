@@ -227,6 +227,25 @@ fed straight into `CarPlayStartSession.setSecurityType()`. Whether iOS accepts 2
 **Do not hardcode a 3-or-4-only check** when the wireless start-session path is wired up. (No live conflict
 today: our `0x4301` wireless builder in `iap2-core/src/session.rs` is exercised only by its own unit tests.)
 
+**Serializer contract:** `CarPlayStartSession::new(port, device_identifier, public_key, source_version)`
+requires params 2–5; the builder no longer treats params 3–5 as optional or offers an empty `Default`.
+`build()` returns a `Result` and rejects empty required strings, embedded NULs, invalid TCP ports,
+empty address lists in present bearer groups, and lengths that cannot fit the TLV/link framing.
+Params 6–8 remain optional; an explicit `SupportsMutualAuthentication=false` is serialized.
+
+Both bearer groups support multiple IP addresses, encoded as **repeated IPAddress TLVs**, not a
+comma-separated string. Wired addresses use `Ipv6Addr`; wireless addresses use `IpAddr`, allowing
+both IPv4 and IPv6 endpoints. The archived schema above specifically describes link-local IPv6;
+wireless IPv4 support follows the interoperability change proposed in
+[DiPlay PR #1071](https://github.com/shihabal3amri/DiPlay/pull/1071), rather than a claim that the
+archived schema explicitly lists IPv4. Typed addresses prevent zone suffixes from entering the
+payload. The caller must select addresses reachable on the offered interface, and must supply the
+receiving application's port, device identity and public key when it runs separately from the adapter.
+
+This completes the **body serializer only**. Live message declarations, availability handling and
+transmission remain unchanged. Earlier declaration-only experiments did not implement the full
+`0x4301` response and therefore are not a negative test of a complete wireless StartSession flow.
+
 #### 4.3 `0x4E0D WirelessCarPlayUpdate` (device → accessory) — CONFIRMED verbatim
 
 ```
@@ -1080,16 +1099,16 @@ The reboot budget **must live in `/etc` (jffs2), not `/tmp` (tmpfs)**, or it eva
 **ocbmd wedge escalation (added after a bench incident: `ocbmd` stuck in an uninterruptible HCI
 ioctl during BT line-discipline teardown never exits, so the inittab respawn, the pid-lock
 singleton, and the failover watchdog's first-120s window all did nothing — USB writes to the
-host stalled until a manual power cycle).** `ocbmd` touches `/tmp/ocbmd_alive` (mtime only) once
-per second from its dispatch loop. `session_supervisor.sh`'s 1 Hz main loop calls this WEDGED
-(independent of, and in addition to, the phone-session ladder above) when **all** of: the mtime
-of `/tmp/ocbmd_alive` is stale, the Mac/host-facing accessory gadget
+host stalled until a manual power cycle).** `ocbmd` writes integer `/proc/uptime` seconds to
+`/tmp/ocbmd_alive` once per second from its dispatch loop. `session_supervisor.sh`'s 1 Hz main loop
+calls this WEDGED (independent of, and in addition to, the phone-session ladder above) when **all**
+of: the monotonic heartbeat is at least 60 seconds old, the Mac/host-facing accessory gadget
 (`/sys/class/android_usb_accessory/android0/state`) reads `CONFIGURED`, and `pidof ocbmd` is
-non-empty. An absent `/tmp/ocbmd_alive` is a no-op (older `ocbmd` builds never create it).
-Staleness is checked with `find /tmp/ocbmd_alive -maxdepth 0 -mmin +0`, the same integer-minute
-BusyBox `find` idiom already used by `radio_hal.sh`/`radio_ap_up.sh` for stale-lock detection —
-this box's BusyBox has no `-newermt`/fractional support, so `-mmin +0` (>=1 full minute stale) is
-the finest granularity available, not the 15 s the underlying contract targets. On WEDGED
+non-empty. Missing, malformed, or future-valued stamps are treated as unknown (not wedged), which
+also makes older mtime-only builds fail safe. The heartbeat and supervisor both use monotonic
+`/proc/uptime`, so `CT_SETTIME` and other wall-clock adjustments cannot age a fresh stamp. The
+daemon seeds a fresh stamp at startup; the 60-second stale threshold therefore doubles as startup
+grace. The pure comparator is covered by `tools/tests/ocbmd_liveness_test.sh`. On WEDGED
 (rate-limited to once per 60 s) the supervisor logs to `/tmp/box.log`, runs the same L2
 restart primitive (`restart_ocbmd_daemon()` in `tools/session_supervisor.sh` — extracted from the
 L2 rung above so both callers share one code path), then polls `pidof ocbmd` for up to 10 s: if
@@ -1101,6 +1120,21 @@ Idle-gate persistent-state mutation: refuse peer-store writes/deletes while `pre
 config/pairing changes through quiesce → mutate-at-idle → clean restart.
 
 ### Supporting layers
+
+- **USB permission re-enumeration watchdog:** `ocbm_boot.sh` launches
+  `/script/usb_gadget_reenum.sh`. It waits until the accessory gadget reports `CONFIGURED`, then
+  allows 15 seconds for `ocbmd` to receive a valid OCBM `CT_HELLO`. If no HELLO arrives, it toggles
+  the gadget's `enable` attribute to cause a fresh USB enumeration (and another opportunity for
+  AAOS USB-handler resolution/permission grant), then repeats the configured-state timer. The
+  timer is not based on adapter boot time, and `SUSPENDED` counts as still attached. `ocbmd`
+  records the HELLO in `/tmp/ocbm_usb_hello_seen`; retries stop for that attachment and the marker
+  is cleared on detach. Gadget disable causes the existing accessory EOF/HUP exit path, after
+  which inittab's `run_ocbmd.sh` respawns the daemon against the new gadget instance. This only
+  addresses hosts that enumerate but do not open the USB device; it cannot itself grant permission
+  or guarantee that AAOS will show a prompt. The watchdog also verifies the persistent mode flags
+  and live gadget identity (`functions=accessory`, PID `0x2d00`) before starting and before each
+  toggle. If `/script/ncm_only` or `/script/ncm_wifi` is armed, it exits without changing the gadget;
+  NCM maintenance connectivity must never be bounced by this OCBM permission-retry mechanism.
 
 - **Observability:** supervisor-written `/tmp/carplay_state` (`phase` + flap counters +
   `health=STUCK reason=…` verdict), uptime-prefixed log lines, a **count-bounded** transition ring (the

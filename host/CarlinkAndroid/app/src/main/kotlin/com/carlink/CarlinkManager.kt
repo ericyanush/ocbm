@@ -1,6 +1,8 @@
 package com.carlink
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Looper
@@ -8,6 +10,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.os.ext.SdkExtensions
 import android.view.Surface
+import androidx.core.content.ContextCompat
 import com.carlink.av.CarPlaySocketMediaBridge
 import com.carlink.audio.MicProfile
 import com.carlink.audio.MicrophoneCaptureManager
@@ -25,6 +28,8 @@ import com.carlink.device.KnownDevice
 import com.carlink.device.KnownDeviceSnapshot
 import com.carlink.device.KnownDeviceStore
 import com.carlink.device.mergeDeviceList
+import com.carlink.gnss.GnssForwarder
+import com.carlink.gnss.GpsForwardingPreference
 import com.carlink.logging.Logger
 import com.carlink.logging.ProbeLog
 import com.carlink.logging.logDebug
@@ -492,9 +497,35 @@ class CarlinkManager(
     @Volatile private var previousPhoneSwitchTargetBtMac: String? = null
     @Volatile private var streamingPhoneMac: String? = null
     @Volatile private var mediaConfirmationGeneration: Long = 0L
+    /** Receiver/control generation whose first rendered frame has already promoted the UI to STREAMING. */
+    @Volatile private var confirmedMediaReceiver: CarPlayRx? = null
+    @Volatile private var confirmedMediaControlGeneration: Long = 0L
     @Volatile private var phoneSwitchTimeoutJob: Job? = null
     private var preferredFallbackJob: Job? = null
-    private val multiPhonePrefs by lazy { context.getSharedPreferences("carlink_multi_phone", Context.MODE_PRIVATE) }
+    private val multiPhonePrefs by lazy {
+        context.getSharedPreferences("carlink_multi_phone", Context.MODE_PRIVATE)
+    }
+    private val gpsForwardingPreference by lazy { GpsForwardingPreference(context) }
+    private val gnssForwarder by lazy {
+        GnssForwarder(context, NativeCore::updateVehicleLocation) { message ->
+            logInfo(message, tag = Logger.Tags.ADAPTR)
+        }
+    }
+
+    val gpsForwardingEnabled: Boolean get() = gpsForwardingPreference.enabled
+
+    /** Persist the user's opt-in. Identification advertises this capability on the next session. */
+    fun setGpsForwardingEnabled(enabled: Boolean) {
+        gpsForwardingPreference.enabled = enabled
+        NativeCore.setLocationForwardingEnabled(enabled && hasFineLocationPermission())
+        if (!enabled) gnssForwarder.stop()
+        logInfo("[GNSS] forwarding preference=${if (enabled) "enabled" else "disabled"}; " +
+            "Identify capability applies to the next native CarPlay session", tag = Logger.Tags.ADAPTR)
+    }
+
+    private fun hasFineLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
 
     /**
      * Durable known-device history. Survives process death; cleared only by the user or by clearing
@@ -1211,6 +1242,10 @@ class CarlinkManager(
 
     private fun startCarPlayReceiver() {
         if (carPlayReceiver != null) return
+        val locationAdvertised = gpsForwardingPreference.enabled && hasFineLocationPermission()
+        NativeCore.setLocationForwardingEnabled(locationAdvertised)
+        logInfo("[GNSS] native Identify location capability=" +
+            if (locationAdvertised) "enabled" else "disabled (opt-in off or permission unavailable)", tag = Logger.Tags.ADAPTR)
         NetworkDiagnostics.start(context)
         acquireCarPlayMulticastLockIfRequired()
         val returnIconImages = oemIconImages
@@ -1222,18 +1257,38 @@ class CarlinkManager(
             infoTransformer = { source ->
                 CarPlayInfoCustomizer.withReturnIcon(source, returnIconImages, returnIconLabel)
             },
+            // Diagnostic test: publish only NsdManager's gm-ccpa record, not gmccpa-rx.local.
+            selfHostedMdnsEnabled = false,
         )
         receiver.onPhoneDiscovered = { name, deviceId ->
             scope.launch { rememberDiscoveredPhone(name, deviceId) }
         }
         logInfo("[CP_RX] using shared GM /info with Carlink return-icon customization", tag = Logger.Tags.ADAPTR)
         receiver.onSessionUp = {
-            carPlaySessionGeneration.incrementAndGet()
+            val sessionGeneration = carPlaySessionGeneration.incrementAndGet()
+            val controlGeneration = receiver.activeControlGeneration
             streamingPhoneMac = null
             wirelessRecoveryAttempted.set(false)
             logInfo("[CP_RX] native receiver accepted a phone control session", tag = Logger.Tags.ADAPTR)
+            if (gpsForwardingPreference.enabled) gnssForwarder.start()
             scope.launch {
-                if (carPlayReceiver !== receiver) return@launch
+                if (carPlayReceiver !== receiver ||
+                    carPlaySessionGeneration.get() != sessionGeneration ||
+                    receiver.activeControlGeneration != controlGeneration
+                ) {
+                    logDebug("[CP_RX] stale session-up UI update ignored (control generation=$controlGeneration)", tag = Logger.Tags.ADAPTR)
+                    return@launch
+                }
+                // The first-frame callback can win the dispatcher race while the phone is already
+                // sending media (notably during a switch with Settings covering the projection).
+                // Never let this delayed startup post demote that confirmed control generation or
+                // restore its "starting CarPlay" overlay text.
+                if (confirmedMediaReceiver === receiver &&
+                    confirmedMediaControlGeneration == controlGeneration
+                ) {
+                    logDebug("[CP_RX] session-up UI update arrived after first-frame confirmation; keeping STREAMING", tag = Logger.Tags.ADAPTR)
+                    return@launch
+                }
                 setState(State.DEVICE_CONNECTED)
                 val switchTarget = pendingPhoneSwitchTargetBtMac
                 setStatusText(
@@ -1262,6 +1317,7 @@ class CarlinkManager(
         receiver.onSessionDown = {
             val endedGeneration = carPlaySessionGeneration.incrementAndGet()
             logInfo("[CP_RX] phone control session ended; retiring phone-only state (generation=$endedGeneration)", tag = Logger.Tags.ADAPTR)
+            gnssForwarder.stop()
             scope.launch {
                 if (carPlayReceiver !== receiver) return@launch
                 // A quick reconnect can race this callback's main-thread work. Do not let teardown
@@ -1376,8 +1432,11 @@ class CarlinkManager(
         }
         lastTouchRoute = null
         lastTouchContactCount = 0
-        adapterActiveBtPeer?.let(receiver::setActiveBluetoothPeer)
-        adapterBtPhase?.let(receiver::setBluetoothPhase)
+        val multiSlotAdapter = client?.hasMultiIap2Slots == true
+        if (!multiSlotAdapter) {
+            adapterActiveBtPeer?.let(receiver::setActiveBluetoothPeer)
+            adapterBtPhase?.let(receiver::setBluetoothPhase)
+        }
         carPlayReceiver = receiver
         receiver.start()
         client?.takeIf { it.hasMultiIap2Slots }?.let {
@@ -2027,6 +2086,9 @@ class CarlinkManager(
 
         stop()
 
+        gnssForwarder.stop()
+        NativeCore.setLocationForwardingEnabled(false)
+
         releaseAudio()
 
         driveMonitor?.stop()
@@ -2468,7 +2530,24 @@ class CarlinkManager(
                     if (phase == Ocbm.BTP_IDLE) slots.remove(address) else slots[address] = phase
                     iap2SlotPhases = slots
                     schedulePreferredPhoneFallback(c)
-                    syncMultiPhoneReceiverTarget(c, mac)
+                    // Slot teardown is peer-scoped. An idle/reject for a different phone must
+                    // not make target synchronization feed IDLE to CarPlayRx, whose legacy phase
+                    // API clears its single pinned peer and handoff gate globally. Keep the
+                    // currently selected phone's receiver state intact while that phone still
+                    // owns a live iAP2 slot; reconcile normally when its own slot changes.
+                    val selected = adapterActiveBtPeer?.uppercase()
+                    val isTerminalSlotEvent =
+                        phase == Ocbm.BTP_IDLE || phase == Ocbm.BTP_PAIR_REJECTED
+                    val unrelatedTerminalEvent = isTerminalSlotEvent &&
+                        !selected.isNullOrBlank() && address != selected && selected in slots
+                    if (unrelatedTerminalEvent) {
+                        logInfo(
+                            "[MULTI_PHONE] keeping receiver target $selected; ignoring ${Ocbm.btpName(phase)} for unrelated slot $address",
+                            tag = Logger.Tags.PHONE,
+                        )
+                    } else {
+                        syncMultiPhoneReceiverTarget(c, mac)
+                    }
                     logInfo(
                         "[MULTI_PHONE] iAP2 slot $address -> ${Ocbm.btpName(phase)}",
                         tag = Logger.Tags.PHONE,
@@ -2910,16 +2989,17 @@ class CarlinkManager(
         previousPhoneSwitchTargetBtMac = previous
         pendingPhoneSwitchTargetBtMac = target
         temporaryPhoneTargetBtMac = target
-        receiver.setActiveBluetoothPeer(target)
-        receiver.setBluetoothPhase(Ocbm.BTP_WIFI_HANDOFF.toInt())
+        receiver.setHandoffTarget(target, ready = true)
         if (!receiver.disconnectActiveSessionForPhoneSwitch(target)) {
             pendingPhoneSwitchTargetBtMac = null
             previousPhoneSwitchTargetBtMac = null
             temporaryPhoneTargetBtMac = null
             // Restore the current session's pin if closing the incumbent failed.
             activeCarPlayBtMac?.let { current ->
-                receiver.setActiveBluetoothPeer(current)
-                receiver.setBluetoothPhase(iap2SlotPhases[current.uppercase()]?.toInt() ?: Ocbm.BTP_IDLE.toInt())
+                receiver.setHandoffTarget(
+                    current,
+                    ready = iap2SlotPhases[current.uppercase()] == Ocbm.BTP_WIFI_HANDOFF,
+                )
             }
             logWarn("[MULTI_PHONE] switch to $target could not close the incumbent CarPlay session", tag = Logger.Tags.PHONE)
             setStatusText("Couldn't switch CarPlay — try again")
@@ -2940,8 +3020,7 @@ class CarlinkManager(
             if (canRestore && client === owner && carPlayReceiver === receiver) {
                 val restoreMac = requireNotNull(restore)
                 logWarn("[MULTI_PHONE] switch to $target timed out before media; re-targeting prior phone $restoreMac", tag = Logger.Tags.PHONE)
-                receiver.setActiveBluetoothPeer(restoreMac)
-                receiver.setBluetoothPhase(Ocbm.BTP_WIFI_HANDOFF.toInt())
+                receiver.setHandoffTarget(restoreMac, ready = true)
                 receiver.refreshPhoneDiscovery()
                 setStatusText("Switch failed — reconnecting ${phoneNames[restoreMac.lowercase()] ?: restoreMac}...")
             } else {
@@ -3031,8 +3110,7 @@ class CarlinkManager(
         val phase = target?.let { slots[it] }
         if (target == null) {
             adapterActiveBtPeer = null
-            receiver.setBluetoothPhase(Ocbm.BTP_IDLE.toInt())
-            receiver.setActiveBluetoothPeer("")
+            receiver.setHandoffTarget(null, ready = false)
             return
         }
 
@@ -3044,12 +3122,12 @@ class CarlinkManager(
             }
             logInfo("[MULTI_PHONE] receiver target -> $target$selection", tag = Logger.Tags.PHONE)
         }
-        // setBluetoothPhase(IDLE) clears CarPlayRx's peer pin. A later slot update can select the
-        // same MAC (so `current == target`) without changing the manager-side target; always restore
-        // the pin before applying the authoritative per-slot phase.
+        // Multi-slot selection and readiness are separate: retain a preferred target even while
+        // its slot is pending, but don't authorize Bonjour connect-outs until this exact phone has
+        // completed Wi-Fi handoff. In particular, don't feed a missing slot as legacy IDLE, which
+        // clears the target globally and makes the later matching handoff impossible to identify.
         adapterActiveBtPeer = target
-        receiver.setActiveBluetoothPeer(target)
-        receiver.setBluetoothPhase((phase ?: Ocbm.BTP_IDLE).toInt())
+        receiver.setHandoffTarget(target, ready = phase == Ocbm.BTP_WIFI_HANDOFF)
     }
 
     private fun onMetadata(
@@ -3251,9 +3329,14 @@ class CarlinkManager(
                 logWarn("[MULTI_PHONE] media arrived for ${phone ?: "unknown phone"} while switch target is $pending; not completing switch", tag = Logger.Tags.PHONE)
                 return@launch
             }
+            confirmedMediaReceiver = receiver
+            confirmedMediaControlGeneration = controlGeneration
             streamingPhoneMac = phone
             lastStreamingStartMs = SystemClock.elapsedRealtime()
-            if (state == State.DEVICE_CONNECTED) setState(State.STREAMING)
+            // A valid first rendered frame is definitive for this control generation. Assigning
+            // rather than conditionally promoting also repairs a late session-up/session-down UI
+            // transition that raced the successful switch.
+            setState(State.STREAMING)
             if (pending != null) {
                 pendingPhoneSwitchTargetBtMac = null
                 previousPhoneSwitchTargetBtMac = null
@@ -3272,6 +3355,7 @@ class CarlinkManager(
                         "(control generation=$controlGeneration, video epoch=$videoEpochId)",
                     tag = Logger.Tags.ADAPTR,
                 )
+                setStatusText("CarPlay connected")
             }
         }
     }
