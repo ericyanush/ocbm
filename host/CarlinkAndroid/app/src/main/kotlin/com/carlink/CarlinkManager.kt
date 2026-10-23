@@ -476,6 +476,9 @@ class CarlinkManager(
     /** True when video start is deferred until a session exists and a valid Surface is present. */
     private var codecDeferred = true
 
+    /** A phone may reconnect while AAOS keeps a valid Surface belonging to a stopped Activity. */
+    private var videoPaused = false
+
     /** One-time [initialize] work (mic manager, MediaSession attach) has run. */
     private var initializedOnce = false
 
@@ -1363,6 +1366,9 @@ class CarlinkManager(
                 if (carPlayMicUplink == null) {
                     carPlayMicUplink = MicUplink(context).also { it.start() }
                 }
+                withContext(Dispatchers.IO) {
+                    restoreNativeSessionVideo(receiver, sessionGeneration, controlGeneration)
+                }
             }
         }
         receiver.onControlConnectionAccepted = { phoneMac, generation ->
@@ -1403,11 +1409,15 @@ class CarlinkManager(
                 }
                 withContext(Dispatchers.IO) {
                     // Joining the decoder can take up to 1.5s; never do it on the UI dispatcher.
-                    if (carPlayReceiver === receiver &&
-                        carPlaySessionGeneration.get() == endedGeneration && !receiver.sessionLive) {
-                        retireVideoEpoch("phone control session ended")
-                    } else {
-                        logInfo("[CP_RX] video epoch retirement skipped; a new phone session arrived", tag = Logger.Tags.ADAPTR)
+                    // Check under the epoch lock: otherwise a replacement can open its decoder
+                    // between this generation check and retirement acquiring that lock.
+                    synchronized(this@CarlinkManager) {
+                        if (carPlayReceiver === receiver &&
+                            carPlaySessionGeneration.get() == endedGeneration && !receiver.sessionLive) {
+                            retireVideoEpoch("phone control session ended")
+                        } else {
+                            logInfo("[CP_RX] video epoch retirement skipped; a new phone session arrived", tag = Logger.Tags.ADAPTR)
+                        }
                     }
                 }
             }
@@ -2243,6 +2253,7 @@ class CarlinkManager(
     @Synchronized
     private fun openVideoEpoch(surface: Surface) {
         val lanes = client?.lanes ?: return
+        if (videoPaused) return
         if (videoEpoch != null) return
         if (!surface.isValid) {
             logWarn("[LIFECYCLE] Video epoch skipped — surface invalid", tag = Logger.Tags.VIDEO)
@@ -2341,6 +2352,7 @@ class CarlinkManager(
      * Start video if it was deferred — i.e. a session exists and a valid Surface has arrived.
      * Both orders happen, so both sides call this.
      */
+    @Synchronized
     fun startCodecIfDeferred() {
         if (!codecDeferred) return
         val surface = videoSurface
@@ -2355,6 +2367,29 @@ class CarlinkManager(
         openVideoEpoch(surface)
     }
 
+    /** Reuse a surviving Surface after a phone switch, without reviving a superseded session. */
+    @Synchronized
+    private fun restoreNativeSessionVideo(
+        receiver: CarPlayRx,
+        sessionGeneration: Long,
+        controlGeneration: Long,
+    ) {
+        if (carPlayReceiver !== receiver ||
+            carPlaySessionGeneration.get() != sessionGeneration ||
+            receiver.activeControlGeneration != controlGeneration ||
+            mediaConfirmationGeneration != controlGeneration
+        ) {
+            logDebug("[LIFECYCLE] Ignoring stale video restore for control generation=$controlGeneration", tag = Logger.Tags.VIDEO)
+            return
+        }
+        if (videoPaused) {
+            logInfo("[LIFECYCLE] Video restore deferred while backgrounded (control generation=$controlGeneration)", tag = Logger.Tags.VIDEO)
+            return
+        }
+        logInfo("[LIFECYCLE] Restoring native session video (control generation=$controlGeneration, epoch=${videoEpoch?.seq})", tag = Logger.Tags.VIDEO)
+        startCodecIfDeferred()
+    }
+
     /**
      * Pause video when the app goes to background.
      *
@@ -2362,7 +2397,9 @@ class CarlinkManager(
      * by design, so a paused-but-open pipe would backpressure the OCBM read thread and stall
      * audio and control traffic too. A closed pipe returns false immediately and counts.
      */
+    @Synchronized
     fun pauseVideo() {
+        videoPaused = true
         logInfo("[LIFECYCLE] Pausing video for background", tag = Logger.Tags.VIDEO)
         cancelDelayedKeyframe()
         retireVideoEpoch("app backgrounded")
@@ -2371,7 +2408,9 @@ class CarlinkManager(
     /**
      * Resume video when the app returns to foreground.
      */
+    @Synchronized
     fun resumeVideo() {
+        videoPaused = false
         logInfo("[LIFECYCLE] Resuming video for foreground", tag = Logger.Tags.VIDEO)
         val surface = videoSurface
         if (surface == null || !surface.isValid) {
@@ -2403,12 +2442,14 @@ class CarlinkManager(
      * frame, whereas an epoch bump costs a codec teardown, a configure and an IDR wait anyway.
      * The watchdog bumps the epoch only if the frame counter proves the keyframe did not help.
      *
-     * Gated on a live video epoch, NOT on `state == STREAMING`: OCBM stamps STREAMING on the first
-     * media metadata, so a session can sit in DEVICE_CONNECTED with video on screen indefinitely
-     * (live-verified 2026-09-25: Back from Settings skipped the recovery there and left a stale
-     * frame). A retired epoch (no session, or stopped) is the only "nothing to recover".
+     * Also recover a missing epoch: a phone switch can retire the decoder while Settings keeps
+     * the same Surface alive. A keyframe alone cannot restore a decoder that no longer exists.
      */
     fun recoverVideoFromOverlay() {
+        if (videoEpoch == null) {
+            logInfo("[LIFECYCLE] Overlay closed with no decoder — retrying deferred video start", tag = Logger.Tags.VIDEO)
+            startCodecIfDeferred()
+        }
         val e = videoEpoch ?: return
         logInfo("[LIFECYCLE] Recovering video after overlay close (state=$state)", tag = Logger.Tags.VIDEO)
         val before = e.renderer.framesRendered.get()
