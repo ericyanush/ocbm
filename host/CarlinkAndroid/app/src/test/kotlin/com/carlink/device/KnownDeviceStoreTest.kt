@@ -19,6 +19,22 @@ import org.robolectric.RobolectricTestRunner
  */
 @RunWith(RobolectricTestRunner::class)
 class KnownDeviceStoreTest {
+    @Test
+    fun `single phone preference persists even when its display list is unchanged`() {
+        val s = store("single-phone-preference")
+        val mac = "02:00:00:aa:bb:01"
+        s.load()
+        s.update { it.withConnectedPhone(mac, "Test Phone A", 1000) }
+        val before = mergeDeviceList(s.snapshot.devices, setOf(mac), emptySet(), null) { "$it" }
+        s.update { it.copy(preferredMac = mac) }
+        val after = mergeDeviceList(s.snapshot.devices, setOf(mac), emptySet(), s.snapshot.preferredMac) { "$it" }
+        assertEquals(before, after) // UI must observe preference independently of the device list.
+        assertEquals(mac, s.snapshot.preferredMac)
+        s.close()
+        val restored = store("single-phone-preference")
+        assertEquals(mac, restored.load().preferredMac)
+        restored.close()
+    }
     private val ctx get() = ApplicationProvider.getApplicationContext<android.content.Context>()
 
     private fun store(name: String) = KnownDeviceStore(ctx, prefsName = name)

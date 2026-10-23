@@ -39,6 +39,29 @@ data class KnownDeviceSnapshot(
     val preferredMac: String? = null,
 )
 
+/** Native media confirmation must remember the phone even when adapter identity events are absent. */
+fun KnownDeviceSnapshot.withConnectedPhone(mac: String, name: String?, nowMs: Long): KnownDeviceSnapshot {
+    val key = mac.lowercase()
+    val previous = devices[key]
+    val record = previous?.copy(name = name?.takeIf { it.isNotBlank() } ?: previous.name, lastConnectedMs = nowMs)
+        ?: KnownDevice(mac = key, name = name?.takeIf { it.isNotBlank() }, firstSeenMs = nowMs, lastConnectedMs = nowMs)
+    return copy(devices = devices + (key to record))
+}
+
+/** Expire tombstones before learning/merging, so an expired entry cannot hide another refresh. */
+fun activeForgetSuppressions(entries: MutableMap<String, Long>, nowMs: Long): Set<String> {
+    entries.entries.removeIf { it.value <= nowMs }
+    return entries.keys.toSet()
+}
+
+/** A delayed identity from another native control session must never rename the selected phone. */
+fun nativePhoneIdentityMatches(identity: JSONObject, controlGeneration: Long, phoneMac: String?): Boolean {
+    val mac = identity.optString("deviceID")
+    return controlGeneration > 0 && identity.optLong("controlGeneration", -1) == controlGeneration &&
+        mac.matches(Regex("[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}")) &&
+        (phoneMac == null || mac.equals(phoneMac, ignoreCase = true))
+}
+
 /**
  * JSON form of [KnownDeviceSnapshot]. Separated from the store so it is testable without a Context.
  *
@@ -136,11 +159,14 @@ fun mergeDeviceList(
     suppressed: Set<String>,
     preferredMac: String?,
     iap2Slots: Map<String, Byte> = emptyMap(),
+    activePhoneMac: String? = null,
     formatLastSeen: (Long) -> String,
 ): List<DeviceInfo> {
     val bonded = bondedMacs.map { it.lowercase() }.toSet()
     val hidden = suppressed.map { it.lowercase() }.toSet()
-    val macs = (known.keys + bonded).filterNot { it in hidden }
+    val liveSlots = iap2Slots.filterValues { it != com.carlink.ocbm.Ocbm.BTP_IDLE }.keys.map { it.lowercase() }
+    val active = activePhoneMac?.lowercase()?.let { setOf(it) }.orEmpty()
+    val macs = (known.keys + bonded + liveSlots + active).filterNot { it in hidden }
 
     return macs
         .map { mac ->

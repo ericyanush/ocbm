@@ -92,6 +92,7 @@ fun PhonesTabContent(
 
     // Observe device list and connection state
     var pairedDevices by remember { mutableStateOf(carlinkManager.pairedDevices) }
+    var preferredBtMac by remember { mutableStateOf(carlinkManager.preferredBtMac) }
     var activeBtMac by remember { mutableStateOf(carlinkManager.activeCarPlayBtMac) }
     var hasLiveCarPlaySession by remember { mutableStateOf(carlinkManager.hasLiveCarPlaySession) }
     var activeWifi by remember { mutableIntStateOf(carlinkManager.currentWifi ?: -1) }
@@ -113,6 +114,7 @@ fun PhonesTabContent(
         val listener =
             CarlinkManager.DeviceListener { devices ->
                 pairedDevices = devices
+                preferredBtMac = carlinkManager.preferredBtMac
             }
         carlinkManager.addDeviceListener(listener)
         // Request fresh device list when tab opens
@@ -128,6 +130,7 @@ fun PhonesTabContent(
     LaunchedEffect(carlinkManager) {
         while (true) {
             activeBtMac = carlinkManager.activeCarPlayBtMac
+            preferredBtMac = carlinkManager.preferredBtMac
             hasLiveCarPlaySession = carlinkManager.hasLiveCarPlaySession
             activeWifi = carlinkManager.currentWifi ?: -1
             phoneType = carlinkManager.currentPhoneType
@@ -226,7 +229,7 @@ fun PhonesTabContent(
                     WirelessDeviceCard(
                         device = device,
                         isConnected = isDeviceActive,
-                        isPreferred = device.btMac.equals(carlinkManager.preferredBtMac, ignoreCase = true),
+                        isPreferred = device.btMac.equals(preferredBtMac, ignoreCase = true),
                         canSwitch =
                             !isDeviceActive &&
                                 device.iap2Phase == Ocbm.BTP_WIFI_HANDOFF &&
@@ -235,8 +238,9 @@ fun PhonesTabContent(
                         onSelect = {
                             view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                             carlinkManager.setPreferredDevice(
-                                if (device.btMac.equals(carlinkManager.preferredBtMac, ignoreCase = true)) null else device.btMac,
+                                if (device.btMac.equals(preferredBtMac, ignoreCase = true)) null else device.btMac,
                             )
+                            preferredBtMac = carlinkManager.preferredBtMac
                         },
                         onRemove = {
                             deviceToRemove = device
@@ -437,7 +441,7 @@ private fun WirelessDeviceCard(
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
-            OutlinedButton(
+            Button(
                 onClick = onSelect,
                 modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight),
             ) {

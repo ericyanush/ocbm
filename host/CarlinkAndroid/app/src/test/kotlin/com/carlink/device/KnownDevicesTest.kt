@@ -14,6 +14,73 @@ import org.junit.Test
  * self-consistent format, including one a future version cannot parse.
  */
 class KnownDevicesTest {
+    @Test
+    fun `native phone identity is accepted only for the current control session and phone`() {
+        val identity = org.json.JSONObject("""{"kind":"phoneIdentity","controlGeneration":42,"deviceID":"02:00:00:AA:BB:01","name":"Test Phone A"}""")
+        assertTrue(nativePhoneIdentityMatches(identity, 42, "02:00:00:aa:bb:01"))
+        assertTrue(nativePhoneIdentityMatches(identity, 42, null))
+        assertEquals(false, nativePhoneIdentityMatches(identity, 43, null))
+        assertEquals(false, nativePhoneIdentityMatches(identity, 42, "02:00:00:AA:BB:02"))
+        identity.put("deviceID", "")
+        assertEquals(false, nativePhoneIdentityMatches(identity, 42, null))
+    }
+    private val liveMac = "02:00:00:aa:bb:01"
+
+    @Test
+    fun `live iap2 slot appears before the bond snapshot and history arrive`() {
+        val out = mergeDeviceList(emptyMap(), emptySet(), emptySet(), null,
+            iap2Slots = mapOf(liveMac.uppercase() to com.carlink.ocbm.Ocbm.BTP_WIFI_HANDOFF)) { "t$it" }
+        assertEquals(listOf(liveMac), out.map { it.btMac })
+        assertEquals(com.carlink.ocbm.Ocbm.BTP_WIFI_HANDOFF, out.single().iap2Phase)
+        assertEquals(false, out.single().bonded) // A live slot does not invent a persisted bond.
+    }
+
+    @Test
+    fun `native active phone appears even without an adapter slot or bond`() {
+        val out = mergeDeviceList(emptyMap(), emptySet(), emptySet(), null,
+            activePhoneMac = liveMac.uppercase()) { "t$it" }
+        assertEquals(liveMac, out.single().btMac)
+    }
+
+    @Test
+    fun `forgotten phone stays hidden from stale active or slot observations`() {
+        val out = mergeDeviceList(emptyMap(), setOf(liveMac), setOf(liveMac), null,
+            iap2Slots = mapOf(liveMac.uppercase() to com.carlink.ocbm.Ocbm.BTP_WIFI_HANDOFF),
+            activePhoneMac = liveMac) { "t$it" }
+        assertTrue(out.isEmpty())
+    }
+
+    @Test
+    fun `confirmed native reconnect restores history while preserving preference and identity`() {
+        val original = KnownDeviceSnapshot(
+            devices = mapOf(liveMac to dev(liveMac, name = "Test Phone A", first = 10, last = 20)),
+            preferredMac = "another-phone",
+        )
+        val restored = original.withConnectedPhone(liveMac.uppercase(), null, 30)
+        assertEquals("another-phone", restored.preferredMac)
+        assertEquals("Test Phone A", restored.devices[liveMac]?.name)
+        assertEquals(10L, restored.devices[liveMac]?.firstSeenMs)
+        assertEquals(30L, restored.devices[liveMac]?.lastConnectedMs)
+        val fresh = KnownDeviceSnapshot().withConnectedPhone(liveMac, "New name", 30)
+        val merged = mergeDeviceList(fresh.devices, setOf(liveMac), emptySet(), null,
+            iap2Slots = mapOf(liveMac.uppercase() to com.carlink.ocbm.Ocbm.BTP_WIFI_HANDOFF), activePhoneMac = liveMac) { "t$it" }
+        assertEquals(1, merged.size)
+        assertEquals("New name", merged.single().name)
+    }
+
+    @Test
+    fun `expired suppression is removed before this merge and bond learning`() {
+        val suppressed = mutableMapOf(liveMac to 25L, "other" to 50L)
+        val hidden = activeForgetSuppressions(suppressed, 25)
+        assertEquals(setOf("other"), hidden)
+        assertEquals(listOf(liveMac), merge(emptyMap(), setOf(liveMac), hidden).map { it.btMac })
+    }
+
+    @Test
+    fun `idle slot alone does not resurrect a removed phone`() {
+        assertTrue(mergeDeviceList(emptyMap(), emptySet(), emptySet(), null,
+            iap2Slots = mapOf(liveMac.uppercase() to com.carlink.ocbm.Ocbm.BTP_IDLE)) { "t$it" }.isEmpty())
+    }
     private fun dev(
         mac: String,
         name: String? = null,

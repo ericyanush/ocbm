@@ -254,11 +254,11 @@ pub const PHONE_IDENT_FILE: &str = "/tmp/phone_identity";
 /// Written whole with a rename so ocbmd can never read a half-written file, and skipped entirely
 /// when the plist carries no name (nothing useful to say, and clobbering a good value with an empty
 /// one would make the host forget a phone it already knows).
-fn publish_phone_identity(d: &Dictionary) {
+fn phone_identity_json(d: &Dictionary, generation: u64) -> Option<String> {
     let get = |k: &str| d.get(k).and_then(|v| v.as_string()).unwrap_or("");
     let name = get("name");
     if name.is_empty() {
-        return;
+        return None;
     }
     // Hand-built JSON: the box crates carry no serializer, the field set is fixed, and the values are
     // short ASCII-ish strings from Apple. Quotes, backslashes and control characters are all escaped —
@@ -279,14 +279,21 @@ fn publish_phone_identity(d: &Dictionary) {
         }
         out
     };
-    let json = format!(
-        r#"{{"name":"{}","deviceID":"{}","model":"{}","osName":"{}","osVersion":"{}"}}"#,
+    Some(format!(
+        r#"{{"kind":"phoneIdentity","controlGeneration":{generation},"name":"{}","deviceID":"{}","model":"{}","osName":"{}","osVersion":"{}"}}"#,
         esc(name),
         esc(get("deviceID")),
         esc(get("model")),
         esc(get("osName")),
         esc(get("osVersion")),
-    );
+    ))
+}
+
+fn publish_phone_identity(d: &Dictionary, generation: u64) {
+    let Some(json) = phone_identity_json(d, generation) else { return; };
+    // On AAOS /tmp is not writable and ocbmd is on another machine. Carry SETUP identity
+    // through the existing in-process receiver's metadata seam, fenced by control generation.
+    iap2_core::metadata::emit_json(&json);
     let tmp = format!("{PHONE_IDENT_FILE}.tmp");
     if std::fs::write(&tmp, json.as_bytes())
         .and_then(|_| std::fs::rename(&tmp, PHONE_IDENT_FILE))
@@ -1885,7 +1892,7 @@ impl SessionDelegate for AvSession {
         // ocbmd to mirror to the host app — see `PHONE_IDENT_FILE`.
         if !has_streams {
             if let Some(d) = dict.as_ref() {
-                publish_phone_identity(d);
+                publish_phone_identity(d, self.generation);
             }
         }
         let keep_alive = dict
@@ -3147,6 +3154,16 @@ fn ntp_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_setup_identity_includes_generation_and_escapes_user_name() {
+        let mut d = Dictionary::new();
+        assert_eq!(phone_identity_json(&d, 42), None);
+        d.insert("name".into(), Value::String("Test\"s\niPhone".into()));
+        d.insert("deviceID".into(), Value::String("02:00:00:AA:BB:01".into()));
+        assert_eq!(phone_identity_json(&d, 42).unwrap(),
+            r#"{"kind":"phoneIdentity","controlGeneration":42,"name":"Test\"s\niPhone","deviceID":"02:00:00:AA:BB:01","model":"","osName":"","osVersion":""}"#);
+    }
 
     #[test]
     fn direct_callback_must_identify_selected_phone_before_media_setup() {

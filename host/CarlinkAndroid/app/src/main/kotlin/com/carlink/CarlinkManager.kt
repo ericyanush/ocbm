@@ -28,6 +28,9 @@ import com.carlink.device.KnownDevice
 import com.carlink.device.KnownDeviceSnapshot
 import com.carlink.device.KnownDeviceStore
 import com.carlink.device.mergeDeviceList
+import com.carlink.device.activeForgetSuppressions
+import com.carlink.device.withConnectedPhone
+import com.carlink.device.nativePhoneIdentityMatches
 import com.carlink.gnss.GnssForwarder
 import com.carlink.gnss.GpsForwardingPreference
 import com.carlink.logging.Logger
@@ -715,6 +718,13 @@ class CarlinkManager(
     // its device list during that window still contains the device; suppress the MAC from merges
     // until expiry or the card resurrects seconds after the user removed it.
     private val recentlyForgotten = mutableMapOf<String, Long>()
+    private val forgottenControlGenerations = mutableMapOf<String, Long>()
+
+    private fun suppressedDeviceMacs(): Set<String> = synchronized(deviceListLock) {
+        val active = activeForgetSuppressions(recentlyForgotten, SystemClock.elapsedRealtime())
+        forgottenControlGenerations.keys.retainAll(active)
+        active
+    }
 
     /**
      * Atomically mutate the device list under [deviceListLock], filtering out recently-forgotten
@@ -1769,7 +1779,7 @@ class CarlinkManager(
             // connects and CT_PHONE_IDENT names it. Suppressed MACs are deliberately NOT learned:
             // the box's snapshot lags its own forget, and persisting one here would defeat the
             // suppression window permanently.
-            val suppressed = synchronized(deviceListLock) { recentlyForgotten.keys.toSet() }
+            val suppressed = suppressedDeviceMacs()
             val unknown = bonded - (knownStore?.snapshot?.devices?.keys ?: emptySet()) - suppressed
             if (unknown.isNotEmpty()) {
                 val now = System.currentTimeMillis()
@@ -1833,6 +1843,12 @@ class CarlinkManager(
         // box processes the forget — its snapshot still contains the device for a while.
         synchronized(deviceListLock) {
             recentlyForgotten[mac] = SystemClock.elapsedRealtime() + FORGET_SUPPRESS_MS
+            val receiver = carPlayReceiver
+            if (receiver?.sessionPhoneMac.equals(mac, ignoreCase = true)) {
+                forgottenControlGenerations[mac] = requireNotNull(receiver).activeControlGeneration
+            } else {
+                forgottenControlGenerations.remove(mac)
+            }
         }
         // Delete the remembered record in the same breath. `recentlyForgotten` is in-memory and
         // elapsedRealtime-based, so it cannot cover storage: without this the device returns when
@@ -2898,6 +2914,9 @@ class CarlinkManager(
             return
         }
         phoneNames[mac] = cleanName
+        // Bonjour may replay an old advertisement after Forget. Only a confirmed new native
+        // session or explicit phone identity may clear suppression and resurrect durable history.
+        if (mac in suppressedDeviceMacs()) return
         val now = System.currentTimeMillis()
         knownStore?.update { snap ->
             val prev = snap.devices[mac]
@@ -2997,9 +3016,10 @@ class CarlinkManager(
                 mergeDeviceList(
                     known = snap.devices,
                     bondedMacs = bondedMacs,
-                    suppressed = recentlyForgotten.keys.toSet(),
+                    suppressed = suppressedDeviceMacs(),
                     preferredMac = snap.preferredMac,
                     iap2Slots = iap2SlotPhases,
+                    activePhoneMac = activeCarPlayBtMac,
                     formatLastSeen = ::formatLastSeen,
                 )
             }
@@ -3220,6 +3240,17 @@ class CarlinkManager(
             Ocbm.META_JSON -> {
                 val obj = runCatching { JSONObject(String(payload, Charsets.UTF_8)) }.getOrNull() ?: return
                 when (obj.optString("kind")) {
+                    "phoneIdentity" -> scope.launch {
+                        val rx = carPlayReceiver ?: return@launch
+                        val generation = obj.optLong("controlGeneration", -1L)
+                        val mac = obj.optString("deviceID").lowercase()
+                        if (!rx.sessionLive || !nativePhoneIdentityMatches(obj, rx.activeControlGeneration, rx.sessionPhoneMac)) return@launch
+                        // An identity queued by the session being removed cannot undo Forget.
+                        if (synchronized(deviceListLock) {
+                                mac in suppressedDeviceMacs() && forgottenControlGenerations[mac] == generation
+                            }) return@launch
+                        onPhoneIdentity(obj.toString())
+                    }
                     "nowPlaying" -> scope.launch { processNowPlaying(obj) }
                     "callState" -> CallState.fromJson(obj)?.let { cs -> scope.launch { onCallState(cs) } }
                     // 0 = no route. Claiming NAVIGATION app focus is the 3P way to tell AAOS the
@@ -3414,6 +3445,23 @@ class CarlinkManager(
             confirmedMediaReceiver = receiver
             confirmedMediaControlGeneration = controlGeneration
             streamingPhoneMac = phone
+            phone?.lowercase()?.takeIf { BLUETOOTH_MAC.matches(it) }?.let { mac ->
+                val freshConnection = synchronized(deviceListLock) {
+                    if (mac in suppressedDeviceMacs() && forgottenControlGenerations[mac] == controlGeneration) {
+                        false // A queued frame from the session being forgotten cannot undo Remove.
+                    } else {
+                        recentlyForgotten.remove(mac)
+                        forgottenControlGenerations.remove(mac)
+                        true
+                    }
+                }
+                if (freshConnection) {
+                    _connectedBtMac = mac
+                    knownStore?.update { it.withConnectedPhone(mac, phoneNames[mac], System.currentTimeMillis()) }
+                    logInfo("[PHONE] native media confirmed device=$mac; remembered and cleared forget suppression", tag = Logger.Tags.PHONE)
+                    rebuildDeviceList()
+                }
+            }
             lastStreamingStartMs = SystemClock.elapsedRealtime()
             // A valid first rendered frame is definitive for this control generation. Assigning
             // rather than conditionally promoting also repairs a late session-up/session-down UI
