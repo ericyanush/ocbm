@@ -57,7 +57,7 @@ class NativeStartSession(
 
     fun endpoint(): JSONObject {
         val rx = checkNotNull(receiver()) { "Native receiver is unavailable" }
-        val credentials = checkNotNull(hotspot()) { "Hotspot credentials unavailable" }
+        val credentials = hotspot() ?: throw HotspotNotReady("Hotspot credentials unavailable; waiting for saved settings")
         val iface = StartSessionHotspot.select(StartSessionHotspot.snapshot())
         val addresses = iface.usableAddresses
         check(addresses.isNotEmpty() && addresses.size <= 16) { "Hotspot addresses unavailable" }
@@ -72,6 +72,10 @@ class NativeStartSession(
         waiting = { evidence ->
             report("StartSession waiting for vehicle hotspot...")
             log("waiting for hotspot: $evidence")
+        },
+        recovered = { endpoint ->
+            log("hotspot readiness recovered: interface=${endpoint.optString("interface")} addresses=${endpoint.optJSONArray("addresses")} port=${endpoint.optInt("port")}")
+            report("Vehicle hotspot ready — preparing CarPlay...")
         },
     )
 

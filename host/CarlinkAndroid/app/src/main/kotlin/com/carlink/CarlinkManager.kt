@@ -56,6 +56,7 @@ import com.carlink.ocbm.VehicleConfigSpec
 import com.carlink.ocbm.VehicleConfigYaml
 import com.carlink.ocbm.VehicleHotspotCredentials
 import com.carlink.ocbm.VehicleHotspotStore
+import com.carlink.ocbm.awaitHotspotReady
 import com.carlink.ocbm.seam.SeamPipe
 import com.carlink.ocbm.seam.SeamCrypto
 import com.carlink.ocbm.seam.VoiceTag
@@ -620,7 +621,7 @@ class CarlinkManager(
     private val nativeStart by lazy {
         com.carlink.ocbm.NativeStartSession(
             scope, receiver = { carPlayReceiver }, send = { client?.startSessionRequest(it) == true },
-            hotspot = { VehicleHotspotStore(context).credentials() }, status = { setStatusText(it) },
+            hotspot = { VehicleHotspotStore(context).credentialsForStartSession() }, status = { setStatusText(it) },
             log = { logInfo("[START_SESSION] $it", tag = Logger.Tags.PHONE) },
         )
     }
@@ -1126,7 +1127,28 @@ class CarlinkManager(
 
         // The adapter's 0x5703 reply is sourced from these values. Without them, its stock AP
         // (e.g. ccpa-fe01) is handed to the iPhone and poisons the wireless join for this session.
-        val hotspot = VehicleHotspotStore(context).credentials()
+        val credentialsOwner = connectionGeneration.get()
+        val hotspot = try {
+            withContext(Dispatchers.IO) {
+                kotlinx.coroutines.withTimeout(60_000) {
+                    awaitHotspotReady(
+                        isCurrent = { !released && connectionGeneration.get() == credentialsOwner },
+                        read = { VehicleHotspotStore(context).credentialsForStartSession() },
+                        waiting = { evidence ->
+                            setStatusText("Waiting for saved vehicle hotspot credentials...")
+                            logWarn("[HOTSPOT] Connection preparation waiting: $evidence", tag = Logger.Tags.ADAPTR)
+                        },
+                        recovered = { logInfo("[HOTSPOT] Saved credentials recovered; resuming connection preparation", tag = Logger.Tags.ADAPTR) },
+                    )
+                }
+            }
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            if (released || connectionGeneration.get() != credentialsOwner) return
+            setState(State.DISCONNECTED)
+            logWarn("[HOTSPOT] Saved credentials still unreadable after 60s; scheduling connection retry", tag = Logger.Tags.ADAPTR)
+            scheduleReconnect()
+            return
+        }
         if (hotspot == null) {
             setState(State.DISCONNECTED)
             setStatusText("Set vehicle hotspot Wi-Fi in Settings before connecting")

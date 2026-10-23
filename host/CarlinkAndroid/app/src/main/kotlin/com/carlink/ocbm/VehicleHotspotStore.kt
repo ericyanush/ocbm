@@ -4,7 +4,11 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import com.carlink.logging.Logger
+import com.carlink.logging.logInfo
+import com.carlink.logging.logWarn
 import java.security.KeyStore
+import java.security.UnrecoverableKeyException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -54,19 +58,38 @@ class VehicleHotspotStore(
         val security: Int = 2,
     )
 
-    fun fields(): Fields =
+    fun fields(): Fields = readFields(waitForPassword = false)
+
+    private fun readFields(waitForPassword: Boolean): Fields =
         Fields(
             ssid = prefs.getString(KEY_SSID, "").orEmpty(),
-            password = runCatching { decryptPassword() }.getOrNull().orEmpty(),
+            password = readPassword(waitForPassword).orEmpty(),
             channel = prefs.getString(KEY_CHANNEL, "").orEmpty(),
             security = prefs.getInt("security", 2),
         )
 
-    fun credentials(): VehicleHotspotCredentials? {
-        val fields = fields()
+    fun credentials(): VehicleHotspotCredentials? = credentialsFrom(fields())
+
+    /** A saved password failing to decrypt during AAOS sleep/wake must not reject a phone slot. */
+    internal fun credentialsForStartSession(): VehicleHotspotCredentials? =
+        credentialsFrom(readFields(waitForPassword = true))
+
+    private fun credentialsFrom(fields: Fields): VehicleHotspotCredentials? {
         val channel = fields.channel.toIntOrNull() ?: return null
         val credentials = VehicleHotspotCredentials(fields.ssid, fields.password, channel, fields.security)
         return credentials.takeIf { it.validationError() == null }
+    }
+
+    private fun readPassword(waitForPassword: Boolean): String? = try {
+        decryptPassword().also { if (it != null) recordPasswordRead(null) }
+    } catch (e: Exception) {
+        // Exception messages/stack traces can contain provider input. Log only exception types,
+        // never the password, ciphertext, IV, or values from SharedPreferences.
+        val types = generateSequence<Throwable>(e) { it.cause }.take(4)
+            .joinToString(" -> ") { it.javaClass.simpleName }
+        recordPasswordRead(types)
+        if (waitForPassword) throw HotspotNotReady("Saved hotspot password temporarily unreadable ($types); retrying")
+        null
     }
 
     /** Validates and commits all fields together so a key-cycle never sees a partially saved set. */
@@ -102,13 +125,15 @@ class VehicleHotspotStore(
         val ciphertext = prefs.getString(KEY_PASSWORD_CIPHERTEXT, null) ?: return null
         val iv = prefs.getString(KEY_PASSWORD_IV, null)?.let { Base64.decode(it, Base64.NO_WRAP) } ?: return null
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(GCM_TAG_BITS, iv))
+        cipher.init(Cipher.DECRYPT_MODE, secretKey(createIfMissing = false), GCMParameterSpec(GCM_TAG_BITS, iv))
         return cipher.doFinal(Base64.decode(ciphertext, Base64.NO_WRAP)).toString(Charsets.UTF_8)
     }
 
-    private fun secretKey(): SecretKey {
+    private fun secretKey(createIfMissing: Boolean = true): SecretKey {
         val keyStore = KeyStore.getInstance(ANDROID_KEY_STORE).apply { load(null) }
         (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        // A failed read must never replace the key protecting an already saved password.
+        if (!createIfMissing) throw UnrecoverableKeyException("Saved hotspot key unavailable")
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEY_STORE)
         val spec =
             KeyGenParameterSpec
@@ -124,6 +149,19 @@ class VehicleHotspotStore(
     }
 
     private companion object {
+        private var lastPasswordFailure: String? = null
+
+        @Synchronized
+        fun recordPasswordRead(failure: String?) {
+            if (lastPasswordFailure == failure) return
+            if (failure == null) {
+                logInfo("[HOTSPOT] Saved password read recovered", tag = Logger.Tags.ADAPTR)
+            } else {
+                logWarn("[HOTSPOT] Saved password read failed: $failure; stored settings retained", tag = Logger.Tags.ADAPTR)
+            }
+            lastPasswordFailure = failure
+        }
+
         const val PREFS_NAME = "vehicle_hotspot"
         const val KEY_SSID = "ssid"
         const val KEY_PASSWORD_CIPHERTEXT = "password_ciphertext"
