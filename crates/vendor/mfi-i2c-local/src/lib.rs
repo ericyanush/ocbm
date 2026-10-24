@@ -1,4 +1,4 @@
-//! One local MFi 2.0C implementation for every box daemon. Whole operations share the
+//! One local MFi 2.0B implementation for every box daemon. Whole operations share the
 //! cross-process lock; busy NACKs are retried without reopening/resetting the controller.
 //! Remote MFI1 behavior remains available through try_cert/try_sign for hosts without a chip.
 mod protocol;

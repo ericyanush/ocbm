@@ -1,4 +1,4 @@
-# MFi 2.0C I2C handling and hardware checks
+# MFi 2.0B I2C handling and hardware checks
 
 All adapter chip access now uses `crates/vendor/mfi-i2c-local`: OCBM host requests in `ocbmd`,
 Bluetooth iAP2 in `btd`, wired iAP2 in `iap2d`, `carplayd`'s signer and native iAP2 tunnel, and
@@ -7,17 +7,20 @@ No AAOS app or USB-helper protocol changes are required.
 
 ## Register transactions
 
-The 2.0C specification says to expect busy NACKs instead of clock stretching (pages 31–32 and 38).
+The added 2.0B specification identifies DeviceVersion `0x03` as the 2.0B coprocessor (p.19),
+defines register `0x05` as read-to-clear (p.20), and requires signature capacity `0x0080` before
+signing (p.22). It permits the observed busy-NACK behavior during processing (p.31).
 Register reads retain the combined I2C write/read transaction: the intervening STOP is optional.
-The continuous certificate read is also explicitly permitted. The shared driver leaves bus speed,
-kernel timeout configuration, chip power and reset pins unchanged.
+The continuous certificate read is explicitly permitted (p.23). The shared driver leaves bus
+speed, kernel timeout configuration, chip power and reset pins unchanged.
 
-The standard signing sequence clears the previous error, writes challenge length/data, initializes
+The 2.0B signing sequence clears the previous error, writes challenge length/data, initializes
 signature capacity at `0x11` to `0x0080`, and then triggers `0x10=1`. This adapter needs an explicit
-compatibility profile: DeviceVersion `0x03` together with an unsupported error register (`0xff`)
-selects `cpc200-v03`, which preserves the existing sequence without that capacity write. A direct
-RSA test on this hardware verified the old sequence and rejected the capacity-initialized sequence
-for the same challenge and certificate. Other parts retain the documented capacity initialization.
+compatibility profile: DeviceVersion `0x03` identifies it as 2.0B, but its error register reads
+`0xff` (unsupported). That exact CPC200 profile preserves its prior initialized-capacity state
+without writing `0x11`. A direct RSA test verified signatures from that path and rejected signatures
+after writing the documented capacity value for the same challenge and certificate. Other profiles
+retain the documented capacity initialization.
 Diagnostics report the version, selected profile and whether capacity was initialized.
 Completion requires status `0x10`,
 with a successful signature process result and no error flag. Another process result with bit 4 set
@@ -129,8 +132,8 @@ stretching faults.
 
 ## References
 
-- Local specification: `CPC200-CCPA_resources/hardware/MFI337S3959_iPod_Auth_Coprocessor_2.0C_spec.pdf`
-  in the parent workspace (signature capacity p.22; continuous certificate read p.23; I2C p.31–32,38).
+- Local specification: `CPC200-CCPA_resources/hardware/mfi-20b_compress.pdf` in the parent workspace
+  (version p.19; error code p.20; capacity p.22; certificate read p.23; I2C p.31–32).
 - [Apple HomeKit ADK signing sequence](https://github.com/apple/HomeKitADK/blob/master/HAP/HAPMFiHWAuth.c)
 - [Apple POSIX I2C implementation](https://github.com/apple/HomeKitADK/blob/master/PAL/POSIX/HAPPlatformMFiHWAuth.c)
 - Board evidence: `CPC200-CCPA_resources/documentation/_evidence/MFi_research/docs/register_map.md`

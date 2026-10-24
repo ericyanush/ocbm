@@ -1,4 +1,4 @@
-//! Shared 2.0C transaction policy. No hardware or sleeping in tests: the bus and clock are injected.
+//! Shared MFi 2.0B transaction policy. No hardware or sleeping in tests: bus and clock are injected.
 use std::{fmt, time::Duration};
 
 const REGISTER_WAIT: Duration = Duration::from_millis(250);
@@ -180,7 +180,7 @@ impl<B: Bus, C: Clock> Driver<B, C> {
 
     fn clear_error(&mut self) -> Result<(), Error> {
         let mut value = [0];
-        self.read(0x05, &mut value)?; // Clear-on-read on genuine 2.0C.
+        self.read(0x05, &mut value)?; // Read-to-clear per the 2.0B register map.
                                       // Board probes report 0xff on this register on some adapters. Record it, but do not
                                       // reject an otherwise valid operation merely because this register is unimplemented.
         self.stats.error_register = Some(value[0]);
@@ -242,7 +242,7 @@ impl<B: Bus, C: Clock> Driver<B, C> {
                     return Ok(None);
                 }
                 let mut cert = vec![0; n];
-                // Continuous reads across certificate pages are permitted by the 2.0C spec.
+                // Continuous reads across certificate pages are permitted by the 2.0B spec.
                 self.read(0x31, &mut cert)?;
                 if !self.confirm_post_certificate_length(n)? || !valid_der_envelope(&cert) {
                     return Ok(None);
@@ -269,9 +269,11 @@ impl<B: Bus, C: Clock> Driver<B, C> {
         let mut version = [0];
         self.read(0x00, &mut version)?;
         self.stats.device_version = Some(version[0]);
-        // Verified on CPC200 hardware: this v03 device has no error register and writing
-        // signature capacity corrupts the returned RSA signature. Its existing sequence
-        // verifies successfully without that write. Keep the standard sequence for other parts.
+        // Version 0x03 identifies the 2.0B coprocessor. The spec says to set signature capacity
+        // to 128 bytes before signing. This CPC200 reports 0xff from the error register and was
+        // verified to return invalid RSA signatures if we write that capacity. Its existing
+        // initialized-capacity path verifies without the write; keep this hardware-specific
+        // exception limited to the observed version/error-register combination.
         let legacy = version[0] == 0x03 && self.stats.error_register == Some(0xff);
         self.stats.compatibility_profile = Some(if legacy { "cpc200-v03" } else { "2.0c" });
         self.write(0x20, &(challenge.len() as u16).to_be_bytes())?;
