@@ -2678,14 +2678,17 @@ class CarlinkManager(
         c.onIap2Slot = { mac, phase ->
             if (client === c && connectionGeneration.get() == ownerGeneration) {
                 scope.launch {
+                    if (client !== c || connectionGeneration.get() != ownerGeneration) return@launch
+                    if (nativeStartForConnection) {
+                        // Legacy phase events have only a MAC, not a slot ID. A delayed IDLE from
+                        // the previous connection must not erase a replacement StartSession slot.
+                        logDebug("[MULTI_PHONE] ignoring unscoped iAP2 phase in StartSession mode: $mac ${Ocbm.btpName(phase)}", tag = Logger.Tags.PHONE)
+                        return@launch
+                    }
                     val slots = iap2SlotPhases.toMutableMap()
                     val address = mac.uppercase()
                     if (phase == Ocbm.BTP_IDLE) slots.remove(address)
-                    else if (!nativeStartForConnection || slots[address] != Ocbm.BTP_WIFI_HANDOFF) {
-                        // In strict mode only a 0x4300 availability event authorizes this slot.
-                        // The earlier 0x5703 credential exchange is insufficient for selection.
-                        slots[address] = if (nativeStartForConnection && phase == Ocbm.BTP_WIFI_HANDOFF) Ocbm.BTP_IDENTIFIED else phase
-                    }
+                    else slots[address] = phase
                     iap2SlotPhases = slots
                     schedulePreferredPhoneFallback(c)
                     // Slot teardown is peer-scoped. An idle/reject for a different phone must

@@ -2470,8 +2470,8 @@ impl Daemon {
     fn start_session_request(&mut self, bytes: &[u8]) {
         use carplay_start_session::{Event, Request};
         let parsed = Request::parse(bytes);
-        let mut event = Event { version: 1, peer_mac: String::new(), slot_id: String::new(), request_id: String::new(),
-            receiver_epoch: String::new(), stage: "failed".into(), reason: String::new(), available: false };
+        let mut event = Event { version: 1, peer_mac: String::new(), slot_id: String::new(), slot_started_at: 0, request_id: String::new(),
+            receiver_epoch: String::new(), stage: "failed".into(), reason: String::new(), failure_reason: None, available: false };
         if let Ok(r) = &parsed {
             event.peer_mac = r.peer_mac.clone(); event.slot_id = r.slot_id.clone();
             event.request_id = r.request_id.clone(); event.receiver_epoch = r.receiver_epoch.clone();

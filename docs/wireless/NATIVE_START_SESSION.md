@@ -70,6 +70,14 @@ The supervisor tracks its pending detached Bluetooth launch by PID, and `btd` ho
 `/tmp/ocbm_btd.lock` for its process lifetime before initializing the controller.
 Duplicate starts exit without touching Bluetooth or publishing slot state.
 
+Slot events include `slotStartedAt` (monotonic adapter uptime in nanoseconds). A slot
+always ends with `stage=ended`, including after failure; `failureReason` preserves
+the preceding error. Old threads cannot overwrite a replacement's event file. The
+main app rejects retired/older slots and obsolete request replies, and uses only
+slot-scoped StartSession events for readiness while the experiment is enabled.
+MAC-only legacy phase events cannot erase a new connection. A new slot is eligible
+even when the preceding slot was blocked after a transport failure or timeout.
+
 ## Control contract
 
 `CAP_CARPLAY_START_SESSION` is `0x80`. `CT_CARPLAY_START_SESSION` (`0x20`) carries

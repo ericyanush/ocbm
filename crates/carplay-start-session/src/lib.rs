@@ -133,10 +133,15 @@ pub struct Event {
     pub version: u8,
     pub peer_mac: String,
     pub slot_id: String,
+    /// Monotonic adapter uptime in nanoseconds; orders slots across btd restarts in one boot.
+    #[serde(default)]
+    pub slot_started_at: u64,
     pub request_id: String,
     pub receiver_epoch: String,
     pub stage: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     pub available: bool,
 }
 

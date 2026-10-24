@@ -21,15 +21,49 @@ struct Bootstrap {
 }
 thread_local! { static CURRENT: RefCell<Option<Bootstrap>> = const { RefCell::new(None) }; }
 
+static EVENT_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn write_slot_event(path: &std::path::Path, event: &Event) -> std::io::Result<bool> {
+    let _guard = EVENT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = fs::read(path).ok().and_then(|b| serde_json::from_slice::<Event>(&b).ok()) {
+        if current.slot_id != event.slot_id &&
+            (event.stage != "connected" || current.slot_started_at >= event.slot_started_at) {
+            return Ok(false);
+        }
+    }
+    let bytes = serde_json::to_vec(event)?;
+    carplay_start_session::write_atomic(path, &bytes)?;
+    Ok(true)
+}
+
+fn monotonic_slot_start() -> u64 {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
+    }
+    (time.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(time.tv_nsec as u64)
+}
+
+fn end_event(event: &mut Event) {
+    if matches!(event.stage.as_str(), "failed" | "unsupported") {
+        event.failure_reason = Some(event.reason.clone());
+    }
+    event.stage = "ended".into();
+    event.reason = "RFCOMM connection ended".into();
+    event.available = false;
+}
+
 fn publish(b: &mut Bootstrap, stage: &str, reason: &str) {
     b.event.stage = stage.into();
     b.event.reason = reason.into();
     b.event.available = b.gate.available && b.gate.identified;
-    if let Ok(bytes) = serde_json::to_vec(&b.event) {
-        let _ = carplay_start_session::write_atomic(
-            &carplay_start_session::event_path(&b.event.peer_mac),
-            &bytes,
-        );
+    match write_slot_event(&carplay_start_session::event_path(&b.event.peer_mac), &b.event) {
+        Ok(true) => {},
+        Ok(false) => {
+            crate::log(&format!("ignoring superseded StartSession event peer={} slot={} stage={stage}", b.event.peer_mac, b.event.slot_id));
+            return;
+        }
+        Err(e) => crate::log(&format!("cannot publish StartSession event: {e}")),
     }
     crate::log(&format!(
         "StartSession peer={} slot={} request={} receiver={} stage={} available={} reason={}",
@@ -73,10 +107,12 @@ pub fn begin(peer: &[u8; 6]) -> bool {
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ),
+            slot_started_at: monotonic_slot_start(),
             request_id: String::new(),
             receiver_epoch: String::new(),
             stage: String::new(),
             reason: String::new(),
+            failure_reason: None,
             available: false,
         },
         gate: Gate::default(),
@@ -98,13 +134,8 @@ pub fn finish() {
     CURRENT.with(|c| {
         if let Some(mut b) = c.borrow_mut().take() {
             b.gate.available = false;
-            let stage = b.event.stage.clone();
-            let reason = b.event.reason.clone();
-            if matches!(stage.as_str(), "failed" | "unsupported") {
-                publish(&mut b, &stage, &reason);
-            } else {
-                publish(&mut b, "ended", "RFCOMM connection ended");
-            }
+            end_event(&mut b.event);
+            publish(&mut b, "ended", "RFCOMM connection ended");
         }
     });
 }
@@ -190,4 +221,43 @@ pub fn poll(
             b.event.peer_mac, e.device_id, e.interface, e.addresses, e.port, &e.public_key[..8]));
         publish(b, "sent", ""); false
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(slot: &str, start: u64, stage: &str) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "peerMac": "02:00:00:AA:BB:01", "slotId": slot,
+            "slotStartedAt": start, "requestId": "request", "receiverEpoch": "receiver",
+            "stage": stage, "reason": "write failed", "available": true
+        })).unwrap()
+    }
+
+    #[test]
+    fn closing_a_failed_slot_always_publishes_ended_and_preserves_failure() {
+        for stage in ["failed", "unsupported", "available"] {
+            let mut e = event("slot-1", 1, stage);
+            end_event(&mut e);
+            assert_eq!(e.stage, "ended");
+            assert!(!e.available);
+            assert_eq!(e.failure_reason.as_deref(), if stage == "available" { None } else { Some("write failed") });
+        }
+    }
+
+    #[test]
+    fn old_slot_teardown_cannot_overwrite_a_replacement_even_if_connected_is_replayed() {
+        let path = std::env::temp_dir().join(format!("ocbm-slot-event-test-{}.json", std::process::id()));
+        let old = event("slot-1", 10, "connected");
+        assert!(write_slot_event(&path, &old).unwrap());
+        let replacement = event("slot-2", 20, "connected");
+        assert!(write_slot_event(&path, &replacement).unwrap());
+        let mut ended = old.clone();
+        end_event(&mut ended);
+        assert!(!write_slot_event(&path, &ended).unwrap());
+        assert!(!write_slot_event(&path, &old).unwrap());
+        assert_eq!(serde_json::from_slice::<Event>(&fs::read(&path).unwrap()).unwrap().slot_id, "slot-2");
+        fs::remove_file(path).unwrap();
+    }
 }

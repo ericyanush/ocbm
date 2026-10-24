@@ -29,6 +29,7 @@ class NativeStartSession(
     }
     private val slots = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
     private val blocked = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val retiredSlots = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val generation = java.util.concurrent.atomic.AtomicLong(0)
     @Volatile private var request: JSONObject? = null
     private var pendingPeer: String? = null
@@ -85,10 +86,45 @@ class NativeStartSession(
         if (!peer.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}"))) return null
         val stage = e.optString("stage")
         if (stage == "queued") { log("request=${e.optString("requestId")} queued; Bluetooth write still pending"); return null }
-        // 'queued' is an acknowledgement, not a replacement for authoritative slot readiness.
-        if (stage != "queued") slots[peer] = e
-        log("peer=$peer slot=${e.optString("slotId")} request=${e.optString("requestId")} stage=$stage reason=${e.optString("reason")}")
+        val slotId = e.optString("slotId")
+        if (slotId.isEmpty()) return null
+        val activeRequest = request
+        if (stage in setOf("sent", "failed", "unsupported", "cancelled") && e.optString("requestId").isNotEmpty() &&
+            (activeRequest == null || e.optString("requestId") != activeRequest.optString("requestId") ||
+                e.optString("receiverEpoch") != activeRequest.optString("receiverEpoch") ||
+                slotId != activeRequest.optString("slotId"))
+        ) {
+            log("ignoring response to obsolete StartSession request=${e.optString("requestId")} slot=$slotId stage=$stage")
+            return null
+        }
+        val known = slots[peer]
+        val establishment = stage in setOf("connected", "identified", "available", "unavailable")
+        val newer = if (known != null && known.optLong("slotStartedAt") > 0 && e.optLong("slotStartedAt") > 0) {
+            e.optLong("slotStartedAt") > known.optLong("slotStartedAt")
+        } else stage == "connected" // Older firmware has no monotonic slot ordering.
+        if (slotId in retiredSlots ||
+            (known != null && known.optString("slotId") != slotId && !newer) ||
+            (known == null && !establishment && e.optLong("slotStartedAt") == 0L && request?.optString("slotId") != slotId)
+        ) {
+            log("ignoring stale event peer=$peer slot=$slotId stage=$stage; current=${known?.optString("slotId")}")
+            return null
+        }
+        if (known != null && known.optString("slotId") != slotId) {
+            val oldSlot = known.optString("slotId")
+            retiredSlots.add(oldSlot)
+            blocked.remove(oldSlot)
+            if (request?.optString("slotId") == oldSlot || pendingSlotId == oldSlot) cancel(clearSlots = false)
+        }
         val current = request
+        if (stage == "ended") {
+            slots.remove(peer)
+            retiredSlots.add(slotId)
+            blocked.remove(slotId)
+            if (current?.optString("slotId") == slotId || pendingSlotId == slotId) cancel(clearSlots = false)
+        } else {
+            slots[peer] = e
+        }
+        log("peer=$peer slot=$slotId request=${e.optString("requestId")} stage=$stage reason=${e.optString("reason")} failureReason=${e.optString("failureReason")}")
         if (current != null && e.optString("requestId") == current.optString("requestId") &&
             e.optString("receiverEpoch") == current.optString("receiverEpoch") && e.optString("slotId") == current.optString("slotId")) {
             if (stage == "sent") {
@@ -104,13 +140,13 @@ class NativeStartSession(
                     }
                 }
             } else if (stage in setOf("failed", "unsupported", "ended")) {
-                timer?.cancel(); blocked.add(e.optString("slotId"))
+                timer?.cancel()
+                if (stage != "ended") blocked.add(slotId)
                 report("StartSession $stage: ${e.optString("reason")}")
             }
         } else if (stage in setOf("failed", "unsupported") && e.optString("requestId").isEmpty()) {
             blocked.add(e.optString("slotId")); report("StartSession $stage: ${e.optString("reason")}")
         }
-        if (stage == "ended") slots.remove(peer)
         if (stage == "cancelled") return null
         return peer to (e.optBoolean("available") && stage !in setOf("failed", "unsupported", "ended", "unavailable"))
     }
@@ -188,6 +224,6 @@ class NativeStartSession(
         }
         request = null
         receiver()?.revokeStartSession()
-        if (clearSlots) { slots.clear(); blocked.clear(); progressText = null }
+        if (clearSlots) { slots.clear(); blocked.clear(); retiredSlots.clear(); progressText = null }
     }
 }
