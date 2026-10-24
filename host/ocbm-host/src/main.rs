@@ -4,6 +4,7 @@
 //!   ocbm-host echo    [vid pid] [secs] [xfer]    ECHO round-trip throughput
 //!   ocbm-host rtt     [vid pid] [secs]           ECHO round-trip LATENCY percentiles (per payload size)
 //!   ocbm-host mfi     [vid pid]                  genuine MFi 2.0C cert + signature
+//!   ocbm-host mfi-check [vid pid] [rounds=20]    repeated certificate/sign/certificate checks
 //!   ocbm-host console [vid pid]                  MODE_SELECT CONSOLE -> root-shell bridge
 //!   ocbm-host settime [vid pid]                  push host wall clock -> box (no RTC battery)
 //!   ocbm-host ncm     [vid pid]                  CH_MGMT ENTER_NCM -> box reboots into USB-NCM maintenance
@@ -30,6 +31,8 @@ use ocbm_proto as p;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
+
+mod mfi_check;
 
 struct Link {
     h: DeviceHandle<Context>,
@@ -1593,6 +1596,13 @@ fn main() {
         "echo" => mode_echo(&mut link, secs, xfer),
         "rtt" => mode_rtt(&mut link, secs),
         "mfi" => mode_mfi(&mut link),
+        "mfi-check" => {
+            let rounds = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20);
+            if let Err(error) = mfi_check::run(&mut link, rounds) {
+                eprintln!("[mfi-check] FAIL: {error}");
+                std::process::exit(1);
+            }
+        },
         "console" => mode_console(&mut link),
         "ncm" => mode_ncm(&mut link),
         "ip" => mode_ip(
