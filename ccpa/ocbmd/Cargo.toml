@@ -9,6 +9,7 @@ name = "ocbmd"
 path = "src/main.rs"
 
 [dependencies]
+mfi-i2c-local = { path = "../../crates/vendor/mfi-i2c-local" }
 ocbm-proto = { path = "../../crates/ocbm-proto" }
 box-common = { path = "../../crates/box-common" }
 libc = "0.2"

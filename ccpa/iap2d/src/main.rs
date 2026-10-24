@@ -20,7 +20,6 @@ use carplay_iap2_core::{
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -30,204 +29,14 @@ const IAP2_DEV: &str = "/dev/android_iap2";
 /// main loop gives up and exits (M2/L1) — see the `read_errs` comment in `main()`.
 const READ_ERR_EXIT_THRESHOLD: u32 = 25;
 
-// ---- Direct MFi chip access over I2C (/dev/i2c-1 @0x11). No NCM bridge, no NCM.
-// The chip is LOCAL to the box, so iap2d drives it directly — unlike carplayd's
-// mfi.rs, which reaches a remote CCPA over an NCM-based TCP bridge (192.168.50.2:5290).
-// This setup does not use the NCM interface at all. ----
-static G_I2C: AtomicI32 = AtomicI32::new(-1);
-const MFI_ADDR: u16 = 0x11;
-const I2C_M_RD: u16 = 0x0001;
-const I2C_RDWR: libc::c_int = 0x0707;
-#[repr(C)]
-struct I2cMsg {
-    addr: u16,
-    flags: u16,
-    len: u16,
-    buf: *mut u8,
+// Local-only by design: the shared driver serializes whole operations with every daemon.
+fn local_mfi() -> Option<mfi_i2c_local::Device> {
+    mfi_i2c_local::Device::open("iap2d").map_err(|error| {
+        eprintln!("[mfi] open /dev/i2c-1 failed: {error}");
+    }).ok()
 }
-#[repr(C)]
-struct I2cRdwr {
-    msgs: *mut I2cMsg,
-    nmsgs: u32,
-}
-fn i2c_rd(reg: u8, out: &mut [u8]) -> bool {
-    let fd = G_I2C.load(Ordering::Relaxed);
-    if fd < 0 {
-        return false;
-    }
-    let mut r = reg;
-    let mut m = [
-        I2cMsg {
-            addr: MFI_ADDR,
-            flags: 0,
-            len: 1,
-            buf: &mut r,
-        },
-        I2cMsg {
-            addr: MFI_ADDR,
-            flags: I2C_M_RD,
-            len: out.len() as u16,
-            buf: out.as_mut_ptr(),
-        },
-    ];
-    let mut x = I2cRdwr {
-        msgs: m.as_mut_ptr(),
-        nmsgs: 2,
-    };
-    for _ in 0..5 {
-        if unsafe { libc::ioctl(fd, I2C_RDWR as _, &mut x) } >= 0 {
-            return true;
-        }
-        unsafe { libc::usleep(5000) };
-    }
-    false
-}
-fn i2c_wr(reg: u8, data: &[u8]) -> bool {
-    let fd = G_I2C.load(Ordering::Relaxed);
-    if fd < 0 {
-        return false;
-    }
-    let mut b = Vec::with_capacity(1 + data.len());
-    b.push(reg);
-    b.extend_from_slice(data);
-    let mut m = I2cMsg {
-        addr: MFI_ADDR,
-        flags: 0,
-        len: b.len() as u16,
-        buf: b.as_mut_ptr(),
-    };
-    let mut x = I2cRdwr {
-        msgs: &mut m,
-        nmsgs: 1,
-    };
-    for _ in 0..5 {
-        if unsafe { libc::ioctl(fd, I2C_RDWR as _, &mut x) } >= 0 {
-            return true;
-        }
-        unsafe { libc::usleep(5000) };
-    }
-    false
-}
-/// Cross-process advisory lock serializing MFi I2C access (#109). The one `/dev/i2c-1` chip now has
-/// FOUR users that must all agree on this path (corrected 2026-07-25 — this used to say "both
-/// daemons"): wired `iap2d` (here), `btd` (`mfi_local::MFI_LOCK_PATH`), `carplayd`'s
-/// `LocalMfiSigner`, and `receiver`'s tunnel handshake via `mfi-i2c-local`. The cert/sign sequences are
-/// stateful, so any interleaving corrupts both transactions. RAII: LOCK_EX on acquire, LOCK_UN + close
-/// on drop. Bounded at 10s (LOCK_NB + deadline), matching `carplayd`'s `MfiLock` for this same file.
-struct MfiLock(i32);
-impl MfiLock {
-    fn acquire() -> Option<MfiLock> {
-        let fd = unsafe {
-            libc::open(
-                c"/tmp/carplay_mfi.lock".as_ptr(),
-                // O_CLOEXEC — an inherited LOCK_EX open-file-description outlives this process in a
-                // detached daemon; if the holder dies before Drop can LOCK_UN, every one of the five
-                // MFi users blocks to its deadline forever.
-                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return None;
-        }
-        // BOUNDED acquire (review fix 2026-07-31; was a bare blocking `flock(LOCK_EX)`): this runs
-        // inside the single-threaded handshake loop, so an unbounded wait on a wedged sibling holder
-        // hung the whole daemon — the loop never regained control, and even its own 120s handshake
-        // budget could not fire. 10s matches carplayd's bound for this same lock; the worst-case
-        // legitimate hold (carplayd's sign path, ~2.1s poll × 3 MFi retries ≈ 6.3s) cannot trip it
-        // spuriously. On timeout, `execute()` maps the resulting None to NoCommit (state held; the
-        // phone re-asks) — a recoverable stall where the blocking wait was a permanent one.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Some(MfiLock(fd));
-            }
-            if Instant::now() >= deadline {
-                unsafe { libc::close(fd) };
-                log("MFi lock busy >10s (another daemon is wedged holding /tmp/carplay_mfi.lock)");
-                return None;
-            }
-            sleep(Duration::from_millis(20));
-        }
-    }
-}
-impl Drop for MfiLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0, libc::LOCK_UN);
-            libc::close(self.0);
-        }
-    }
-}
-
-/// CopyCertificate: reg 0x30 len (2 BE), reg 0x31 cert.
-fn mfi_cert() -> Option<Vec<u8>> {
-    let _lock = MfiLock::acquire()?; // serialize vs btd (#109)
-    let mut lb = [0u8; 2];
-    if !i2c_rd(0x30, &mut lb) {
-        return None;
-    }
-    let n = ((lb[0] as usize) << 8) | lb[1] as usize;
-    if n == 0 || n > 2048 {
-        return None;
-    }
-    let mut o = vec![0u8; n];
-    if !i2c_rd(0x31, &mut o) {
-        return None;
-    }
-    Some(o)
-}
-/// CreateSignature: write challenge (0x20 len, 0x21 data), go (0x10=1), poll bit4, read 0x11/0x12.
-fn mfi_sign(chal: &[u8]) -> Option<Vec<u8>> {
-    let _lock = MfiLock::acquire()?; // hold across the whole stateful sequence (#109)
-    let clen = chal.len();
-    if !i2c_wr(0x20, &[(clen >> 8) as u8, clen as u8]) {
-        return None;
-    }
-    if !i2c_wr(0x21, chal) {
-        return None;
-    }
-    if !i2c_wr(0x10, &[0x01]) {
-        return None;
-    }
-    unsafe { libc::usleep(100_000) };
-    let mut done = false;
-    // Bounded by WALL CLOCK, not iteration count — the same defect audit #8 fixed in
-    // `mfi-i2c-local`. `for _ in 0..200` with a 10 ms sleep looks like ~2.1 s, and is, but only
-    // while every status read succeeds. The status read is itself `for _ in 0..5` with a 5 ms
-    // sleep, so under chip NAK each iteration costs ~35 ms and the loop runs ~7.1 s — and with
-    // the caller's retries that is ~21 s holding /tmp/carplay_mfi.lock, blowing through every
-    // other chip user's 10 s acquire deadline.
-    const SIGN_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2500);
-    let poll_start = std::time::Instant::now();
-    while poll_start.elapsed() < SIGN_POLL_DEADLINE {
-        let mut st = [0u8; 1];
-        if i2c_rd(0x10, &mut st) && (st[0] & 0x10) != 0 {
-            if st[0] != 0x10 {
-                eprintln!("mfi: sign status 0x{:02x} (expected 0x10)", st[0]);
-            }
-            done = true;
-            break;
-        }
-        unsafe { libc::usleep(10_000) };
-    }
-    if !done {
-        return None;
-    }
-    let mut sl = [0u8; 2];
-    if !i2c_rd(0x11, &mut sl) {
-        return None;
-    }
-    let n = ((sl[0] as usize) << 8) | sl[1] as usize;
-    if n == 0 || n > 256 {
-        return None;
-    }
-    let mut sig = vec![0u8; n];
-    if !i2c_rd(0x12, &mut sig) {
-        return None;
-    }
-    Some(sig)
-}
+fn mfi_cert() -> Option<Vec<u8>> { local_mfi()?.certificate().ok() }
+fn mfi_sign(challenge: &[u8]) -> Option<Vec<u8>> { local_mfi()?.signature(challenge).ok() }
 
 /// The app-pushed vehicle identity (Identify param 20), snapshotted ONCE per process — docs/carplay/04_CAPABILITIES_AND_CONFIG.md C-3.
 ///
@@ -650,33 +459,15 @@ fn main() {
         }
     };
     log("opened /dev/android_iap2 — iAP2 transport ready");
-    // open the LOCAL MFi chip directly over i2c — no remote bridge, no NCM
-    let i2c = unsafe { libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if i2c < 0 {
-        // Without the chip every auth Action fails and the handshake is doomed anyway — running on
-        // is just a slower, more confusing failure. The supervisor respawns iap2d while the phone
-        // is present (session_supervisor.sh), so exiting IS the retry.
+    let chip = local_mfi().unwrap_or_else(|| {
         log("FATAL: cannot open /dev/i2c-1 (MFi chip)");
         std::process::exit(1);
+    });
+    match chip.device_version() {
+        Ok(version) => log(&format!("MFi chip open (local i2c), DeviceVersion=0x{version:02x}")),
+        Err(error) => log(&format!("MFi chip open; advisory DeviceVersion probe failed: {error}")),
     }
-    G_I2C.store(i2c, Ordering::Relaxed);
-    // Advisory only: a NAK here must not kill the daemon — the real reads retry per-transaction.
-    // But it is still a chip transaction, so it takes the same cross-process lock as cert/sign: the
-    // one thing worse than a failed warm-up is one that lands inside another chip user's
-    // write→trigger→poll→read window (carplayd's sign path) and corrupts THAT transaction.
-    let mut v = [0u8; 1];
-    let warm = match MfiLock::acquire() {
-        Some(_lock) => i2c_rd(0x00, &mut v),
-        None => false,
-    };
-    if warm {
-        log(&format!(
-            "MFi chip open (local i2c), DeviceVersion=0x{:02x}",
-            v[0]
-        ));
-    } else {
-        log("MFi chip open (local i2c), DeviceVersion read failed (transient NAK or chip lock busy)");
-    }
+    drop(chip);
 
     let mut link = Link::new();
     if !tx(&mut iap, &link::DETECT) {

@@ -126,8 +126,7 @@ impl Bus for LinuxBus<'_> {
             msgs: messages.as_mut_ptr(),
             nmsgs: 2,
         };
-        let actual =
-            unsafe { libc::ioctl(self.0.as_raw_fd(), 0x0707 as libc::c_ulong, &mut request) };
+        let actual = unsafe { libc::ioctl(self.0.as_raw_fd(), 0x0707 as _, &mut request) };
         let errno = if actual < 0 {
             std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
         } else {
@@ -147,8 +146,7 @@ impl Bus for LinuxBus<'_> {
             msgs: &mut message,
             nmsgs: 1,
         };
-        let actual =
-            unsafe { libc::ioctl(self.0.as_raw_fd(), 0x0707 as libc::c_ulong, &mut request) };
+        let actual = unsafe { libc::ioctl(self.0.as_raw_fd(), 0x0707 as _, &mut request) };
         let errno = if actual < 0 {
             std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
         } else {
@@ -226,10 +224,16 @@ impl Device {
 }
 
 fn local_device() -> Result<Device, MfiError> {
-    Device::open("local-api").map_err(|error| {
-        eprintln!("[mfi-i2c] open /dev/i2c-1 failed: {error}");
-        MfiError::Chip
-    })
+    match Device::open("local-api") {
+        Ok(device) => Ok(device),
+        Err(error) => {
+            eprintln!("[mfi-i2c] open /dev/i2c-1 failed: {error}");
+            // Preserve the existing distinction for hosts such as Android that cannot even
+            // open /tmp/carplay_mfi.lock: this is not a transient chip error to retry.
+            let _lock = MfiLock::acquire()?;
+            Err(MfiError::Chip)
+        }
+    }
 }
 fn remote_err(what: &str, e: mfi_wire::client::Error) -> MfiError {
     eprintln!("[mfi-i2c-local] remote {what} failed: {e}");

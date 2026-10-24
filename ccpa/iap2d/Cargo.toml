@@ -9,6 +9,7 @@ name = "iap2d"
 path = "src/main.rs"
 
 [dependencies]
+mfi-i2c-local = { path = "../../crates/vendor/mfi-i2c-local" }
 # Authoritative CarPlay protocol core: message catalog from CarPlaySimulator.devicekitplugin,
 # link framing + accessory auth/identify state machine (carplayd, the reinforcing session ref).
 carplay-iap2-core = { path = "../../crates/vendor/iap2-core" }

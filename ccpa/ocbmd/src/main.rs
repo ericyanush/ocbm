@@ -291,328 +291,17 @@ impl FileState {
     }
 }
 
-// ---- MFi authentication bridge over I2C (/dev/i2c-1 @0x11) — ported from the ncm_carplayd MFi auth helper ----
-const I2C_M_RD: u16 = 0x0001;
-const I2C_RDWR: libc::c_int = 0x0707;
-
-#[inline]
-fn i2c_transfer_complete(actual: libc::c_int, expected: libc::c_int) -> bool {
-    actual == expected
-}
-
-#[repr(C)]
-struct I2cMsg {
-    addr: u16,
-    flags: u16,
-    len: u16,
-    buf: *mut u8,
-}
-#[repr(C)]
-struct I2cRdwr {
-    msgs: *mut I2cMsg,
-    nmsgs: u32,
-}
-
-struct Mfi {
-    fd: RawFd,
-    addr: u16,
-}
-
-#[derive(Debug)]
-enum MfiError {
-    LockOpen(i32),
-    LockBusy,
-    DeviceOpen(i32),
-    I2c {
-        op: &'static str,
-        reg: u8,
-        expected: libc::c_int,
-        actual: libc::c_int,
-        errno: i32,
-    },
-    InvalidLength {
-        what: &'static str,
-        length: usize,
-    },
-    SignPollTimeout,
-}
-
-impl std::fmt::Display for MfiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MfiError::LockOpen(errno) => write!(f, "cannot open shared MFi lock (errno {errno})"),
-            MfiError::LockBusy => write!(f, "shared MFi lock busy for 10s"),
-            MfiError::DeviceOpen(errno) => write!(f, "cannot open /dev/i2c-1 (errno {errno})"),
-            MfiError::I2c {
-                op,
-                reg,
-                expected,
-                actual,
-                errno,
-            } => write!(
-                f,
-                "I2C {op} reg 0x{reg:02x}: transferred {actual}/{expected} messages (errno {errno})"
-            ),
-            MfiError::InvalidLength { what, length } => {
-                write!(f, "invalid {what} length {length}")
-            }
-            MfiError::SignPollTimeout => write!(f, "signature completion poll exceeded 2500ms"),
-        }
-    }
-}
-
-/// Bounded `flock` on `/tmp/carplay_mfi.lock`, the same file `carplayd`, `iap2d`,
-/// `btd` and `mfi-i2c-local` use.
-///
-/// `ocbmd` is the FIFTH chip user and took no lock at all — so a CH_MFI `sign` from the host could
-/// interleave its stateful write-challenge / poll / read-signature sequence with any other daemon's,
-/// corrupting both. The serialization guarantee every "four chip users" comment in the tree asserts
-/// was simply not complete. Same corruption class the 2026-07-25 QC pass fixed for `carplayd`.
-///
-/// Bounded, not `LOCK_EX`: a wedged peer must not hang the OCBM dispatch loop, which also carries
-/// video, audio and the console.
-struct MfiLock(RawFd);
-
-impl MfiLock {
-    fn acquire() -> Result<MfiLock, MfiError> {
-        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-        let fd = unsafe {
-            libc::open(
-                c"/tmp/carplay_mfi.lock".as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(MfiError::LockOpen(
-                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            ));
-        }
-        let start = std::time::Instant::now();
-        loop {
-            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(MfiLock(fd));
-            }
-            if start.elapsed() >= DEADLINE {
-                unsafe { libc::close(fd) };
-                return Err(MfiError::LockBusy);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
-}
-
-impl Drop for MfiLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0, libc::LOCK_UN);
-            libc::close(self.0);
-        }
-    }
-}
-
+// ---- Local MFi bridge. The shared driver owns locking, timing and register validation. ----
+use mfi_i2c_local::MfiError;
+struct Mfi(mfi_i2c_local::Device);
 impl Mfi {
-    fn open() -> Result<Mfi, MfiError> {
-        // O_CLOEXEC so the MFi chip handle does not leak into the CONSOLE root shell on execv.
-        let fd = unsafe { libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            Err(MfiError::DeviceOpen(
-                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            ))
-        } else {
-            Ok(Mfi { fd, addr: 0x11 })
-        }
+    fn open() -> Result<Self, MfiError> {
+        mfi_i2c_local::Device::open("ocbmd").map(Self).map_err(|error| {
+            eprintln!("[mfi] open /dev/i2c-1 failed: {error}"); MfiError::Chip
+        })
     }
-
-    fn reopen(&mut self) -> Result<(), MfiError> {
-        let fd = unsafe { libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(MfiError::DeviceOpen(
-                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            ));
-        }
-        unsafe { libc::close(self.fd) };
-        self.fd = fd;
-        eprintln!("[mfi] reopened /dev/i2c-1 after a failed transfer");
-        Ok(())
-    }
-
-    fn rd_once(&self, reg: u8, out: &mut [u8]) -> Result<(), MfiError> {
-        let mut r = reg;
-        let mut msgs = [
-            I2cMsg {
-                addr: self.addr,
-                flags: 0,
-                len: 1,
-                buf: &mut r,
-            },
-            I2cMsg {
-                addr: self.addr,
-                flags: I2C_M_RD,
-                len: out.len() as u16,
-                buf: out.as_mut_ptr(),
-            },
-        ];
-        let mut x = I2cRdwr {
-            msgs: msgs.as_mut_ptr(),
-            nmsgs: 2,
-        };
-        let actual = unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) };
-        if i2c_transfer_complete(actual, 2) {
-            Ok(())
-        } else {
-            Err(MfiError::I2c {
-                op: "read",
-                reg,
-                expected: 2,
-                actual,
-                errno: if actual < 0 {
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-                } else {
-                    0
-                },
-            })
-        }
-    }
-
-    fn wr_once(&self, reg: u8, data: &[u8]) -> Result<(), MfiError> {
-        let mut b = Vec::with_capacity(1 + data.len());
-        b.push(reg);
-        b.extend_from_slice(data);
-        let mut msg = I2cMsg {
-            addr: self.addr,
-            flags: 0,
-            len: b.len() as u16,
-            buf: b.as_mut_ptr(),
-        };
-        let mut x = I2cRdwr {
-            msgs: &mut msg,
-            nmsgs: 1,
-        };
-        let actual = unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) };
-        if i2c_transfer_complete(actual, 1) {
-            Ok(())
-        } else {
-            Err(MfiError::I2c {
-                op: "write",
-                reg,
-                expected: 1,
-                actual,
-                errno: if actual < 0 {
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-                } else {
-                    0
-                },
-            })
-        }
-    }
-
-    /// Retry idempotent register reads/writes briefly. After exhausting those attempts, reopen the
-    /// device once and retry; this recovers from a stale fd without an unbounded retry loop.
-    fn transfer_retry<T>(
-        &mut self,
-        op: &'static str,
-        reg: u8,
-        mut transfer: impl FnMut(&Self) -> Result<T, MfiError>,
-    ) -> Result<T, MfiError> {
-        let mut last = None;
-        for pass in 0..2 {
-            for attempt in 0..5 {
-                match transfer(self) {
-                    Ok(value) => return Ok(value),
-                    Err(err) => last = Some(err),
-                }
-                if attempt < 4 {
-                    unsafe { libc::usleep(5000) };
-                }
-            }
-            if pass == 0 {
-                self.reopen()?;
-            }
-        }
-        Err(last.unwrap_or(MfiError::I2c {
-            op,
-            reg,
-            expected: 0,
-            actual: -1,
-            errno: 0,
-        }))
-    }
-
-    fn rd(&mut self, reg: u8, out: &mut [u8]) -> Result<(), MfiError> {
-        self.transfer_retry("read", reg, |m| m.rd_once(reg, out))
-    }
-
-    fn wr(&mut self, reg: u8, data: &[u8]) -> Result<(), MfiError> {
-        self.transfer_retry("write", reg, |m| m.wr_once(reg, data))
-    }
-
-    /// The trigger is stateful: if its ioctl reports an error/short transfer, whether the chip saw
-    /// the trigger is unknown. Never blindly replay it; return a diagnostic instead.
-    fn trigger_sign(&self) -> Result<(), MfiError> {
-        self.wr_once(0x10, &[0x01])
-    }
-    /// CopyCertificate: reg 0x30 = length (2 BE), reg 0x31 = cert bytes.
-    fn cert(&mut self) -> Result<Vec<u8>, MfiError> {
-        let _lock = MfiLock::acquire()?; // serialize the whole cert read vs the other four users
-        let mut lb = [0u8; 2];
-        self.rd(0x30, &mut lb)?;
-        let n = ((lb[0] as usize) << 8) | lb[1] as usize;
-        eprintln!(
-            "[mfi] copy_certificate length-register raw={:02x}:{:02x} length={n}",
-            lb[0], lb[1]
-        );
-        if n == 0 || n > 2048 {
-            return Err(MfiError::InvalidLength {
-                what: "certificate",
-                length: n,
-            });
-        }
-        let mut o = vec![0u8; n];
-        self.rd(0x31, &mut o)?;
-        Ok(o)
-    }
-    /// CreateSignature: write challenge (0x20 len, 0x21 data), go (0x10=1), poll 0x10 bit4, read 0x11 len / 0x12 sig.
-    fn sign(&mut self, chal: &[u8]) -> Result<Vec<u8>, MfiError> {
-        let _lock = MfiLock::acquire()?; // hold across the ENTIRE stateful challenge/poll/read sequence
-        let clen = chal.len();
-        self.wr(0x20, &[(clen >> 8) as u8, clen as u8])?;
-        self.wr(0x21, chal)?;
-        self.trigger_sign()?;
-        unsafe { libc::usleep(100_000) };
-        let mut done = false;
-        // Bounded by WALL CLOCK, not iteration count — the same defect audit #8 fixed in
-        // `mfi-i2c-local`. `for _ in 0..200` with a 10 ms sleep looks like ~2.1 s, and is, but only
-        // while every status read succeeds. The status read is itself `for _ in 0..5` with a 5 ms
-        // sleep, so under chip NAK each iteration costs ~35 ms and the loop runs ~7.1 s — and with
-        // the caller's retries that is ~21 s holding /tmp/carplay_mfi.lock, blowing through every
-        // other chip user's 10 s acquire deadline.
-        const SIGN_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2500);
-        let poll_start = std::time::Instant::now();
-        while poll_start.elapsed() < SIGN_POLL_DEADLINE {
-            let mut st = [0u8; 1];
-            if self.rd(0x10, &mut st).is_ok() && (st[0] & 0x10) != 0 {
-                done = true;
-                break;
-            }
-            unsafe { libc::usleep(10_000) };
-        }
-        if !done {
-            return Err(MfiError::SignPollTimeout);
-        }
-        let mut sl = [0u8; 2];
-        self.rd(0x11, &mut sl)?;
-        let n = ((sl[0] as usize) << 8) | sl[1] as usize;
-        if n == 0 || n > 256 {
-            return Err(MfiError::InvalidLength {
-                what: "signature",
-                length: n,
-            });
-        }
-        let mut sig = vec![0u8; n];
-        self.rd(0x12, &mut sig)?;
-        Ok(sig)
-    }
+    fn cert(&mut self) -> Result<Vec<u8>, MfiError> { self.0.certificate() }
+    fn sign(&mut self, challenge: &[u8]) -> Result<Vec<u8>, MfiError> { self.0.signature(challenge) }
 }
 
 struct Daemon {
@@ -3262,9 +2951,8 @@ impl Daemon {
         let start = Instant::now();
         let result: Result<Vec<u8>, MfiError> = match op {
             0x01 => self.ensure_mfi().and_then(Mfi::cert),
-            // Upper bound before the chip is touched: `I2cMsg::len` is a u16, so a 65536-byte
-            // challenge would wrap it to 0 and hand the coprocessor a zero-length write plus a "go".
-            // MFi 2.0C challenges are 20/32-byte digests; 1024 is generous.
+            // Bound the OCBM request; the shared driver also validates the chip
+            // challenge limit before any stateful write.
             0x02 if ilen > 0 && ilen <= 1024 && 3 + ilen <= pl.len() => {
                 self.ensure_mfi().and_then(|m| m.sign(&pl[3..3 + ilen]))
             }
@@ -4535,18 +4223,12 @@ fn main() {
         }
     };
     if let Some(m) = mfi.as_mut() {
-        // Warm-up (DeviceVersion) under /tmp/carplay_mfi.lock, like every other chip access. ocbmd
-        // respawns on every `ocbm-host` command, so this runs far more often than "once at boot" —
-        // unlocked it can land inside carplayd's HELD write-challenge/trigger/poll/read sequence and
-        // corrupt both transactions. Skipped, not forced, if the lock is unavailable: a warm-up read
-        // is not worth stepping on a live handshake.
-        if let Ok(_lock) = MfiLock::acquire() {
-            let mut v = [0u8; 1];
-            if let Err(err) = m.rd(0x00, &mut v) {
-                eprintln!("[mfi] startup DeviceVersion probe failed: {err:?}");
-            }
+        // Advisory probe takes the same whole-operation lock as all other chip users.
+        if let Err(error) = m.0.device_version() {
+            eprintln!("[mfi] startup DeviceVersion probe failed: {error}");
         }
     }
+
     unsafe {
         // non-blocking accessory fd so a stalled host reader can never wedge the daemon
         let fd = acc.as_raw_fd();
@@ -5107,24 +4789,6 @@ mod tests {
     fn presence_flag_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    #[test]
-    fn i2c_ioctl_must_report_every_message_transferred() {
-        assert!(i2c_transfer_complete(2, 2));
-        assert!(i2c_transfer_complete(1, 1));
-        assert!(
-            !i2c_transfer_complete(1, 2),
-            "a short two-message read is not success"
-        );
-        assert!(
-            !i2c_transfer_complete(0, 1),
-            "zero transferred messages is not success"
-        );
-        assert!(
-            !i2c_transfer_complete(-1, 1),
-            "an ioctl error is not success"
-        );
     }
 
     /// A Daemon with no MFi chip, no listeners and a /dev/null accessory fd.

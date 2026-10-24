@@ -70,266 +70,32 @@ fn cluster_url(surface: u8) -> String {
     }
 }
 
-// ---- Local MFi 2.0C chip over I2C (/dev/i2c-1 @0x11) — same proven path as iap2d / the MFi auth helper (ncm_carplayd) ----
-const MFI_ADDR: u16 = 0x11;
-const I2C_M_RD: u16 = 0x0001;
-const I2C_RDWR: libc::c_int = 0x0707;
-
-#[repr(C)]
-struct I2cMsg {
-    addr: u16,
-    flags: u16,
-    len: u16,
-    buf: *mut u8,
-}
-#[repr(C)]
-struct I2cRdwr {
-    msgs: *mut I2cMsg,
-    nmsgs: u32,
-}
-
-/// `MfiSigner` backed by the on-board genuine MFi 2.0C coprocessor over local I2C — the box-resident
-/// signing service. Drops in for receiver_core's `MfiAuthClient` (remote NCM TCP) with direct chip
-/// access, so the MFi private key never leaves the adapter.
-pub struct LocalMfiSigner {
-    fd: libc::c_int,
-}
-
-/// Close the i2c handle on drop. A fresh `LocalMfiSigner` is opened per iPhone connection, so without
-/// this the `/dev/i2c-1` fd would leak on every (re)connect and eventually exhaust the fd limit —
-/// pairing would then fail with no obvious cause on the reconnect-heavy lifecycle (docs/carplay/02_SESSION_LIFECYCLE.md).
-impl Drop for LocalMfiSigner {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe { libc::close(self.fd) };
-        }
-    }
-}
-
+// ---- Shared local 2.0C driver, with the existing remote signer option for the Pi. ----
+pub struct LocalMfiSigner { local: Option<mfi_i2c_local::Device> }
 impl LocalMfiSigner {
     pub fn open() -> io::Result<Self> {
-        // Remote coprocessor (Raspberry Pi port): there is no /dev/i2c-1 on this host, so opening it
-        // here would fail the whole control connection before a single trait method ran — which is
-        // exactly what "MFi open: No such file or directory" was. Hand back a signer with no fd; the
-        // trait impls below dispatch over the network and never touch `self.fd`.
-        if mfi_wire::client::addr().is_some() {
-            return Ok(Self { fd: -1 });
-        }
-        // O_CLOEXEC: never let the chip handle leak into a child process.
-        let fd = unsafe {
-            libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { fd })
+        if mfi_wire::client::addr().is_some() { return Ok(Self { local: None }); }
+        Ok(Self { local: Some(mfi_i2c_local::Device::open("carplayd")?) })
     }
-
-    fn rd(&self, reg: u8, out: &mut [u8]) -> bool {
-        let mut r = reg;
-        let mut m = [
-            I2cMsg { addr: MFI_ADDR, flags: 0, len: 1, buf: &mut r },
-            I2cMsg { addr: MFI_ADDR, flags: I2C_M_RD, len: out.len() as u16, buf: out.as_mut_ptr() },
-        ];
-        let mut x = I2cRdwr { msgs: m.as_mut_ptr(), nmsgs: 2 };
-        for _ in 0..5 {
-            // I2C_RDWR returns the number of messages transferred — require BOTH, as
-            // `mfi-i2c-local` and `wireless/mfi_local.rs` do. `>= 0` accepted a partial transfer in
-            // which the read leg never happened, handing back an all-zero `out` as a success.
-            if unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) } == 2 {
-                return true;
-            }
-            unsafe { libc::usleep(5000) };
-        }
-        false
-    }
-
-    fn wr(&self, reg: u8, data: &[u8]) -> bool {
-        let mut b = Vec::with_capacity(1 + data.len());
-        b.push(reg);
-        b.extend_from_slice(data);
-        let mut m = I2cMsg { addr: MFI_ADDR, flags: 0, len: b.len() as u16, buf: b.as_mut_ptr() };
-        let mut x = I2cRdwr { msgs: &mut m, nmsgs: 1 };
-        for _ in 0..5 {
-            // Require the write to have landed (see `rd`).
-            if unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) } == 1 {
-                return true;
-            }
-            unsafe { libc::usleep(5000) };
-        }
-        false
-    }
-
-    /// DeviceVersion (reg 0x00) — a cheap warm-up/liveness read (=0x03 on this unit).
-    ///
-    /// `None` with no fd: on the remote-coprocessor path `open()` hands back `fd = -1` and there is
-    /// no local register to read, so a raw `rd` here just burns five EBADF retries and reports a
-    /// chip failure the host does not have. `mfid` exposes no DeviceVersion opcode, so the honest
-    /// answer is "unknown", not "failed".
-    pub fn device_version(&self) -> Option<u8> {
-        if self.fd < 0 {
-            return None;
-        }
-        let mut v = [0u8; 1];
-        if self.rd(0x00, &mut v) {
-            Some(v[0])
-        } else {
-            None
-        }
-    }
+    pub fn device_version(&self) -> Option<u8> { self.local.as_ref()?.device_version().ok() }
 }
-
-/// Cross-process advisory lock serializing MFi I2C access, shared with `iap2d` (`MfiLock`),
-/// `btd` (`mfi_local::MFI_LOCK_PATH`) and `receiver`'s tunnel path
-/// (`mfi-i2c-local::MFI_LOCK_PATH`). All four must agree on this path.
-///
-/// QC 2026-07-25 (HIGH): carplayd was the ONE chip user that took no lock at all. Both sequences
-/// below are stateful multi-register transactions (cert = 0x30 then 0x31; sign = write 0x20/0x21,
-/// trigger 0x10, poll 0x10 bit4, read 0x11/0x12), and carplayd + btd are BOTH live around
-/// a wireless bring-up. An interleave lets the second writer's challenge clobber the first's before its
-/// trigger/poll completes — both sides then get a garbage signature and pairing fails with no
-/// diagnostic. Note this only serializes; it does not change the (device-proven) register sequence.
-///
-/// Acquisition is bounded rather than a bare blocking `LOCK_EX`: the worst-case legitimate hold is
-/// this daemon's own sign path, whose poll is capped at `SIGN_POLL_DEADLINE` (2.5 s) plus the
-/// surrounding register transfers — well under 10 s, so the ceiling cannot fire spuriously but still
-/// stops a wedged holder from hanging pairing forever (the failure then surfaces as a normal signer
-/// error the handshake can report, instead of a silent stall). The earlier "~2.1 s poll × 3 MFi
-/// retries ≈ 6.3 s" figure was wrong twice over: nothing retries this signer (`mfi_retry` wraps
-/// `mfi-i2c-local`, not `LocalMfiSigner`), and the poll was iteration- rather than time-bounded, so
-/// under chip NAK it ran ~7.1 s.
-struct MfiLock(i32);
-impl MfiLock {
-    fn acquire() -> io::Result<MfiLock> {
-        let fd = unsafe {
-            libc::open(
-                c"/tmp/carplay_mfi.lock".as_ptr(),
-                // O_CLOEXEC — an inherited LOCK_EX open-file-description outlives this process in a
-                // detached daemon; if the holder dies before Drop can LOCK_UN, every one of the five
-                // MFi users blocks to its deadline forever.
-                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(MfiLock(fd));
-            }
-            if std::time::Instant::now() >= deadline {
-                unsafe { libc::close(fd) };
-                return Err(io::Error::other(
-                    "MFi lock busy >10s (another daemon is wedged holding /tmp/carplay_mfi.lock)",
-                ));
-            }
-            unsafe { libc::usleep(20_000) };
-        }
-    }
-}
-impl Drop for MfiLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0, libc::LOCK_UN);
-            libc::close(self.0);
-        }
-    }
-}
-
 impl MfiSigner for LocalMfiSigner {
-    /// CopyCertificate: reg 0x30 = length (2 BE), reg 0x31 = cert bytes (the genuine ~945-byte cert).
     fn copy_certificate(&mut self) -> io::Result<Vec<u8>> {
-        // Remote coprocessor (Raspberry Pi port): this host has no /dev/i2c-1, so the chip is
-        // reached over USB-NCM. Dispatching INSIDE the impl keeps `LocalMfiSigner`'s type identical,
-        // so `ControlServer<_, LocalMfiSigner>` and every other generic instantiation are unchanged.
         if let Some(addr) = mfi_wire::client::addr() {
             return mfi_wire::client::cert(addr).map_err(io::Error::from);
         }
-        let _lock = MfiLock::acquire()?; // held for the whole 0x30→0x31 transaction
-        let mut lb = [0u8; 2];
-        if !self.rd(0x30, &mut lb) {
-            return Err(io::Error::other("MFi cert length read failed"));
-        }
-        let n = ((lb[0] as usize) << 8) | lb[1] as usize;
-        if n == 0 || n > 2048 {
-            return Err(io::Error::other(format!("MFi cert length {n} out of range")));
-        }
-        let mut cert = vec![0u8; n];
-        if !self.rd(0x31, &mut cert) {
-            return Err(io::Error::other("MFi cert read failed"));
-        }
-        Ok(cert)
+        self.local.as_ref().ok_or_else(|| io::Error::other("local MFi device unavailable"))?
+            .certificate().map_err(io::Error::other)
     }
-
-    /// CreateSignature over a 20-byte SHA-1 digest: write challenge (0x20 len / 0x21 data), trigger
-    /// (0x10=1), poll status (0x10 bit4), read sig (0x11 len / 0x12 data) — genuine 128-byte RSA-1024.
     fn create_signature(&mut self, digest: &[u8]) -> io::Result<Vec<u8>> {
         if let Some(addr) = mfi_wire::client::addr() {
             return mfi_wire::client::sign(addr, digest).map_err(io::Error::from);
         }
-        // Same length guard the remote path applies, so a wrong-length digest is refused here
-        // instead of being written to reg 0x20/0x21 for the chip to NAK opaquely.
         if digest.len() != mfi_wire::DIGEST_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "digest is {} bytes, expected {}",
-                    digest.len(),
-                    mfi_wire::DIGEST_LEN
-                ),
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "MFi signature requires a 20-byte digest"));
         }
-        // Held across the ENTIRE write→trigger→poll→read sequence, not just the first register: the
-        // poll window is exactly where an interleaving writer would corrupt the in-flight challenge.
-        let _lock = MfiLock::acquire()?;
-        let clen = digest.len();
-        if !self.wr(0x20, &[(clen >> 8) as u8, clen as u8]) {
-            return Err(io::Error::other("MFi challenge-len write failed"));
-        }
-        if !self.wr(0x21, digest) {
-            return Err(io::Error::other("MFi challenge write failed"));
-        }
-        if !self.wr(0x10, &[0x01]) {
-            return Err(io::Error::other("MFi sign trigger failed"));
-        }
-        unsafe { libc::usleep(100_000) };
-        // Bounded by WALL CLOCK, not iteration count — the same fix `mfi-i2c-local` already carries
-        // (`SIGN_POLL_DEADLINE`). `for _ in 0..200` with a 10 ms sleep looks like ~2.1 s, and is, but
-        // only while every status read succeeds. `rd` is itself `for _ in 0..5` with a 5 ms sleep, so
-        // under chip NAK each iteration costs ~35 ms and the loop ran ~7.1 s — with the cross-process
-        // chip lock held, 3.4x the worst case the `MfiLock` ceiling below is sized against.
-        const SIGN_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2500);
-        let poll_start = std::time::Instant::now();
-        let mut done = false;
-        while poll_start.elapsed() < SIGN_POLL_DEADLINE {
-            let mut st = [0u8; 1];
-            if self.rd(0x10, &mut st) && (st[0] & 0x10) != 0 {
-                if st[0] != 0x10 {
-                    eprintln!("[carplayd] mfi: sign status 0x{:02x} (expected 0x10)", st[0]);
-                }
-                done = true;
-                break;
-            }
-            unsafe { libc::usleep(10_000) };
-        }
-        if !done {
-            return Err(io::Error::other("MFi sign poll timeout"));
-        }
-        let mut sl = [0u8; 2];
-        if !self.rd(0x11, &mut sl) {
-            return Err(io::Error::other("MFi sig length read failed"));
-        }
-        let n = ((sl[0] as usize) << 8) | sl[1] as usize;
-        if n == 0 || n > 256 {
-            return Err(io::Error::other(format!("MFi sig length {n} out of range")));
-        }
-        let mut sig = vec![0u8; n];
-        if !self.rd(0x12, &mut sig) {
-            return Err(io::Error::other("MFi sig read failed"));
-        }
-        Ok(sig)
+        self.local.as_ref().ok_or_else(|| io::Error::other("local MFi device unavailable"))?
+            .signature(digest).map_err(io::Error::other)
     }
 }
 
