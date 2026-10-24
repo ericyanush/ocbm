@@ -375,6 +375,9 @@ fn identify_body_with_setting(excluded: &[u16], location_enabled: bool) -> Vec<u
     if location_enabled
         && !excluded.contains(&spec::ident::LOCATION_INFORMATION_COMPONENT)
     {
+        // The component and its protocol declarations must agree. Without these IDs the
+        // phone can see a GPS component but has not been told it may subscribe to it.
+        body = declare_location_messages(&body);
         body.extend_from_slice(&message::build_location_information_component(
             3,
             "Vehicle GPS",
@@ -385,6 +388,32 @@ fn identify_body_with_setting(excluded: &[u16], location_enabled: bool) -> Vec<u
         ));
     }
     body
+}
+
+fn declare_location_messages(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 6);
+    let mut offset = 0;
+    while offset < body.len() {
+        let len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        assert!(len >= 4 && offset + len <= body.len(), "invalid generated Identify group");
+        let id = u16::from_be_bytes([body[offset + 2], body[offset + 3]]);
+        let additional: &[u16] = match id {
+            6 => &[spec::MSG_LOCATION_INFORMATION],
+            7 => &[spec::MSG_START_LOCATION_INFORMATION, spec::MSG_STOP_LOCATION_INFORMATION],
+            _ => &[],
+        };
+        let mut value = body[offset + 4..offset + len].to_vec();
+        for msg in additional {
+            if !value.chunks_exact(2).any(|bytes| bytes == msg.to_be_bytes()) {
+                value.extend_from_slice(&msg.to_be_bytes());
+            }
+        }
+        out.extend_from_slice(&u16::try_from(value.len() + 4).expect("Identify group too large").to_be_bytes());
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&value);
+        offset += len;
+    }
+    out
 }
 
 fn parse_location_request(body: &[u8]) -> u8 {
@@ -1010,6 +1039,27 @@ mod location_forwarding_tests {
         assert!(!top_level_ids(&disabled).contains(&excluded));
         assert!(top_level_ids(&enabled).contains(&excluded));
         assert!(!top_level_ids(&retry).contains(&excluded));
+        assert_eq!(disabled, retry); // Stripping GPS also strips its optional message declarations.
+        fn declared(body: &[u8], group: u16) -> Vec<u16> {
+            let mut offset = 0;
+            while offset < body.len() {
+                let len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+                let id = u16::from_be_bytes([body[offset + 2], body[offset + 3]]);
+                if id == group {
+                    return body[offset + 4..offset + len].chunks_exact(2)
+                        .map(|b| u16::from_be_bytes([b[0], b[1]])).collect();
+                }
+                offset += len;
+            }
+            panic!("message list missing");
+        }
+        let sent = declared(&enabled, 6);
+        let received = declared(&enabled, 7);
+        assert_eq!(sent, [declared(&disabled, 6), vec![spec::MSG_LOCATION_INFORMATION]].concat());
+        assert_eq!(received, [declared(&disabled, 7), vec![spec::MSG_START_LOCATION_INFORMATION, spec::MSG_STOP_LOCATION_INFORMATION]].concat());
+        assert!(!sent.contains(&spec::MSG_START_LOCATION_INFORMATION));
+        assert!(!received.contains(&spec::MSG_LOCATION_INFORMATION));
+        assert_eq!(declare_location_messages(&enabled), enabled);
     }
 
     #[test]
