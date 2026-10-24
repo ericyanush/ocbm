@@ -29,10 +29,9 @@
 //! (`AA-wireless-UUID search -> 2 bytes: 3500`) and is kept only as a diagnostic.
 //! See docs/androidauto/03_WIRELESS.md §2f and §6d.
 //!
-//! The outbound reconnect worker remains deliberately single-flight: it does not start a second
-//! outbound paging attempt while any iAP2 slot is active. The RFCOMM accept path can meanwhile
-//! accept additional phone-initiated slots. Bounded backoff (10→60 s) between rounds; reset after a
-//! session so a post-drive reconnect is prompt.
+//! Paging stays serial, but each established iAP2 link runs in its own bounded per-peer worker.
+//! A phone holding a slot must not prevent another bonded phone from reconnecting. Anonymous/AA
+//! sessions retain their exclusive claim. Bounded backoff (10→60 s) remains between paging rounds.
 
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,15 +133,28 @@ fn sleep_or_request(secs: u64, shutdown: &AtomicBool, ctrl: &Control) -> bool {
     !shutdown.load(Ordering::Relaxed)
 }
 
+/// A slot ending is a reason to reconnect promptly, even if other phones remain connected.
+fn sleep_or_slot_change(secs: u64, shutdown: &AtomicBool, ctrl: &Control,
+                        workers: &[([u8; 6], thread::JoinHandle<()>)]) -> bool {
+    let before = ctrl.active_peers();
+    for _ in 0..secs {
+        if shutdown.load(Ordering::Relaxed) { return false; }
+        if ctrl.has_request() || ctrl.active_peers() != before || workers.iter().any(|(_, h)| h.is_finished()) {
+            return true;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    !shutdown.load(Ordering::Relaxed)
+}
+
 /// One reconnect attempt against `peer`: SDP-query → RFCOMM-connect → hand to the iAP2 driver.
-/// Returns `true` if a session actually ran (so the caller resets its backoff); `false` also covers
-/// losing the single-session claim to the accept path. The slot is CLAIMED via `compare_exchange` right
-/// before the driver runs (not held across the connect) and cleared only by the claim owner.
-/// What one [`attempt`] did, so the loop can pick the right backoff.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+/// What one reconnect attempt did, so the loop can track its owner and pick a retry delay.
+#[derive(Debug)]
 enum Attempt {
     /// The iAP2 driver ran (a real session, however short).
     Ran,
+    /// The socket is established; its iAP2 owner runs independently of the paging coordinator.
+    Started(thread::JoinHandle<()>),
     /// SDP/RFCOMM failed for an ordinary reason (absent phone, page timeout, lost claim).
     Failed,
     /// The phone rejected the SSP re-pair (`rfcomm_uspace::connect_to` → `PermissionDenied`):
@@ -154,9 +166,9 @@ enum Attempt {
 fn attempt(
     peer: [u8; 6],
     name: &str,
-    shutdown: &AtomicBool,
-    session_active: &AtomicBool,
-    ctrl: &Control,
+    shutdown: &Arc<AtomicBool>,
+    session_active: &Arc<AtomicBool>,
+    ctrl: &Arc<Control>,
 ) -> Attempt {
     // Do not PAGE at all while a wireless Android Auto session owns the box.
     //
@@ -228,22 +240,24 @@ fn attempt(
     ));
     // The real success signal is iAP2 progress inside bt_driver::run, NOT the mgmt DEVICE_CONNECTED
     // for our own outbound connect (docs/wireless/01_BT_AND_RADIO.md §Design notes — the Model-A latching gotcha).
-    // Claim the single-session slot ATOMICALLY, immediately before running the driver. compare_exchange
-    // (not a plain store) closes the TOCTOU with the accept path: the ~16 s SDP-query + RFCOMM-connect
-    // above can overlap an inbound accept that took the slot in the meantime. If we lose the claim, stand
-    // down — drop the freshly-connected socket (the phone retries) rather than run a second concurrent
-    // bt_driver::run against the same phone. Only the claim owner clears the flag (below), so a finishing
-    // session can never clobber another owner's still-live claim.
-    // The guard claims the slot, publishes the peer for the device screen, and releases BOTH on
-    // every exit from here — so the claim and its release cannot drift apart as this block grows,
-    // which is what had already happened between this call site and the accept path's.
-    let Some(_claim) = control::SessionClaim::try_claim(session_active, ctrl, Some(peer)) else {
-        log("session already active — standing down (dropping outbound connect)");
-        return Attempt::Failed;
-    };
-    bt_driver::run(sock, name, peer, shutdown);
-    log("reconnect session ended");
-    Attempt::Ran
+    // Claim inside the worker, immediately before running the driver. The accept path can win
+    // during SDP/connect; only the winner owns this peer's slot. The coordinator tracks the worker
+    // even before its claim is visible, so it cannot spawn a duplicate for the same phone.
+    let worker_shutdown = shutdown.clone();
+    let worker_active = session_active.clone();
+    let worker_ctrl = ctrl.clone();
+    let worker_name = name.to_owned();
+    match thread::Builder::new().name(format!("iap2-{}", control::fmt_addr(&peer))).spawn(move || {
+        let Some(_claim) = control::SessionClaim::try_claim(&worker_active, &worker_ctrl, Some(peer)) else {
+            log(&format!("slot already claimed for {} — dropping outbound connect", control::fmt_addr(&peer)));
+            return;
+        };
+        bt_driver::run(sock, &worker_name, peer, &worker_shutdown);
+        log(&format!("reconnect session ended peer={}", control::fmt_addr(&peer)));
+    }) {
+        Ok(worker) => Attempt::Started(worker),
+        Err(error) => { log(&format!("could not start iAP2 worker: {error}")); Attempt::Failed }
+    }
 }
 
 /// Satisfy gearhead's headset gate: connect OUT to the phone's own audio-gateway RFCOMM channel and
@@ -775,8 +789,20 @@ fn has_established_on_local_port(table: &str, port: u16) -> bool {
     })
 }
 
-/// The reconnect loop. Spawns nothing. Whenever no session is live, re-reads the bond list and tries
-/// each bonded phone in turn with bounded backoff, until `shutdown`. When nothing is bonded it idles
+/// Per-peer admission, including workers whose claim has not yet been published. A named live
+/// slot excludes only its own peer; an anonymous session excludes all paging. The claim in the
+/// worker remains authoritative if an inbound connection arrives during SDP/connect.
+fn can_reconnect(peer: [u8; 6], flag: bool, active: &[[u8; 6]], workers: &[[u8; 6]]) -> bool {
+    let occupied: std::collections::HashSet<_> = active.iter().chain(workers).copied().collect();
+    !(flag && active.is_empty()) && !occupied.contains(&peer) && occupied.len() < control::MAX_IAP2_SLOTS
+}
+
+fn retry_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(BACKOFF_START_SECS))
+}
+
+/// The reconnect loop. Pages serially and dispatches established sockets to per-peer workers;
+/// re-reads the bond list and tries missing phones with bounded backoff until `shutdown`. When nothing is bonded it idles
 /// (re-checking every `BACKOFF_MAX_SECS`) rather than exiting, so a phone paired via the accept path
 /// after boot becomes reconnect-eligible without a daemon restart (audit Fix #22).
 ///
@@ -805,15 +831,18 @@ pub fn run(
     // `None` = nothing logged yet; `Some(true)` = had bonds; `Some(false)` = idle.
     let mut last_state: Option<bool> = None;
     let mut last_manual_log = false;
+    let mut workers: Vec<([u8; 6], thread::JoinHandle<()>)> = Vec::new();
+    let mut last_attempt = std::collections::HashMap::new();
     while !shutdown.load(Ordering::Relaxed) {
-        // Never fight an in-progress session (accept path or a prior reconnect). Advisory fast-path
-        // only — the authoritative claim is the compare_exchange in attempt().
-        if session_active.load(Ordering::Relaxed) {
-            if !interruptible_sleep(BACKOFF_START_SECS, shutdown) {
-                break;
+        // Reap owners without ever waiting on a live phone. The old synchronous driver parked
+        // this entire loop for that phone's lifetime and global session_active blocked retries
+        // even after it ended, if a second inbound phone still occupied any slot.
+        for i in (0..workers.len()).rev() {
+            if workers[i].1.is_finished() {
+                let (peer, worker) = workers.swap_remove(i);
+                if worker.join().is_err() { log(&format!("iAP2 worker panicked peer={}", control::fmt_addr(&peer))); }
+                backoff = BACKOFF_START_SECS;
             }
-            backoff = BACKOFF_START_SECS; // a live session means the phone is here; retry promptly after it
-            continue;
         }
         // Re-read the bond list every round (audit Fix #22): a phone paired via the accept path AFTER
         // boot must become reconnect-eligible without a daemon restart. The old code snapshotted bonds
@@ -883,11 +912,17 @@ pub fn run(
         let mut ran = false;
         let mut rejected = false;
         for &peer in &targets {
-            if shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed) {
-                break;
-            }
+            if shutdown.load(Ordering::Relaxed) { break; }
+            let active = ctrl.active_peers();
+            let pending: Vec<_> = workers.iter().map(|(peer, _)| *peer).collect();
+            if !can_reconnect(peer, session_active.load(Ordering::Acquire), &active, &pending) { continue; }
+            // Slot-change wakeups must never turn a fast handshake failure into a paging loop.
+            let now = Instant::now();
+            if !retry_due(last_attempt.get(&peer).copied(), now) { continue; }
+            last_attempt.insert(peer, now);
             match attempt(peer, name, shutdown, session_active, ctrl) {
                 Attempt::Ran => ran = true,
+                Attempt::Started(worker) => { workers.push((peer, worker)); ran = true; }
                 Attempt::Failed => {}
                 Attempt::PairRejected => {
                     rejected = true;
@@ -906,7 +941,13 @@ pub fn run(
         // DLC then drops, or fails auth fast) makes each attempt return in well under a second. Without this
         // floor the old `continue` spun the loop back-to-back — pinning the single i.MX6UL core and paging
         // the phone continuously. A genuine session that just ended still retries within BACKOFF_START_SECS.
-        if !sleep_or_request(backoff, shutdown, ctrl) {
+        let keep_running = if rejected {
+            // Another slot's teardown must not shorten the SSP rejection hold-off.
+            sleep_or_request(backoff, shutdown, ctrl)
+        } else {
+            sleep_or_slot_change(backoff, shutdown, ctrl, &workers)
+        };
+        if !keep_running {
             break;
         }
         if rejected {
@@ -916,6 +957,11 @@ pub fn run(
             backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
         }
     }
+    // Each driver observes this same shutdown flag through its timed reads/writes. Join only
+    // after shutdown so no outbound iAP2 owner can survive into a replacement wireless stack.
+    for (peer, worker) in workers {
+        if worker.join().is_err() { log(&format!("iAP2 worker panicked on shutdown peer={}", control::fmt_addr(&peer))); }
+    }
     log("reconnect loop exiting");
 }
 
@@ -924,6 +970,39 @@ mod tests {
     use super::{has_established_on_local_port, headset_candidates, split_at_lines};
     use crate::hfp_hf::Path;
     use crate::sdp_client::Services;
+
+    #[test]
+    fn named_phone_does_not_block_another_phones_reconnect() {
+        let a = [2, 0, 0, 0, 0, 1];
+        let b = [2, 0, 0, 0, 0, 2];
+        assert!(super::can_reconnect(a, true, &[b], &[b]));
+        assert!(!super::can_reconnect(b, true, &[b], &[b]));
+        // A worker pending publication must also suppress duplicate outbound paging.
+        assert!(!super::can_reconnect(a, false, &[], &[a]));
+        assert!(super::can_reconnect(b, false, &[], &[a]));
+    }
+
+    #[test]
+    fn fast_worker_exit_cannot_bypass_the_per_phone_retry_floor() {
+        let now = std::time::Instant::now();
+        assert!(super::retry_due(None, now));
+        assert!(!super::retry_due(Some(now), now + std::time::Duration::from_secs(1)));
+        assert!(!super::retry_due(Some(now), now + std::time::Duration::from_millis(9_999)));
+        assert!(super::retry_due(Some(now), now + std::time::Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn reconnect_respects_anonymous_sessions_and_shared_slot_capacity() {
+        let peer = [2, 0, 0, 0, 0, 99];
+        assert!(!super::can_reconnect(peer, true, &[], &[]));
+        let occupied: Vec<_> = (0..crate::control::MAX_IAP2_SLOTS)
+            .map(|n| [2, 0, 0, 0, 0, n as u8]).collect();
+        assert!(!super::can_reconnect(peer, true, &occupied, &[]));
+        assert!(!super::can_reconnect(peer, false, &[], &occupied));
+        // The same peer in the worker list and active set consumes only one slot.
+        assert!(super::can_reconnect(peer, true, &occupied[..7], &occupied[..7]));
+        assert!(super::can_reconnect(peer, true, &occupied[..7], &[]));
+    }
 
     /// The bench Pixel's own numbers: HFP AG on RFCOMM 4, HSP AG on 3. AUTO must try HFP first —
     /// that is the route the stock firmware proved against this exact phone.
