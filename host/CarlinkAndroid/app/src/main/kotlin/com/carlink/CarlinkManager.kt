@@ -2458,6 +2458,24 @@ class CarlinkManager(
      */
     fun videoFramesRendered(): Long = videoEpoch?.renderer?.framesRendered?.get() ?: 0L
 
+    private val projectionLiveness = com.carlink.av.ProjectionLiveness()
+
+    /** IO-thread poll: native state/keyframe access can wait behind control authentication. */
+    fun videoIsResponsive(): Boolean {
+        val epoch = videoEpoch ?: return false
+        val receiver = carPlayReceiver ?: return epoch.renderer.framesRendered.get() > 0L
+        val generation = receiver.activeControlGeneration
+        val decision = projectionLiveness.update(
+            epoch.seq.toLong(), generation, epoch.renderer.framesRendered.get(), receiver.sessionLive,
+            NativeCore.avIdleMs(generation), android.os.SystemClock.elapsedRealtime(),
+        )
+        if (decision.requestKeyframe) {
+            logInfo("[CP_RX] A/V idle; probing video before exposing recovery controls (control=$generation epoch=${epoch.seq})", tag = Logger.Tags.VIDEO)
+            requestCurrentKeyframe()
+        }
+        return decision.visible
+    }
+
     private fun requestCurrentKeyframe(): Boolean =
         if (carPlayReceiver != null) NativeCore.forceKeyFrame() else client?.requestKeyframe() ?: false
 

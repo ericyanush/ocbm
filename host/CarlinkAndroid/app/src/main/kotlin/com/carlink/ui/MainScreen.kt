@@ -76,6 +76,8 @@ import com.carlink.ui.settings.ResetConnectionDialog
 import com.carlink.ui.theme.AutomotiveDimens
 import com.carlink.util.EdgeInsets
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -99,7 +101,7 @@ private class SessionUiState {
     /** Set once initialize() has run with a real surface + size; gates the one-shot start effect. */
     var initializedForStart by mutableStateOf(false)
 
-    /** True only while the current renderer epoch has produced a frame (polled; see [SessionEffects]). */
+    /** Current epoch has a frame and native media has not failed its liveness probe. */
     var videoOnScreen by mutableStateOf(false)
 
     /** The wireless pairing code awaiting Pair / Cancel (CT_PAIRING_CODE), or null. */
@@ -184,7 +186,7 @@ fun MainScreen(
             // left at "Waiting for phone...") is misleading while video is being rebuilt.
             val overlayStatus =
                 if (ui.connectionState == CarlinkManager.State.STREAMING && !ui.videoOnScreen) {
-                    "CarPlay connected — restoring video..."
+                    "CarPlay video unavailable — waiting for phone..."
                 } else {
                     ui.statusText
                 }
@@ -279,7 +281,7 @@ private fun SessionEffects(
         if (ui.connectionState != CarlinkManager.State.STREAMING) ui.activeTouches.clear()
     }
 
-    // Keep the overlay tied to the CURRENT renderer epoch, not just the last session state. This
+    // Keep the overlay tied to the CURRENT renderer epoch and media liveness, not session history. This
     // also catches pauseVideo() retiring the epoch while MainActivity is backgrounded and a phone
     // disconnect that does not immediately move the manager out of STREAMING. Without this, a
     // resumed Activity can remain a black Surface with the Settings/Reset controls hidden.
@@ -294,12 +296,12 @@ private fun SessionEffects(
 
         var wasVisible = ui.videoOnScreen
         while (true) {
-            val hasCurrentFrame = carlinkManager.videoFramesRendered() > 0L
+            val hasCurrentFrame = withContext(Dispatchers.IO) { carlinkManager.videoIsResponsive() }
             if (hasCurrentFrame != ui.videoOnScreen) {
                 if (hasCurrentFrame) {
-                    logInfo("[UI_STATE] Current video renderer produced a frame — hiding recovery overlay", tag = "UI")
+                    logInfo("[UI_STATE] Current video session responsive — hiding recovery overlay", tag = "UI")
                 } else if (wasVisible) {
-                    logInfo("[UI_STATE] Current video renderer has no frames — showing recovery overlay", tag = "UI")
+                    logInfo("[UI_STATE] Current video session unavailable or probe unanswered — showing recovery overlay", tag = "UI")
                 }
                 ui.videoOnScreen = hasCurrentFrame
             }
