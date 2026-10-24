@@ -2,8 +2,92 @@
 use crate::{p, Link};
 use std::{
     collections::HashSet,
+    fs::{self, DirBuilder},
+    os::unix::fs::DirBuilderExt,
+    path::PathBuf,
+    process::Command,
     time::{Duration, Instant},
 };
+
+struct Verifier {
+    dir: PathBuf,
+}
+impl Verifier {
+    fn new(certificate: &[u8]) -> Result<Self, String> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ocbm-mfi-verify-{}-{nonce}", std::process::id()));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| e.to_string())?;
+        let verifier = Self { dir };
+        fs::write(verifier.dir.join("certificate.der"), certificate).map_err(|e| e.to_string())?;
+        Self::openssl(
+            Command::new("openssl")
+                .arg("pkcs7")
+                .arg("-inform")
+                .arg("DER")
+                .arg("-in")
+                .arg(verifier.dir.join("certificate.der"))
+                .arg("-print_certs")
+                .arg("-out")
+                .arg(verifier.dir.join("certificate.pem")),
+        )?;
+        Self::openssl(
+            Command::new("openssl")
+                .arg("x509")
+                .arg("-in")
+                .arg(verifier.dir.join("certificate.pem"))
+                .arg("-pubkey")
+                .arg("-noout")
+                .arg("-out")
+                .arg(verifier.dir.join("public-key.pem")),
+        )?;
+        Ok(verifier)
+    }
+    fn openssl(command: &mut Command) -> Result<(), String> {
+        let output = command
+            .output()
+            .map_err(|e| format!("OpenSSL is required for MFi verification: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "OpenSSL verification failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+    fn verify(&self, challenge: &[u8], signature: &[u8]) -> Result<(), String> {
+        fs::write(self.dir.join("digest.bin"), challenge).map_err(|e| e.to_string())?;
+        fs::write(self.dir.join("signature.bin"), signature).map_err(|e| e.to_string())?;
+        Self::openssl(
+            Command::new("openssl")
+                .arg("pkeyutl")
+                .arg("-verify")
+                .arg("-pubin")
+                .arg("-inkey")
+                .arg(self.dir.join("public-key.pem"))
+                .arg("-sigfile")
+                .arg(self.dir.join("signature.bin"))
+                .arg("-in")
+                .arg(self.dir.join("digest.bin"))
+                .arg("-pkeyopt")
+                .arg("digest:sha1")
+                .arg("-pkeyopt")
+                .arg("rsa_padding_mode:pkcs1"),
+        )
+    }
+}
+impl Drop for Verifier {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
 
 fn reply(payload: &[u8], tag: u8) -> Result<Option<Vec<u8>>, String> {
     if payload.len() < 4 {
@@ -65,6 +149,7 @@ pub(super) fn run(link: &mut Link, rounds: u64) -> Result<(), String> {
     if baseline.is_empty() || baseline.len() > 1280 {
         return Err("invalid initial certificate length".into());
     }
+    let verifier = Verifier::new(&baseline)?;
     let mut signatures = HashSet::new();
     for round in 0..rounds {
         // The first pair, and the boundary between rounds, exercise back-to-back cert reads.
@@ -75,17 +160,19 @@ pub(super) fn run(link: &mut Link, rounds: u64) -> Result<(), String> {
         if signature.len() != 128 {
             return Err("signature length is not 128 bytes".into());
         }
+        verifier
+            .verify(&challenge, &signature)
+            .map_err(|e| format!("round {} RSA signature invalid: {e}", round + 1))?;
         if !signatures.insert(signature) {
             return Err("signature repeated for a different challenge".into());
         }
         check_cert(&baseline, &exchange(link, 1, &[], &mut tag)?)?;
         println!(
-            "[mfi-check] round {}/{rounds} OK (certificate stable before/after signing)",
+            "[mfi-check] round {}/{rounds} OK (certificate stable, RSA signature verified)",
             round + 1
         );
     }
-    println!("[mfi-check] PASS: {rounds} rounds; {} stable certificate reads; distinct 128-byte signatures", 1 + 2*rounds);
-    println!("[mfi-check] Signature checks cover length/non-repetition, not RSA verification.");
+    println!("[mfi-check] PASS: {rounds} rounds; {} stable certificate reads; distinct, verified RSA signatures", 1 + 2*rounds);
     Ok(())
 }
 
@@ -105,5 +192,28 @@ mod tests {
         assert!(check_cert(&[1, 2, 3], &[1, 2, 3]).is_ok());
         assert!(check_cert(&[1, 2, 3], &[1, 9, 3]).is_err());
         assert!(check_cert(&[1, 2, 3], &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn rsa_verification_rejects_wrong_challenges_and_corrupt_signatures() {
+        let certificate = include_bytes!("../../../crates/vendor/mfi/tests/fixtures/mfi_cert.der");
+        let signature =
+            include_bytes!("../../../crates/vendor/mfi/tests/fixtures/mfi_sign_testvector.sig");
+        // Existing captured fixture signs this synthetic SHA-1 digest.
+        let challenge = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+        ];
+        let verifier = Verifier::new(certificate).unwrap();
+        verifier.verify(&challenge, signature).unwrap();
+        let mut wrong = challenge;
+        wrong[0] ^= 1;
+        assert!(verifier.verify(&wrong, signature).is_err());
+        let mut corrupt = signature.to_vec();
+        corrupt[0] ^= 1;
+        assert!(verifier.verify(&challenge, &corrupt).is_err());
+        let dir = verifier.dir.clone();
+        drop(verifier);
+        assert!(!dir.exists());
     }
 }
