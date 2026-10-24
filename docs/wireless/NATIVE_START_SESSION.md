@@ -78,6 +78,14 @@ slot-scoped StartSession events for readiness while the experiment is enabled.
 MAC-only legacy phase events cannot erase a new connection. A new slot is eligible
 even when the preceding slot was blocked after a transport failure or timeout.
 
+The receiver arms its advertisement watchdog before calling `registerService`,
+including when Android delivers the registration callback synchronously. Readiness
+and callbacks belong to a registration attempt; callbacks from a replaced or
+stopped attempt cannot change the current attempt's readiness or diagnostic state.
+
+To test these safeguards, rebuild and deploy both `btd` and `ocbmd`, update
+`session_supervisor.sh`, and install the updated main app. The USB helper is unchanged.
+
 ## Control contract
 
 `CAP_CARPLAY_START_SESSION` is `0x80`. `CT_CARPLAY_START_SESSION` (`0x20`) carries

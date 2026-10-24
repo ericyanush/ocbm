@@ -45,6 +45,51 @@ internal fun isExpectedInboundPeer(remoteAddress: String, expectedAddresses: Set
     return remote.isNotEmpty() && expectedAddresses.any { normalized(it) == remote }
 }
 
+/** Registration callbacks can run inside registerService(), or arrive after a replacement/stop. */
+internal class AdvertisementRegistration(private val clock: () -> Long = System::currentTimeMillis) {
+    internal class Attempt {
+        val ready = CountDownLatch(1)
+        var registeredAt = 0L
+        var failed = false
+    }
+
+    private var current: Attempt? = null
+
+    fun register(pending: () -> Unit, submit: (Attempt) -> Unit) {
+        val attempt = synchronized(this) {
+            current?.ready?.countDown()
+            Attempt().also { current = it; pending() }
+        }
+        submit(attempt) // Pending state and its watchdog exist BEFORE an immediate callback.
+    }
+
+    @Synchronized fun complete(attempt: Attempt, success: Boolean, notify: () -> Unit): Boolean {
+        if (current !== attempt || attempt.ready.count == 0L) return false
+        attempt.registeredAt = if (success) clock() else 0L
+        attempt.failed = !success
+        try { notify() } finally { attempt.ready.countDown() }
+        return true
+    }
+
+    @Synchronized fun invalidate(attempt: Attempt, notify: () -> Unit) {
+        if (current !== attempt) return
+        attempt.registeredAt = 0L
+        attempt.failed = true
+        attempt.ready.countDown()
+        notify()
+    }
+
+    @Synchronized fun clear() { current?.ready?.countDown(); current = null }
+    @Synchronized fun registeredAt(): Long = current?.registeredAt ?: 0L
+    @Synchronized fun failed(): Boolean = current?.failed == true
+
+    fun await(timeoutMs: Long): Boolean {
+        val attempt = synchronized(this) { current } ?: return false
+        if (!attempt.ready.await(timeoutMs, TimeUnit.MILLISECONDS)) return false
+        return synchronized(this) { current === attempt && attempt.registeredAt != 0L && !attempt.failed }
+    }
+}
+
 /**
  * A **CarPlay-identity** AirPlay receiver — the successor to the feasibility-era `AirPlayRx` probe
  * (now removed).
@@ -454,12 +499,11 @@ class CarPlayRx(
             pinnedPhoneMac.get() == expectedPeer
 
     /** When the advert went live. The connect-out must not run until iOS has had time to index it. */
-    @Volatile private var advertisedAt = 0L
+    private val advertisement = AdvertisementRegistration()
+    private val advertisedAt: Long get() = advertisement.registeredAt()
 
     /** `onRegistrationFailed` fired — [advertisedAt] will never be stamped, so stop waiting on it. */
-    @Volatile private var advertFailed = false
-    /** Released by either terminal NsdManager registration callback; lets startup gate on reality. */
-    private val advertRegistration = CountDownLatch(1)
+    private val advertFailed: Boolean get() = advertisement.failed()
 
     /** One connect-out at a time. See the guard in [connectOutWithRetry]. */
     private val dialInFlight = AtomicBoolean(false)
@@ -677,8 +721,6 @@ class CarPlayRx(
         // NOT set here. This is the request, not the confirmation — starting the settle clock now
         // charges NsdManager's own registration latency against the margin that exists to cover
         // iOS's indexing. onServiceRegistered is the event that means the record is really live.
-        advertisedAt = 0L
-        advertFailed = false
         advertise()
         browseForPhone()
         pool.execute { rediscoverLoop() }
@@ -692,7 +734,7 @@ class CarPlayRx(
         if (advertisedAt != 0L) return true
         if (advertFailed) return false
         return try {
-            advertRegistration.await(timeoutMs, TimeUnit.MILLISECONDS) && advertisedAt != 0L
+            advertisement.await(timeoutMs)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             false
@@ -710,6 +752,7 @@ class CarPlayRx(
     fun stop(): Boolean {
         // BEFORE anything else: from here on this instance speaks to nobody. See [stopped].
         stopped = true
+        advertisement.clear()
         running.set(false)
         handoffReady.set(false)
         handoffGeneration.incrementAndGet()
@@ -829,44 +872,49 @@ class CarPlayRx(
             setPort(listenPort)
             for ((k, v) in txtRecord()) setAttribute(k, v)
         }
-        val l = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(s: NsdServiceInfo) {
-                if (stopped) { log.i("late advert registration ignored — receiver already stopped"); return }
-                log.i("advertise _airplay._tcp:$listenPort REGISTERED as '${s.serviceName}'")
-                advertisedAt = System.currentTimeMillis()
-                advertRegistration.countDown()
-                SessionTrace.met(X_ADVERT)
-                SessionTrace.Board.up(B_ADVERT_NSD, "'${s.serviceName}' _airplay._tcp:$listenPort")
+        advertisement.register(pending = {
+            SessionTrace.Board.down(B_ADVERT_NSD, "registerService requested — awaiting onServiceRegistered")
+            SessionTrace.expect(X_ADVERT, ADVERT_WAIT_MS,
+                "registerService('$ACCESSORY_NAME' _airplay._tcp:$listenPort) was requested and no " +
+                    "onServiceRegistered/onRegistrationFailed callback has arrived")
+        }, submit = { attempt ->
+            val l = object : NsdManager.RegistrationListener {
+                override fun onServiceRegistered(s: NsdServiceInfo) {
+                    if (stopped) { log.i("late advert registration ignored — receiver already stopped"); return }
+                    advertisement.complete(attempt, success = true) {
+                        log.i("advertise _airplay._tcp:$listenPort REGISTERED as '${s.serviceName}'")
+                        SessionTrace.met(X_ADVERT)
+                        SessionTrace.Board.up(B_ADVERT_NSD, "'${s.serviceName}' _airplay._tcp:$listenPort")
+                    }
+                }
+                override fun onRegistrationFailed(s: NsdServiceInfo, c: Int) {
+                    if (stopped) { log.i("late advert failure ignored — receiver already stopped"); return }
+                    // Latch it. advertisedAt is stamped only by onServiceRegistered, so without this the
+                    // connect-out waits on an event that is never coming.
+                    advertisement.complete(attempt, success = false) {
+                        log.e("advertise FAILED code=$c")
+                        SessionTrace.cancel(X_ADVERT, "NsdManager reported onRegistrationFailed code=$c")
+                        SessionTrace.Board.failed(B_ADVERT_NSD, "onRegistrationFailed code=$c")
+                    }
+                }
+                override fun onServiceUnregistered(s: NsdServiceInfo) {
+                    advertisement.invalidate(attempt) { SessionTrace.Board.down(B_ADVERT_NSD, "unregistered") }
+                }
+                override fun onUnregistrationFailed(s: NsdServiceInfo, c: Int) {
+                    log.w("advert unregister FAILED code=$c — NsdManager may keep '${s.serviceName}' published")
+                }
             }
-            override fun onRegistrationFailed(s: NsdServiceInfo, c: Int) {
-                if (stopped) { log.i("late advert failure ignored — receiver already stopped"); return }
-                // Latch it. advertisedAt is stamped only by onServiceRegistered, so without this the
-                // connect-out waits on an event that is never coming.
-                advertFailed = true
-                advertRegistration.countDown()
-                log.e("advertise FAILED code=$c")
-                // Resolved, not missing: the failure is the answer, and Board.failed is its E line.
-                SessionTrace.cancel(X_ADVERT, "NsdManager reported onRegistrationFailed code=$c")
-                SessionTrace.Board.failed(B_ADVERT_NSD, "onRegistrationFailed code=$c")
+            regListener = l
+            try {
+                checkNotNull(nsd).registerService(info, NsdManager.PROTOCOL_DNS_SD, l)
+            } catch (t: Exception) {
+                advertisement.complete(attempt, success = false) {
+                    log.e("advertise registerService threw ${t.javaClass.simpleName}")
+                    SessionTrace.cancel(X_ADVERT, "registerService threw ${t.javaClass.simpleName}")
+                    SessionTrace.Board.failed(B_ADVERT_NSD, "registerService threw ${t.javaClass.simpleName}")
+                }
             }
-            override fun onServiceUnregistered(s: NsdServiceInfo) {
-                SessionTrace.Board.down(B_ADVERT_NSD, "unregistered")
-            }
-            override fun onUnregistrationFailed(s: NsdServiceInfo, c: Int) {
-                log.w("advert unregister FAILED code=$c — NsdManager may keep '${s.serviceName}' published")
-            }
-        }
-        regListener = l
-        nsd?.registerService(info, NsdManager.PROTOCOL_DNS_SD, l)
-        // Requested is not registered. The record is live only on onServiceRegistered (55 ms after
-        // the request on 2026-09-09); ADVERT_WAIT_MS is already the app's own definition of "too
-        // long" — a connect-out abandons itself after that — so a registration that has not arrived
-        // by then is missing by the receiver's own rules, whether or not a dial happened to be waiting.
-        SessionTrace.Board.down(B_ADVERT_NSD, "registerService requested — awaiting onServiceRegistered")
-        SessionTrace.expect(X_ADVERT, ADVERT_WAIT_MS,
-            "registerService('$ACCESSORY_NAME' _airplay._tcp:$listenPort) was requested and no " +
-            "onServiceRegistered/onRegistrationFailed callback has arrived — iOS cannot index an " +
-            "advert that is not live, so no connect-out can succeed")
+        })
 
         if (!selfHostedMdnsEnabled) {
             log.i("self-hosted advert disabled — NsdManager advert stands alone")
