@@ -200,12 +200,12 @@ impl Device {
         let mut driver = Driver::new(LinuxBus(&self.file), RealClock(Instant::now()));
         let result = run(&mut driver);
         let s = &driver.stats;
-        eprintln!("[mfi-i2c] source={} pid={} op={op} result={} elapsed_ms={} lock_wait_ms={lock_wait} reads={} writes={} retries={} busy_nacks={} other_failures={} first_fault={} last_fault={} status={:02x?} error_register={:02x?} certificate_attempts={} length_samples={:02x?}",
+        eprintln!("[mfi-i2c] source={} pid={} op={op} result={} elapsed_ms={} lock_wait_ms={lock_wait} reads={} writes={} retries={} busy_nacks={} other_failures={} first_fault={} last_fault={} status={:02x?} error_register={:02x?} certificate_attempts={} post_length_anomalies={} post_length_resamples={} device_version={:02x?} profile={:?} capacity_initialized={} length_samples={:02x?}",
             self.source, std::process::id(), result.as_ref().map(|_| "ok".into()).unwrap_or_else(|e| e.to_string()),
             start.elapsed().as_millis(), s.reads, s.writes, s.retries, s.busy_nacks, s.other_failures,
             s.first_fault.map(|e| e.to_string()).unwrap_or_else(|| "none".into()),
             s.last_fault.map(|e| e.to_string()).unwrap_or_else(|| "none".into()),
-            s.last_status, s.error_register, s.certificate_attempts, s.length_samples);
+            s.last_status, s.error_register, s.certificate_attempts, s.post_length_anomalies, s.post_length_resamples, s.device_version, s.compatibility_profile, s.capacity_initialized, s.length_samples);
         result.map_err(|_| MfiError::Chip)
     }
     pub fn certificate(&self) -> Result<Vec<u8>, MfiError> {

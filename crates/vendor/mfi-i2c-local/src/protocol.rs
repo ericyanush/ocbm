@@ -94,6 +94,11 @@ pub(crate) struct Stats {
     pub error_register: Option<u8>,
     pub length_samples: Vec<[u8; 2]>,
     pub certificate_attempts: usize,
+    pub post_length_anomalies: usize,
+    pub post_length_resamples: usize,
+    pub device_version: Option<u8>,
+    pub compatibility_profile: Option<&'static str>,
+    pub capacity_initialized: bool,
 }
 
 pub(crate) struct Driver<B, C> {
@@ -198,6 +203,31 @@ impl<B: Bus, C: Clock> Driver<B, C> {
         }
     }
 
+    fn confirm_post_certificate_length(&mut self, expected: usize) -> Result<bool, Error> {
+        if self.certificate_length()? == expected {
+            return Ok(true);
+        }
+        self.stats.post_length_anomalies += 1;
+        // On this adapter the first length read after a continuous certificate read returns
+        // 9c:b1 even after a 100ms delay. Re-selecting 0x30 again returns 03:b1. Require two
+        // consecutive correct samples after an anomaly; do not accept persistent divergence.
+        let mut matching = 0;
+        for _ in 0..3 {
+            self.clock.sleep(RETRY_PAUSE);
+            self.stats.post_length_resamples += 1;
+            if self.certificate_length()? == expected {
+                matching += 1;
+                if matching == 2 {
+                    return Ok(true);
+                }
+            } else {
+                matching = 0;
+                self.stats.post_length_anomalies += 1;
+            }
+        }
+        Ok(false)
+    }
+
     pub fn certificate(&mut self) -> Result<Vec<u8>, Error> {
         self.clear_error()?;
         for attempt in 0..3 {
@@ -214,7 +244,7 @@ impl<B: Bus, C: Clock> Driver<B, C> {
                 let mut cert = vec![0; n];
                 // Continuous reads across certificate pages are permitted by the 2.0C spec.
                 self.read(0x31, &mut cert)?;
-                if self.certificate_length()? != n || !valid_der_envelope(&cert) {
+                if !self.confirm_post_certificate_length(n)? || !valid_der_envelope(&cert) {
                     return Ok(None);
                 }
                 Ok(Some(cert))
@@ -236,9 +266,20 @@ impl<B: Bus, C: Clock> Driver<B, C> {
             return Err(Error::InvalidChallenge(challenge.len()));
         }
         self.clear_error()?;
+        let mut version = [0];
+        self.read(0x00, &mut version)?;
+        self.stats.device_version = Some(version[0]);
+        // Verified on CPC200 hardware: this v03 device has no error register and writing
+        // signature capacity corrupts the returned RSA signature. Its existing sequence
+        // verifies successfully without that write. Keep the standard sequence for other parts.
+        let legacy = version[0] == 0x03 && self.stats.error_register == Some(0xff);
+        self.stats.compatibility_profile = Some(if legacy { "cpc200-v03" } else { "2.0c" });
         self.write(0x20, &(challenge.len() as u16).to_be_bytes())?;
         self.write(0x21, challenge)?;
-        self.write(0x11, &[0x00, 0x80])?; // Signature capacity, required before PROC_CONTROL=1.
+        if !legacy {
+            self.write(0x11, &[0x00, 0x80])?;
+            self.stats.capacity_initialized = true;
+        }
         self.write(0x10, &[0x01])?;
         let deadline = self.clock.now() + SIGN_WAIT;
         self.clock.sleep(Duration::from_millis(100));
@@ -395,6 +436,7 @@ mod tests {
     fn setup() -> Vec<Step> {
         vec![
             read(5, &[0]),
+            read(0x00, &[0x05]),
             write(0x20, &[0, 20]),
             write(0x21, &[0x5a; 20]),
             write(0x11, &[0, 128]),
@@ -423,6 +465,34 @@ mod tests {
         assert!(d.bus.steps.is_empty());
         assert_eq!(d.stats.busy_nacks, 3);
         assert_eq!(d.clock.now(), Duration::from_millis(120));
+    }
+
+    #[test]
+    fn capacity_write_is_skipped_only_for_the_verified_cpc200_profile() {
+        for (version, error_register) in [(3, 0xff), (5, 0xff), (3, 0), (5, 0)] {
+            let legacy = version == 3 && error_register == 0xff;
+            let mut steps = setup();
+            steps[0] = read(5, &[error_register]);
+            steps[1] = read(0, &[version]);
+            if legacy {
+                steps.remove(4);
+            } // Signature-capacity write, not the trigger.
+            steps.extend([
+                read(0x10, &[0x10]),
+                read(0x11, &[0, 128]),
+                read(0x12, &[0xab; 128]),
+                read(5, &[error_register]),
+            ]);
+            let mut d = driver(steps);
+            assert_eq!(d.sign(&[0x5a; 20]).unwrap(), vec![0xab; 128]);
+            assert_eq!(d.stats.capacity_initialized, !legacy);
+            assert_eq!(
+                d.stats.compatibility_profile,
+                Some(if legacy { "cpc200-v03" } else { "2.0c" })
+            );
+            assert_eq!(d.stats.writes, if legacy { 3 } else { 4 });
+            assert!(d.bus.steps.is_empty());
+        }
     }
 
     #[test]
@@ -513,6 +583,11 @@ mod tests {
                     read(0x31, &body),
                     read(0x30, &post),
                 ]);
+                if post != [0, 4] {
+                    for _ in 0..3 {
+                        steps.push(read(0x30, &post));
+                    }
+                }
             }
             let mut d = driver(steps);
             assert!(matches!(
@@ -522,6 +597,42 @@ mod tests {
             assert!(d.bus.steps.is_empty());
             assert_eq!(d.stats.certificate_attempts, 3);
         }
+    }
+
+    #[test]
+    fn post_certificate_register_quirk_recovers_only_after_two_matching_resamples() {
+        let certificate = include_bytes!("../../mfi/tests/fixtures/mfi_cert.der");
+        let length = (certificate.len() as u16).to_be_bytes();
+        let bad = [0x9c, length[1]];
+        let mut d = driver(vec![
+            read(5, &[0xff]),
+            read(0x30, &length),
+            read(0x30, &length),
+            read(0x31, certificate),
+            read(0x30, &bad),
+            read(0x30, &length),
+            read(0x30, &length),
+            read(5, &[0xff]),
+        ]);
+        assert_eq!(d.certificate().unwrap(), certificate);
+        assert_eq!(d.stats.certificate_attempts, 1);
+        assert_eq!(d.stats.post_length_anomalies, 1);
+        assert_eq!(d.stats.post_length_resamples, 2);
+        assert_eq!(d.stats.busy_nacks, 0);
+        assert!(d.bus.steps.is_empty());
+    }
+
+    #[test]
+    fn one_good_post_read_sample_does_not_hide_an_unstable_length() {
+        let mut d = driver(vec![
+            read(0x30, &[0x9c, 0xb1]),
+            read(0x30, &[3, 0xb1]),
+            read(0x30, &[0x9c, 0xb1]),
+            read(0x30, &[3, 0xb1]),
+        ]);
+        assert!(!d.confirm_post_certificate_length(945).unwrap());
+        assert_eq!(d.stats.post_length_resamples, 3);
+        assert!(d.bus.steps.is_empty());
     }
 
     #[test]

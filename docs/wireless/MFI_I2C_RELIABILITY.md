@@ -12,12 +12,19 @@ Register reads retain the combined I2C write/read transaction: the intervening S
 The continuous certificate read is also explicitly permitted. The shared driver leaves bus speed,
 kernel timeout configuration, chip power and reset pins unchanged.
 
-The signing sequence clears the previous error, writes challenge length/data, initializes signature
-capacity at `0x11` to `0x0080`, and then triggers `0x10=1`. Completion requires status `0x10`,
+The standard signing sequence clears the previous error, writes challenge length/data, initializes
+signature capacity at `0x11` to `0x0080`, and then triggers `0x10=1`. This adapter needs an explicit
+compatibility profile: DeviceVersion `0x03` together with an unsupported error register (`0xff`)
+selects `cpc200-v03`, which preserves the existing sequence without that capacity write. A direct
+RSA test on this hardware verified the old sequence and rejected the capacity-initialized sequence
+for the same challenge and certificate. Other parts retain the documented capacity initialization.
+Diagnostics report the version, selected profile and whether capacity was initialized.
+Completion requires status `0x10`,
 with a successful signature process result and no error flag. Another process result with bit 4 set
 (for example `0x30`) is not accepted. The final signature must be 128 bytes, and the chip error
 register is checked after the read. A returned error-register value of `0xff` is recorded but
 treated as unsupported, matching the existing adapter probe evidence for this register.
+Status `0xff` is not accepted as success, even though bit 4 is set.
 
 Busy/transient register failures use a 5ms retry pause and a 250ms register budget. Signing has a
 separate 2500ms completion-poll budget, including the initial 100ms settle. These budgets are
@@ -31,7 +38,11 @@ returns a failure rather than replaying that command. Idempotent register access
 Every ioctl must report the exact expected number of messages; a short read is not success.
 
 Certificate reads compare two length samples before allocating (1–1280 bytes), read the body, and
-check another length sample afterward. They also require the outer DER sequence length to match
+check the length afterward. On this adapter the first post-certificate length read returns
+`9c:b1`, even after a 100ms delay; re-selecting `0x30` restores `03:b1` (945). After an anomalous
+post-read sample, the driver allows up to three additional selections and requires two consecutive
+matches to the pre-read length. Persistently wrong or unstable lengths are still rejected.
+Certificate reads also require the outer DER sequence length to match
 the actual buffer. Up to three consistency attempts handle observations such as `03:b1` followed
 by `9c:b1`. Exhausted transport retries fail the operation rather than accepting a partially read
 buffer. Structural framing is not certificate-chain validation: the phone still verifies trust and
@@ -41,7 +52,8 @@ the signature. Signatures are always generated for the supplied challenge, never
 
 Each operation emits one `[mfi-i2c]` summary with source, PID, result, elapsed time, lock wait,
 read/write counts, retries, busy NACK count, other failures, first/last failed transfer, final
-status, error-register value, certificate attempt count and raw length samples. Failed transfers
+status, error-register value, certificate attempt count, post-read length anomaly/re-sample counts
+and raw length samples, plus chip version/profile/capacity-initialization details. Failed transfers
 identify the operation, register, byte count, ioctl message count and errno. Certificate bytes,
 challenge bytes, signatures and private keys are not included in these summaries.
 
@@ -82,13 +94,38 @@ cargo run --release -p ocbm-host --offline -- mfi-check 1314 2d00 20
 
 This explicitly runs 20 rounds of certificate/sign/certificate operations. It compares every
 certificate byte against the initial read, exercises back-to-back certificate reads between
-rounds, varies the challenge and requires distinct 128-byte signatures. It reports per-request
-timing and correlation tags, stops on the first failure and returns a nonzero exit status.
-It does not cryptographically verify the RSA signatures, pair phones or subscribe to projection.
+rounds, varies the challenge and requires distinct 128-byte signatures. OpenSSL must be available
+on PATH: the tool extracts the certificate's public key and verifies every RSA signature against
+its challenge. It reports per-request timing and correlation tags, stops on the first failure and
+returns a nonzero exit status. It does not validate certificate-chain trust, pair phones or
+subscribe to projection.
 
 After the bench test, test real CarPlay startup, a warm key cycle, switching between two phones,
 and GPS forwarding. Export the AAOS diagnostic bundle to collect the adapter summaries under
 real authentication contention. These hardware tests remain necessary even when unit tests pass.
+
+## Adapter read-sequence comparison (2026-10-24)
+
+Temporary diagnostics under the shared chip lock compared combined repeated-START reads with
+STOP-separated register selection/read transactions. Both produced `03:b1` before a continuous
+945-byte certificate read, `9c:b1` on the first post-read selection, then `03:b1` on subsequent
+selections. Waiting 5ms or 100ms before the first post-read did not eliminate it. Both transaction
+forms also observed a transient `ff` signing status followed by `10` when signature capacity was
+initialized, but those signatures failed RSA verification. Without that capacity write the chip
+NACKed while computing, returned `10`, and produced a signature that verified. Adding the optional
+STOP therefore did not resolve either adapter response or the incompatible capacity write.
+
+A temporary executable using the corrected shared driver completed five signing rounds on the
+adapter: all eleven certificate reads matched, and OpenSSL verified all five signatures against
+their respective challenges and the certificate's public key. These tests used RAM diagnostics;
+the installed adapter binaries still require deployment of the rebuilt production artifacts.
+
+The successful combined-read sequence is allowed by the specification. Our retry policy is not
+a literal implementation of its two separate address-phase loops: it retries the combined
+transaction and uses 5ms instead of 500µs. The observed signing NACKs in the split-phase diagnostic
+were in register selection (phase 0), for which restarting from selection is appropriate. We do
+not infer that all I2C errors are NACKs or that these successful-but-stale responses are clock
+stretching faults.
 
 ## References
 
