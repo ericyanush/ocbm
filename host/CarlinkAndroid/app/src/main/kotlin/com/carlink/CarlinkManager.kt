@@ -50,6 +50,7 @@ import com.carlink.ocbm.OcbmAvLanes
 import com.carlink.ocbm.OcbmClient
 import com.carlink.ocbm.Mfi
 import com.carlink.ocbm.RebindableMfiRelay
+import com.carlink.ocbm.ConnectionMfiRelay
 import com.carlink.ocbm.OemIcon
 import com.carlink.ocbm.UsbBulkTransport
 import com.carlink.ocbm.VehicleConfigSpec
@@ -1321,7 +1322,11 @@ class CarlinkManager(
                 return response.payload
             }
         }
-        carPlayMfiRelay.bind(ownerGeneration, delegate)
+        carPlayMfiRelay.bind(ownerGeneration, ConnectionMfiRelay(delegate, ensureCurrent = {
+            check(client === owner && connectionGeneration.get() == ownerGeneration && owner.subscribed) {
+                "MFi adapter session is no longer active (generation=$ownerGeneration)"
+            }
+        }, log = { logInfo("[MFI] generation=$ownerGeneration $it", tag = Logger.Tags.ADAPTR) }))
         logInfo("[CP_RX] MFi relay bound to subscribed OCBM generation=$ownerGeneration", tag = Logger.Tags.ADAPTR)
     }
 
