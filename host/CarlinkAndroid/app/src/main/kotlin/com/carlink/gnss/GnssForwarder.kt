@@ -14,11 +14,12 @@ import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.max
 import kotlin.math.min
+import org.json.JSONObject
 
 /** Reads the AAOS vehicle GPS provider and emits the GPGGA/GPRMC sentences requested by CarPlay. */
 class GnssForwarder(
     context: Context,
-    private val sendNmea: (String) -> Boolean,
+    private val sendNmea: (String) -> String,
     private val log: (String) -> Unit,
 ) {
     private val appContext = context.applicationContext
@@ -40,12 +41,15 @@ class GnssForwarder(
         val callback = object : LocationListener {
             override fun onLocationChanged(location: Location) {
                 val payload = formatNmea(location)
-                val sent = runCatching { sendNmea(payload) }.getOrDefault(false)
+                val report = runCatching { JSONObject(sendNmea(payload)) }.getOrElse {
+                    JSONObject().put("reason", "forwarding_exception").put("errorType", it.javaClass.simpleName)
+                }
+                val sent = report.optInt("sentSentences") > 0
                 val accuracy = if (location.hasAccuracy()) "${location.accuracy}m" else "unknown"
                 log(
                     "[GNSS] fix lat=${"%.5f".format(Locale.US, location.latitude)} " +
                         "lon=${"%.5f".format(Locale.US, location.longitude)} " +
-                        "accuracy=$accuracy sent=$sent",
+                        "accuracy=$accuracy sent=$sent forwarding=$report",
                 )
             }
 

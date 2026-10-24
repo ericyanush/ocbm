@@ -515,8 +515,8 @@ class CarlinkManager(
     }
     private val gpsForwardingPreference by lazy { GpsForwardingPreference(context) }
     private val gnssForwarder by lazy {
-        GnssForwarder(context, NativeCore::updateVehicleLocation) { message ->
-            logInfo(message, tag = Logger.Tags.ADAPTR)
+        GnssForwarder(context, NativeCore::updateVehicleLocationReport) { message ->
+            logInfo("$message controlGeneration=${carPlayReceiver?.activeControlGeneration ?: 0}", tag = Logger.Tags.ADAPTR)
         }
     }
 

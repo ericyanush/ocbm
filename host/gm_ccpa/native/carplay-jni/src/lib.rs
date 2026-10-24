@@ -864,6 +864,19 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeUpdateVehicleLocat
     .unwrap_or(0)
 }
 
+/// Report the native Wi-Fi tunnel's forwarding decision through the app's exported diagnostics.
+#[no_mangle]
+pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeUpdateVehicleLocationReport(
+    mut env: JNIEnv, _class: JClass, nmea: JString,
+) -> jni::sys::jstring {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(nmea) = env.get_string(&nmea) else { return std::ptr::null_mut() };
+        let nmea: String = nmea.into();
+        let report = receiver::iap_tunnel::update_vehicle_location_report(&nmea);
+        env.new_string(report.json()).map(|value| value.into_raw()).unwrap_or(std::ptr::null_mut())
+    })).unwrap_or(std::ptr::null_mut())
+}
+
 /// `setLimitedUI` — tell iOS to restrict the CarPlay UI for driving, and to release it when parked.
 ///
 /// Wraps [`receiver::events::send_set_limited_ui`], which emits

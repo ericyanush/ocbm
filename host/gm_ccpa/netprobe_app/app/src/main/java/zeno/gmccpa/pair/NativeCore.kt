@@ -125,6 +125,11 @@ object NativeCore {
     /** Offer a fresh NMEA fix to the active native iAP2 tunnel; false is normal when unsubscribed. */
     fun updateVehicleLocation(nmea: String): Boolean = available && nativeUpdateVehicleLocation(nmea)
 
+    /** State-only JSON, persisted by the Kotlin GPS logger alongside each offered fix. */
+    fun updateVehicleLocationReport(nmea: String): String =
+        if (available) nativeUpdateVehicleLocationReport(nmea) ?: "{\"reason\":\"native_error\"}"
+        else "{\"reason\":\"native_unavailable\"}"
+
     /**
      * Restrict ([limit] = true) or release the CarPlay UI for driving.
      *
@@ -177,6 +182,7 @@ object NativeCore {
     private external fun nativeRequestSiriPress(): Boolean
     private external fun nativeSetLocationForwardingEnabled(enabled: Boolean): Boolean
     private external fun nativeUpdateVehicleLocation(nmea: String): Boolean
+    private external fun nativeUpdateVehicleLocationReport(nmea: String): String?
     private external fun nativeSetLimitedUI(limit: Boolean): Boolean
     private external fun nativeSetNightMode(night: Boolean): Boolean
     private external fun nativeForceKeyFrame(): Boolean

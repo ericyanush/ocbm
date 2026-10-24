@@ -127,6 +127,7 @@ const MAX_HANDSHAKE_REBUILDS: u32 = 3;
 static HANDSHAKE_REBUILDS: AtomicU32 = AtomicU32::new(0);
 static LOCATION_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(false);
 static LOCATION_SUBSCRIPTIONS: AtomicU8 = AtomicU8::new(0);
+static LOCATION_AUTH_ERROR: AtomicU8 = AtomicU8::new(0);
 
 struct Session {
     link: Link,
@@ -295,6 +296,7 @@ pub fn reset() {
     *crate::plock(&SESSION) = None;
     HANDSHAKE_REBUILDS.store(0, Ordering::Relaxed); // re-arm the budget retry cap for the next session
     LOCATION_SUBSCRIPTIONS.store(0, Ordering::Release);
+    LOCATION_AUTH_ERROR.store(0, Ordering::Release);
 }
 
 /// Configure whether the next iAP2 Identify advertises the optional vehicle location component.
@@ -309,31 +311,77 @@ pub fn set_location_forwarding_enabled(enabled: bool) {
 /// Consume the app's current NMEA fix and send only sentence types requested by the phone.
 /// `send_iap_message` selects the active RCS/DataStream transport (or the receiver's fallback).
 pub fn update_vehicle_location(nmea: &str) -> bool {
-    if !LOCATION_FORWARDING_ENABLED.load(Ordering::Acquire) {
-        return false;
+    update_vehicle_location_report(nmea).sent_sentences > 0
+}
+
+pub struct LocationForwardingReport {
+    pub enabled: bool,
+    pub subscriptions: u8,
+    pub tunnel_state: String,
+    pub link_up: bool,
+    pub reason: &'static str,
+    pub sent_sentences: usize,
+    pub last_handshake_error: &'static str,
+}
+
+impl LocationForwardingReport {
+    fn new(enabled: bool, subscriptions: u8) -> Self {
+        Self { enabled, subscriptions, tunnel_state: "absent".into(), link_up: false,
+            reason: "tunnel_unavailable", sent_sentences: 0, last_handshake_error: "none" }
     }
+
+    /// Fixed protocol-state fields only; never include coordinates, NMEA, keys, or certificates.
+    pub fn json(&self) -> String {
+        format!(r#"{{"enabled":{},"requestedGga":{},"requestedRmc":{},"tunnelState":"{}","linkUp":{},"reason":"{}","sentSentences":{},"lastHandshakeError":"{}"}}"#,
+            self.enabled, self.subscriptions & 1 != 0, self.subscriptions & 2 != 0,
+            self.tunnel_state, self.link_up, self.reason, self.sent_sentences, self.last_handshake_error)
+    }
+}
+
+pub fn update_vehicle_location_report(nmea: &str) -> LocationForwardingReport {
+    let enabled = LOCATION_FORWARDING_ENABLED.load(Ordering::Acquire);
     let wanted = LOCATION_SUBSCRIPTIONS.load(Ordering::Acquire);
-    if wanted == 0 {
-        return false;
-    }
-    let mut sent_any = false;
-    for sentence in requested_location_sentences(nmea, wanted) {
+    // GPS must not block behind the certificate/sign operation holding the tunnel lock.
+    let mut report = match SESSION.try_lock() {
+        Ok(mut session) => forward_location(enabled, wanted, nmea, session.as_mut(), crate::events::send_iap_message),
+        Err(std::sync::TryLockError::Poisoned(e)) =>
+            forward_location(enabled, wanted, nmea, e.into_inner().as_mut(), crate::events::send_iap_message),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let mut r = LocationForwardingReport::new(enabled, wanted);
+            r.tunnel_state = "busy".into(); r.reason = if enabled { "tunnel_busy" } else { "disabled" }; r
+        }
+    };
+    report.last_handshake_error = match LOCATION_AUTH_ERROR.load(Ordering::Acquire) {
+        1 => "mfi_certificate_failed", 2 => "mfi_signature_failed", _ => "none",
+    };
+    report
+}
+
+fn forward_location(
+    enabled: bool, wanted: u8, nmea: &str, session: Option<&mut Session>,
+    mut send: impl FnMut(&[u8]) -> bool,
+) -> LocationForwardingReport {
+    let mut report = LocationForwardingReport::new(enabled, wanted);
+    if !enabled { report.reason = "disabled"; return report; }
+    let Some(sess) = session else { return report; };
+    report.tunnel_state = format!("{:?}", sess.state);
+    report.link_up = sess.link_up;
+    if sess.state < State::Identified { report.reason = "tunnel_not_identified"; return report; }
+    if wanted == 0 { report.reason = "awaiting_subscription"; return report; }
+    let sentences = requested_location_sentences(nmea, wanted);
+    if sentences.is_empty() { report.reason = "no_requested_sentence"; return report; }
+    for sentence in sentences {
         let mut params = message::Tlv::new();
         params.str(0, sentence);
-        let mut guard = crate::plock(&SESSION);
-        let Some(sess) = guard.as_mut() else { return false };
-        if sess.state < State::Identified {
-            return false;
-        }
         let frame = sess.link.build_msg(1, spec::MSG_LOCATION_INFORMATION, &params.0);
-        if !crate::events::send_iap_message(&frame) {
-            log("WARN LocationInformation send failed (no active iAP2 transport)");
-            return sent_any;
+        if !send(&frame) {
+            report.reason = if report.sent_sentences == 0 { "transport_unavailable" } else { "partially_sent" };
+            return report;
         }
-        drop(guard);
-        sent_any = true;
+        report.sent_sentences += 1;
     }
-    sent_any
+    report.reason = "sent";
+    report
 }
 
 /// Handle phone-originated location subscription messages after tunnel framing is removed.
@@ -908,6 +956,7 @@ fn execute(action: Action, link: &mut Link) -> ExecOutcome {
     match action {
         Action::SendCert => match mfi_cert() {
             Some(cert) => {
+                LOCATION_AUTH_ERROR.store(0, Ordering::Release);
                 let body = message::group_one(0x0000, &cert);
                 let sent = crate::events::send_iap_message(&link.build_msg(
                     1,
@@ -921,10 +970,11 @@ fn execute(action: Action, link: &mut Link) -> ExecOutcome {
                     ExecOutcome::NoCommit
                 }
             }
-            None => ExecOutcome::NoCommit,
+            None => { LOCATION_AUTH_ERROR.store(1, Ordering::Release); ExecOutcome::NoCommit },
         },
         Action::SignChallenge(chal) => match mfi_sign(&chal) {
             Some(sig) => {
+                LOCATION_AUTH_ERROR.store(0, Ordering::Release);
                 let body = message::group_one(0x0000, &sig);
                 let sent = crate::events::send_iap_message(&link.build_msg(
                     1,
@@ -938,7 +988,7 @@ fn execute(action: Action, link: &mut Link) -> ExecOutcome {
                     ExecOutcome::NoCommit
                 }
             }
-            None => ExecOutcome::NoCommit,
+            None => { LOCATION_AUTH_ERROR.store(2, Ordering::Release); ExecOutcome::NoCommit },
         },
         Action::SendIdentify => {
             let ib = identify_body(&[]);
@@ -1080,6 +1130,50 @@ mod location_forwarding_tests {
         assert_eq!(requested_location_sentences(nmea, 0x02), ["$GPRMC,move*00"]);
         assert_eq!(requested_location_sentences(nmea, 0x03), ["$GPGGA,fix*00", "$GPRMC,move*00"]);
         assert!(requested_location_sentences(nmea, 0).is_empty());
+    }
+
+    fn session(state: State) -> Session {
+        Session { link: Link::new(), state, syn: Vec::new(), started: Instant::now(),
+            syn_fallback: false, link_up: true, art: Default::default() }
+    }
+
+    #[test]
+    fn forwarding_reports_the_exact_gate_without_sending_unrequested_data() {
+        let nmea = "$GPGGA,fix*00\r\n$GPRMC,move*00\r\n";
+        let must_not_send = |_: &[u8]| -> bool { panic!("unready sender must not transmit") };
+        assert_eq!(forward_location(false, 3, nmea, None, must_not_send).reason, "disabled");
+        assert_eq!(forward_location(true, 3, nmea, None, must_not_send).reason, "tunnel_unavailable");
+        let mut auth = session(State::CertSent);
+        let report = forward_location(true, 3, nmea, Some(&mut auth), must_not_send);
+        assert_eq!(report.reason, "tunnel_not_identified");
+        assert_eq!(report.tunnel_state, "CertSent");
+        let mut ready = session(State::Identified);
+        assert_eq!(forward_location(true, 0, nmea, Some(&mut ready), must_not_send).reason, "awaiting_subscription");
+        assert_eq!(forward_location(true, 1, "$GPRMC,move*00", Some(&mut ready), must_not_send).reason, "no_requested_sentence");
+        let mut frames = Vec::new();
+        let report = forward_location(true, 1, nmea, Some(&mut ready), |bytes| { frames.push(bytes.to_vec()); true });
+        assert_eq!(report.reason, "sent");
+        assert_eq!(report.sent_sentences, 1);
+        let rx = Link::new().parse(&frames[0]).unwrap();
+        assert_eq!(link::parse_msg_id(&rx.payload), Some(spec::MSG_LOCATION_INFORMATION));
+        let body = link::parse_msg_body(&rx.payload).unwrap();
+        assert!(body.windows(6).any(|w| w == b"$GPGGA"));
+        assert!(!body.windows(6).any(|w| w == b"$GPRMC"));
+        assert!(report.json().contains("\"requestedGga\":true"));
+        assert!(!report.json().contains("$GPGGA")); // Diagnostic report never contains location data.
+    }
+
+    #[test]
+    fn transport_failures_report_zero_or_partial_sentence_delivery() {
+        let nmea = "$GPGGA,fix*00\r\n$GPRMC,move*00\r\n";
+        let mut ready = session(State::Identified);
+        let report = forward_location(true, 3, nmea, Some(&mut ready), |_| false);
+        assert_eq!(report.reason, "transport_unavailable");
+        assert_eq!(report.sent_sentences, 0);
+        let mut writes = 0;
+        let report = forward_location(true, 3, nmea, Some(&mut ready), |_| { writes += 1; writes == 1 });
+        assert_eq!(report.reason, "partially_sent");
+        assert_eq!(report.sent_sentences, 1);
     }
 }
 
