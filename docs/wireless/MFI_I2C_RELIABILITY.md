@@ -59,7 +59,7 @@ FDK_AAC_PREFIX="$PWD/scratchpad/fdk/install" \
   cargo zigbuild --release --target armv7-unknown-linux-musleabihf \
   -p ocbmd -p btd -p iap2d -p carplayd --offline
 
-./tools/box_deploy.sh --host ccpa-ncm --return \
+./tools/box_deploy.sh --host root@192.168.50.2 --return \
   target/armv7-unknown-linux-musleabihf/release/ocbmd:/usr/sbin/ocbmd \
   target/armv7-unknown-linux-musleabihf/release/btd:/usr/sbin/btd \
   target/armv7-unknown-linux-musleabihf/release/iap2d:/usr/sbin/iap2d \
@@ -68,6 +68,9 @@ FDK_AAC_PREFIX="$PWD/scratchpad/fdk/install" \
 
 Close Mac applications using the adapter before deployment. `mfid` is a bench-only server;
 rebuild it with `-p mfid` if using that separate NCM test path. It is not required for CarPlay.
+The deploy script defaults to `root@192.168.50.2` and uses `~/.ssh/id_ccpa_ncm` when present.
+Use `--identity /path/to/key` to select a different key. With a selected key it does not fall
+back to password prompts; an encrypted key must first be loaded with `ssh-add`.
 
 ## Direct Mac test over OCBM
 

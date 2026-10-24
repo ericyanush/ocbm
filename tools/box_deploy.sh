@@ -18,10 +18,11 @@
 # through telnet/base64 or a backgrounded `nc` listener; earlier `nc` transfers truncated large files.
 #
 # USAGE
-#   tools/box_deploy.sh [--host SSH_DEST] [--return] [--dry-run] SRC:DEST[:MODE] [...]
+#   tools/box_deploy.sh [--host SSH_DEST] [--identity KEY] [--return] [--dry-run] SRC:DEST[:MODE] [...]
 #   tools/box_deploy.sh [--host SSH_DEST] --return-only # NCM back into accessory mode
 #
-#   --host        SSH destination (alias, hostname, or user@IP); default: ccpa-ncm
+#   --host        SSH destination; default: root@192.168.50.2 (bare hosts also use root)
+#   --identity    SSH private-key path; defaults to ~/.ssh/id_ccpa_ncm when present
 #   --return      after installing, clear /script/ncm_only and reboot back to OCBM, then wait for USB
 #   --dry-run     resolve mode + verify reachability + print the plan; transfer nothing
 #   MODE          octal chmod, default 755
@@ -30,25 +31,26 @@
 #   tools/box_deploy.sh --return \
 #     target/armv7-unknown-linux-musleabihf/release/carplayd:/usr/sbin/carplayd
 #
-# The default SSH destination is `ccpa-ncm` (see ~/.ssh/config). Use `--host root@192.168.50.2`
-# when the adapter's NCM address differs or the alias does not resolve. SSH password prompts are
-# supported; connection multiplexing reuses the authenticated connection for later commands/transfers.
+# No SSH alias is required. When a key is selected, authentication is non-interactive; load an
+# encrypted key into ssh-agent first. Without a selected key, SSH configuration/agent/password
+# authentication remains available. Multiplexing reuses authentication for transfers.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOST_BIN="$REPO/target/release/ocbm-host"
-BOX_SSH="ccpa-ncm"
+BOX_SSH="root@192.168.50.2"
+SSH_IDENTITY=""
 VID=1314 PID=2d00
 NCM_WAIT=90        # seconds to wait for ssh after ENTER_NCM (the reboot is normally a few seconds)
 OCBM_WAIT=120      # seconds to wait for the USB device after returning
 
 # Use a short socket path (macOS's TMPDIR can exceed the Unix-domain socket path limit). The first
-# SSH connection can authenticate interactively by key or password; later commands reuse its master.
+# SSH connection establishes a master; later commands reuse it.
 SSH_CONTROL_DIR="$(mktemp -d /tmp/ocbm-box-deploy.XXXXXX)"
 SSH_CONTROL_PATH="$SSH_CONTROL_DIR/c"
 SSH_OPTS=(-o ControlMaster=auto -o ControlPersist=300 -o "ControlPath=$SSH_CONTROL_PATH" -o ConnectTimeout=4)
 cleanup_ssh() {
-  ssh -S "$SSH_CONTROL_PATH" -O exit "$BOX_SSH" >/dev/null 2>&1 || true
+  ssh "${SSH_OPTS[@]}" -O exit "$BOX_SSH" >/dev/null 2>&1 || true
   rmdir "$SSH_CONTROL_DIR" 2>/dev/null || true
 }
 trap cleanup_ssh EXIT
@@ -60,6 +62,11 @@ while [ $# -gt 0 ]; do
     --host)
       [ $# -ge 2 ] || { echo "ERROR: --host requires an SSH destination" >&2; exit 2; }
       BOX_SSH="$2"
+      shift
+      ;;
+    --identity)
+      [ $# -ge 2 ] || { echo "ERROR: --identity requires a key path" >&2; exit 2; }
+      SSH_IDENTITY="$2"
       shift
       ;;
     --return)      RETURN=1 ;;
@@ -74,9 +81,21 @@ done
 say()  { printf '[deploy] %s\n' "$*"; }
 die()  { printf '[deploy] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Do not inherit the Mac login name when --host supplies just an IP or hostname.
+case "$BOX_SSH" in *@*) ;; *) BOX_SSH="root@$BOX_SSH" ;; esac
+if [ -z "$SSH_IDENTITY" ] && [ -f "$HOME/.ssh/id_ccpa_ncm" ]; then
+  SSH_IDENTITY="$HOME/.ssh/id_ccpa_ncm"
+fi
+if [ -n "$SSH_IDENTITY" ]; then
+  [ -f "$SSH_IDENTITY" ] || die "SSH key not found: $SSH_IDENTITY"
+  SSH_OPTS+=(-i "$SSH_IDENTITY" -o IdentitiesOnly=yes -o BatchMode=yes)
+  say "SSH destination=$BOX_SSH identity=$SSH_IDENTITY (key authentication)"
+else
+  say "SSH destination=$BOX_SSH (using SSH configuration/agent/password authentication)"
+fi
+
 ssh_box() { ssh "${SSH_OPTS[@]}" "$BOX_SSH" "$@"; }
-# Keep stderr attached: OpenSSH may render the interactive password prompt there. Suppressing it
-# makes password-only hosts look indistinguishable from an unreachable NCM address.
+# Keep stderr attached so failed key authentication or password-only prompts remain visible.
 ssh_ok()  { ssh_box true >/dev/null; }
 # ioreg, not `system_profiler SPUSBDataType` — the latter returns an empty document on this Mac, so a
 # poll built on it spins the full timeout and reports "no adapter" with one plugged in. Same reasoning

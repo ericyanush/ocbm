@@ -45,7 +45,7 @@ changes for these fixes. From the repository root:
 
 ```sh
 cargo zigbuild --release --target armv7-unknown-linux-musleabihf -p btd --offline
-./tools/box_deploy.sh --host ccpa-ncm --return \
+./tools/box_deploy.sh --host root@192.168.50.2 --return \
   target/armv7-unknown-linux-musleabihf/release/btd:/usr/sbin/btd
 ```
 
