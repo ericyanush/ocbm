@@ -181,19 +181,43 @@ fn accessory_bt_mac() -> [u8; 6] {
 /// wired driver's `write_interruptible`, generic over `Write` for the same reason (unit-testable
 /// without real hardware).
 pub(crate) fn write_interruptible<W: Write>(w: &mut W, data: &[u8], should_abort: &dyn Fn() -> bool) -> bool {
+    match write_interruptible_report(w, data, should_abort) {
+        Ok(()) => true,
+        Err(failure) => { log(&format!("RFCOMM write stopped: {failure}")); false }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WriteFailure {
+    pub written: usize,
+    /// None means the caller cancelled; Some preserves the actual socket error and errno.
+    pub error: Option<std::io::Error>,
+}
+
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.error {
+            Some(error) => write!(f, "I/O error after {} bytes: {error} (kind={:?}, errno={:?})", self.written, error.kind(), error.raw_os_error()),
+            None => write!(f, "cancelled after {} bytes", self.written),
+        }
+    }
+}
+
+pub(crate) fn write_interruptible_report<W: Write>(w: &mut W, data: &[u8], should_abort: &dyn Fn() -> bool) -> Result<(), WriteFailure> {
     let mut written = 0;
     while written < data.len() {
         if should_abort() {
-            return false;
+            return Err(WriteFailure { written, error: None });
         }
         match w.write(&data[written..]) {
-            Ok(0) => return false,
+            Ok(0) => return Err(WriteFailure { written, error: Some(std::io::Error::from(ErrorKind::WriteZero)) }),
             Ok(n) => written += n,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => sleep(Duration::from_millis(50)),
-            Err(_) => return false,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => sleep(Duration::from_millis(50)),
+            Err(error) => return Err(WriteFailure { written, error: Some(error) }),
         }
     }
-    true
+    Ok(())
 }
 
 /// Max bytes to hold while reassembling one link frame across RFCOMM reads. A legit partial tail is at

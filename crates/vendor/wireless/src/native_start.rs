@@ -177,6 +177,18 @@ pub fn incoming(id: u16, body: &[u8]) -> bool {
     })
 }
 
+/// A frame never put on the wire must not consume a link sequence number. Once any byte is
+/// written, cancellation requires a new RFCOMM connection to avoid a truncated iAP2 frame.
+fn write_start_frame<W: std::io::Write>(sock: &mut W, link: &mut Link, body: &[u8], abort: &dyn Fn() -> bool) -> Result<(), crate::bt_driver::WriteFailure> {
+    let seq = link.my_seq;
+    let bytes = link.build_msg(1, 0x4301, body);
+    let result = crate::bt_driver::write_interruptible_report(sock, &bytes, abort);
+    if matches!(&result, Err(failure) if failure.written == 0 && failure.error.is_none()) {
+        link.my_seq = seq;
+    }
+    result
+}
+
 pub fn poll(
     sock: &mut fs::File,
     link: &mut Link,
@@ -211,9 +223,16 @@ pub fn poll(
         let still_current = || fs::read_to_string("/tmp/host_present").ok().as_deref().map(str::trim) == Some("1") && fs::read(carplay_start_session::REQUEST).ok().and_then(|v| Request::parse(&v).ok())
             .is_some_and(|latest| latest.action == "start" && latest.request_id == r.request_id && latest.slot_id == r.slot_id && latest.receiver_epoch == r.receiver_epoch);
         if !still_current() { return false; }
-        let bytes = link.build_msg(1, 0x4301, &body);
-        if !crate::bt_driver::write_interruptible(sock, &bytes, &|| abort() || !still_current()) {
-            publish(b, "failed", "StartSession write failed or cancelled"); return true;
+        let write_started = Instant::now();
+        let write_expired = || write_started.elapsed() >= Duration::from_secs(5);
+        if let Err(failure) = write_start_frame(sock, link, &body, &|| abort() || !still_current() || write_expired()) {
+            let cancelled_before_write = failure.error.is_none() && failure.written == 0 && !abort() && !write_expired();
+            let reason = if write_expired() { format!("StartSession write deadline exceeded: {failure}") }
+                else { format!("StartSession write {failure}") };
+            crate::log(&format!("StartSession write stopped peer={} slot={} request={} receiver={} keep_link={cancelled_before_write}: {reason}",
+                b.event.peer_mac, b.event.slot_id, r.request_id, r.receiver_epoch));
+            publish(b, if cancelled_before_write { "cancelled" } else { "failed" }, &reason);
+            return !cancelled_before_write;
         }
         if !still_current() { publish(b, "cancelled", "host changed during write"); return false; }
         b.gate.sent_request = Some(r.request_id.clone()); b.endpoint = e.clone();
@@ -226,6 +245,57 @@ pub fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_before_any_bytes_preserves_the_link_sequence() {
+        let mut link = Link::new();
+        link.my_seq = 42;
+        let mut wire = Vec::new();
+        let failure = write_start_frame(&mut wire, &mut link, b"payload", &|| true).unwrap_err();
+        assert_eq!(failure.written, 0);
+        assert!(failure.error.is_none());
+        assert!(wire.is_empty());
+        assert_eq!(link.my_seq, 42);
+        write_start_frame(&mut wire, &mut link, b"replacement", &|| false).unwrap();
+        assert_eq!(wire[5], 42);
+        assert_eq!(link.my_seq, 43);
+    }
+
+    #[test]
+    fn cancellation_after_partial_write_requires_reconnect_and_keeps_sequence_consumed() {
+        use std::cell::Cell;
+        struct Partial<'a>(&'a Cell<bool>);
+        impl std::io::Write for Partial<'_> {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { self.0.set(true); Ok(3) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let cancelled = Cell::new(false);
+        let mut link = Link::new();
+        let failure = write_start_frame(&mut Partial(&cancelled), &mut link, b"payload", &|| cancelled.get()).unwrap_err();
+        assert_eq!(failure.written, 3);
+        assert!(failure.error.is_none());
+        assert_eq!(link.my_seq, 1);
+    }
+
+    #[test]
+    fn socket_failure_preserves_errno_and_interrupted_writes_are_retried() {
+        struct Broken(usize);
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Err(std::io::ErrorKind::Interrupted.into()),
+                    2 => Ok(2),
+                    _ => Err(std::io::Error::from_raw_os_error(libc::EPIPE)),
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let failure = write_start_frame(&mut Broken(0), &mut Link::new(), b"payload", &|| false).unwrap_err();
+        assert_eq!(failure.written, 2);
+        assert_eq!(failure.error.as_ref().unwrap().raw_os_error(), Some(libc::EPIPE));
+        assert!(failure.to_string().contains("I/O error after 2 bytes"));
+    }
 
     fn event(slot: &str, start: u64, stage: &str) -> Event {
         serde_json::from_value(serde_json::json!({
