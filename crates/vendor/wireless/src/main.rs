@@ -29,6 +29,7 @@ mod sco_audio;
 mod sdp_client;
 mod wifi_handoff;
 mod native_start;
+mod instance_lock;
 
 // The Bluetooth primitives moved to `bt-common` (2026-09-01) so wireless Android Auto can use the
 // same radio machinery instead of a second copy. Re-exported at the crate root, so every existing
@@ -705,6 +706,17 @@ fn install_panic_hook(name: &'static str) {
 
 fn main() {
     install_panic_hook("btd");
+    let _instance_lock = match instance_lock::acquire(std::path::Path::new("/tmp/ocbm_btd.lock")) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            log("another btd owns Bluetooth; duplicate launch ignored");
+            return;
+        }
+        Err(e) => {
+            log(&format!("cannot acquire Bluetooth owner lock: {e}; refusing unguarded startup"));
+            std::process::exit(1);
+        }
+    };
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone())
         .expect("register SIGTERM handler");

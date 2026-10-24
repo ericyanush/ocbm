@@ -64,6 +64,12 @@ an unsuccessful reset/teardown; it does not establish why a phone ignored 0x4301
 Rollback: disable the setting and perform a full session restart. Updated adapter
 binaries support the original startup behavior when the setting is off.
 
+## Disconnect recovery safeguards
+
+The supervisor tracks its pending detached Bluetooth launch by PID, and `btd` holds
+`/tmp/ocbm_btd.lock` for its process lifetime before initializing the controller.
+Duplicate starts exit without touching Bluetooth or publishing slot state.
+
 ## Control contract
 
 `CAP_CARPLAY_START_SESSION` is `0x80`. `CT_CARPLAY_START_SESSION` (`0x20`) carries

@@ -767,7 +767,15 @@ radio_off() { [ -f /tmp/radio_off ]; }
 # is a deliberate extension, enabled ONLY by the host YAML `hot_handover: true`. Absent/anything-else => the
 # standard "keep wireless on plug" behavior. See docs/ops/05_AUDITS.md and the transport-selection research 2026-08-01.
 hot_handover_enabled() { grep -qiE '^[[:space:]]*hot_handover:[[:space:]]*true' "$WIRELESS_CFG" 2>/dev/null; }
-wireless_running() { pgrep -f /usr/sbin/btd >/dev/null 2>&1; }
+wireless_running() {
+  # Track the detached wrapper explicitly. BusyBox process matching can miss its long argv
+  # during radio setup; a second launch must not cycle the controller underneath the first.
+  if [ -n "${wireless_launch_pid:-}" ] && kill -0 "$wireless_launch_pid" 2>/dev/null; then
+    return 0
+  fi
+  wireless_launch_pid=""
+  pgrep -f /usr/sbin/btd >/dev/null 2>&1
+}
 # Is ANY part of the wireless stack still drawing power? The advertiser can be dead while hostapd is
 # still beaconing and hci0 is still UP — which is exactly the state that made a wired session crawl
 # (owner report 2026-08-11), so all three are checked, not just the daemon.
@@ -1006,6 +1014,7 @@ wireless_up() {
     # nothing every tick.
     exec /usr/sbin/btd </dev/null >>/tmp/wl.log 2>&1
   ' </dev/null >/dev/null 2>&1 &
+  wireless_launch_pid=$!
   # The wireless Android Auto byte pump, alongside the advertiser that will bootstrap phones to it.
   # Started here rather than inside the wrapper above so its exit status and log line are visible;
   # it binds the AP address with its own retry, so racing the AP bring-up in that wrapper is fine.
@@ -1019,6 +1028,12 @@ wireless_down() {
   # BEFORE the already-fully-down early return below: that return only inspects the CarPlay-side
   # stack (advertiser, A/V children, hostapd, hci0), and the AA pump can outlive all four.
   aa_bridge_wireless_down
+  # Stop a pending wrapper as well as the exec'd daemon. Otherwise it can finish radio setup
+  # after teardown and resurrect btd with the previous host's configuration.
+  if [ -n "${wireless_launch_pid:-}" ]; then
+    kill "$wireless_launch_pid" 2>/dev/null || true
+    wireless_launch_pid=""
+  fi
   # COMPLETE wireless-stack teardown, tied to app presence: the advertiser (btd) AND its
   # setsid-detached A/V children (carplayd). pkill-ing ONLY the parent orphans the children,
   # and the next app-connect bring-up then collides with those orphans ("Address in use" on the
