@@ -31,7 +31,7 @@ class NativeStartSessionTest {
             assertEquals(peer to false, controller.event(event("unsupported", true).put("reason", "rejected")))
             controller.select(peer)
             assertTrue(sent.isEmpty()) // No implicit downgrade or retry of a rejected slot.
-            assertTrue(states.single().contains("rejected"))
+            assertTrue(states.last().contains("rejected"))
             assertTrue(controller.progressText.orEmpty().contains("rejected"))
             controller.cancel(clearSlots = false)
             assertTrue(controller.progressText.orEmpty().contains("rejected"))

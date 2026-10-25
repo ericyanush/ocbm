@@ -18,6 +18,7 @@ class NativeStartSession(
     private val hotspot: () -> VehicleHotspotCredentials?,
     private val status: (String) -> Unit,
     private val log: (String) -> Unit,
+    private val onDialBackTimeout: (peerMac: String, slotId: String) -> Unit = { _, _ -> },
 ) {
     var enabled = false
     @Volatile var progressText: String? = null
@@ -89,6 +90,7 @@ class NativeStartSession(
         val current = progressText.orEmpty()
         if (current.startsWith("StartSession failed") ||
             current.startsWith("StartSession unavailable") ||
+            current.startsWith("StartSession unsupported") ||
             current.startsWith("StartSession ended") ||
             current.startsWith("Adapter did not process")
         ) return
@@ -170,6 +172,7 @@ class NativeStartSession(
                         report("StartSession timed out — retry or disable the experiment")
                         blocked.add(current.optString("slotId"))
                         cancel(clearSlots = false)
+                        onDialBackTimeout(peer, slotId)
                     }
                 }
             } else if (stage in setOf("failed", "unsupported", "ended")) {

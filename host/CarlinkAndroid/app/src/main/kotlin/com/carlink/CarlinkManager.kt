@@ -58,6 +58,7 @@ import com.carlink.ocbm.VehicleConfigYaml
 import com.carlink.ocbm.VehicleHotspotCredentials
 import com.carlink.ocbm.VehicleHotspotStore
 import com.carlink.ocbm.awaitHotspotReady
+import com.carlink.ocbm.readyAlternateAfterDialBackTimeout
 import com.carlink.ocbm.seam.SeamPipe
 import com.carlink.ocbm.seam.SeamCrypto
 import com.carlink.ocbm.seam.VoiceTag
@@ -624,6 +625,7 @@ class CarlinkManager(
             scope, receiver = { carPlayReceiver }, send = { client?.startSessionRequest(it) == true },
             hotspot = { VehicleHotspotStore(context).credentialsForStartSession() }, status = { setStatusText(it) },
             log = { logInfo("[START_SESSION] $it", tag = Logger.Tags.PHONE) },
+            onDialBackTimeout = { peer, slotId -> onPreferredDialBackTimeout(peer, slotId) },
         )
     }
 
@@ -3248,6 +3250,29 @@ class CarlinkManager(
         client?.takeIf { it.hasMultiIap2Slots }?.let { schedulePreferredPhoneFallback(it) }
     }
 
+    private fun onPreferredDialBackTimeout(peer: String, slotId: String) {
+        val owner = client ?: return
+        if (!nativeStartForConnection || !owner.hasMultiIap2Slots) return
+        val fallback = readyAlternateAfterDialBackTimeout(
+            preferredMac = preferredBtMac,
+            timedOutMac = peer,
+            currentTargetMac = adapterActiveBtPeer,
+            slots = iap2SlotPhases,
+            sessionLive = carPlayReceiver?.sessionLive == true,
+            explicitTargetMac = temporaryPhoneTargetBtMac,
+            switchPending = pendingPhoneSwitchTargetBtMac != null,
+        ) ?: return
+        preferredFallbackJob?.cancel()
+        preferredFallbackJob = null
+        fallbackTargetBtMac = fallback
+        logInfo(
+            "[MULTI_PHONE] preferred phone $peer slot=$slotId did not dial back; temporarily selecting ready alternate $fallback",
+            tag = Logger.Tags.PHONE,
+        )
+        syncMultiPhoneReceiverTarget(owner, fallback)
+        rebuildDeviceList()
+    }
+
     private fun schedulePreferredPhoneFallback(owner: OcbmClient) {
         val preferred = preferredBtMac?.uppercase() ?: run {
             preferredFallbackJob?.cancel()
@@ -3256,14 +3281,15 @@ class CarlinkManager(
             return
         }
         val slots = iap2SlotPhases
+        // Retain an already chosen alternate through its dial-back even if the preferred
+        // Bluetooth slot stays ready (or becomes ready again). A live session is never preempted.
+        if (fallbackTargetBtMac?.let { slots[it] == Ocbm.BTP_WIFI_HANDOFF } == true) return
+        fallbackTargetBtMac = null
         if (slots[preferred] == Ocbm.BTP_WIFI_HANDOFF) {
             preferredFallbackJob?.cancel()
             preferredFallbackJob = null
-            fallbackTargetBtMac = null
             return
         }
-        if (fallbackTargetBtMac?.let { slots[it] == Ocbm.BTP_WIFI_HANDOFF } == true) return
-        fallbackTargetBtMac = null
         val alternateReady = slots.any { (mac, phase) -> mac != preferred && phase == Ocbm.BTP_WIFI_HANDOFF }
         if (!alternateReady || preferredFallbackJob?.isActive == true) return
 
@@ -3304,8 +3330,8 @@ class CarlinkManager(
         val fallback = fallbackTargetBtMac?.takeIf { slots[it] == Ocbm.BTP_WIFI_HANDOFF }
         val target = when {
             temporary != null -> temporary
-            preferred != null && slots[preferred] == Ocbm.BTP_WIFI_HANDOFF -> preferred
             preferred != null && fallback != null -> fallback
+            preferred != null && slots[preferred] == Ocbm.BTP_WIFI_HANDOFF -> preferred
             preferred != null -> preferred // wait for it unless the configured fallback timer expires
             current != null && current in ready -> current
             ready.isNotEmpty() -> ready.first()
