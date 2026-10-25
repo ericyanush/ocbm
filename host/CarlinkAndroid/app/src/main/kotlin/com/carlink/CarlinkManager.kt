@@ -1177,6 +1177,19 @@ class CarlinkManager(
         // Stable for this manager's whole life, NOT per client: a reattach after a USB blip is the same
         // host and should warm-reuse the box's live session, whereas a new process must force a re-arm.
         c.instanceNonce = instanceNonce
+        if (nativeStartForConnection) {
+            nativeStart.adapterSessionChanged()
+            if (carPlayReceiver?.sessionLive != true) {
+                // These per-peer phases belong to the old OCBM client. Retaining them can select
+                // a phone whose adapter iAP2 slot has already ended after sleep/reboot.
+                iap2SlotPhases = emptyMap()
+                adapterActiveBtPeer = null
+                adapterBtPhase = null
+                fallbackTargetBtMac = null
+                preferredFallbackJob?.cancel()
+                preferredFallbackJob = null
+            }
+        }
         client = c
         wireClientCallbacks(c, generation)
         c.start()
@@ -1252,6 +1265,10 @@ class CarlinkManager(
             setState(State.DEVICE_CONNECTED)
             setStatusText("Phone connected — restoring CarPlay...")
         } else {
+            // awaitEndpoint() may have reported that the hotspot recovered while preparing the
+            // receiver. That is only a milestone; retaining it in progressText makes the overlay
+            // look frozen here even though startup has completed and we are waiting for iAP2.
+            if (nativeStartForConnection) nativeStart.waitingForPhone()
             setStatusText(if (nativeStartForConnection) nativeStart.progressText ?: "Waiting for phone..." else "Waiting for phone...")
         }
     }

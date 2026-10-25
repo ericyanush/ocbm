@@ -80,6 +80,39 @@ class NativeStartSession(
         },
     )
 
+    /** Hotspot readiness is a preparation milestone, not the ongoing phone-wait state. */
+    fun waitingForPhone() {
+        progressText = null
+    }
+
+    private fun reportWaitingUnlessFailed() {
+        val current = progressText.orEmpty()
+        if (current.startsWith("StartSession failed") ||
+            current.startsWith("StartSession unavailable") ||
+            current.startsWith("StartSession ended") ||
+            current.startsWith("Adapter did not process")
+        ) return
+        waitingForPhone()
+        status("Waiting for phone...")
+    }
+
+    /** Slot ordering is only meaningful within one OCBM adapter session. */
+    fun adapterSessionChanged() {
+        generation.incrementAndGet()
+        timer?.cancel(); timer = null
+        pending?.cancel(); pending = null
+        networkWatch?.cancel(); networkWatch = null
+        pendingPeer = null
+        pendingSlotId = null
+        request = null
+        val oldSlotCount = slots.size
+        slots.clear()
+        blocked.clear()
+        retiredSlots.clear()
+        progressText = null
+        log("new OCBM adapter session; discarded $oldSlotCount cached iAP2 slot(s) and StartSession state")
+    }
+
     fun event(e: JSONObject): Pair<String, Boolean>? {
         if (!enabled || e.optInt("version") != 1) return null
         val peer = e.optString("peerMac").uppercase()
@@ -153,11 +186,16 @@ class NativeStartSession(
 
     fun select(peer: String?) {
         if (!enabled || receiver()?.sessionLive == true) return
-        if (peer == null) { cancel(clearSlots = false); return }
+        if (peer == null) {
+            cancel(clearSlots = false)
+            reportWaitingUnlessFailed()
+            return
+        }
         if (request?.optString("peerMac")?.equals(peer, true) == false || pendingPeer?.equals(peer, true) == false) cancel(clearSlots = false)
         val slot = slots[peer.uppercase()]
         if (slot == null || !slot.optBoolean("available") || slot.optString("slotId") in blocked) {
             cancel(clearSlots = false)
+            reportWaitingUnlessFailed()
             return
         }
         val previous = request
