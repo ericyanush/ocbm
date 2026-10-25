@@ -31,9 +31,13 @@ import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.VideoSettings
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -50,6 +54,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import com.carlink.CarlinkManager
 import com.carlink.logging.logInfo
@@ -330,7 +336,7 @@ private val RESET_CONNECTION_CONFIRM =
         confirmLabel = "Reset",
     )
 
-/** One confirmation shape for every destructive adapter action. */
+/** Wide confirmation with the same touch targets as the automotive controls. */
 @Composable
 private fun ConfirmDialog(
     spec: ConfirmSpec,
@@ -338,14 +344,41 @@ private fun ConfirmDialog(
     onDismiss: () -> Unit,
 ) {
     val colorScheme = MaterialTheme.colorScheme
-    AlertDialog(
+    Dialog(
         onDismissRequest = onDismiss,
-        icon = { Icon(imageVector = spec.icon, contentDescription = null, tint = colorScheme.tertiary) },
-        title = { Text(spec.title) },
-        text = { Text(spec.text) },
-        confirmButton = { TextButton(onClick = onConfirm) { Text(spec.confirmLabel, color = colorScheme.error) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            modifier = Modifier.widthIn(max = 760.dp).fillMaxWidth(0.92f),
+            shape = MaterialTheme.shapes.extraLarge,
+            tonalElevation = 6.dp,
+        ) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()).padding(32.dp),
+                verticalArrangement = Arrangement.spacedBy(20.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Icon(
+                        imageVector = spec.icon,
+                        contentDescription = null,
+                        tint = colorScheme.tertiary,
+                        modifier = Modifier.size(40.dp),
+                    )
+                    Text(spec.title, style = MaterialTheme.typography.headlineMedium)
+                }
+                Text(spec.text, style = MaterialTheme.typography.bodyLarge)
+                OutlinedButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = AutomotiveDimens.ButtonMinHeight),
+                ) { Text("Cancel", style = MaterialTheme.typography.titleLarge) }
+                Button(
+                    onClick = onConfirm,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = AutomotiveDimens.ButtonMinHeight),
+                    colors = ButtonDefaults.buttonColors(containerColor = colorScheme.error, contentColor = colorScheme.onError),
+                ) { Text(spec.confirmLabel, style = MaterialTheme.typography.titleLarge) }
+            }
+        }
+    }
 }
 
 /** Display mode, decoder and session resets. */
