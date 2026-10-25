@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ncm_base_install.sh — take an NCM-capable CPC200-CCPA to the owned NCM base, over the NCM link.
 #
-# STARTING POINT (required): an adapter already running the NCM .img — `/script/custom_init.sh`
-# + `/script/ncm_only`, CDC-NCM armed early in boot, root shell reachable at 192.168.50.2.
-# That image is the distributed on-ramp; this script is the CONTINUATION and assumes the link
-# exists. It does not bootstrap NCM and will refuse to run without it.
+# STARTING POINT: either an adapter already running the NCM image, or this reviewed 2026 stock
+# firmware after `ccpa_stock_usb_bootstrap.sh` provides the live NCM root shell. For the latter,
+# this script stages the owned NCM boot path, then `bootstrap_handoff` removes the profile override
+# before the cold boot. It still assumes a live link; it does not create the initial shell.
 #
 # ENDPOINT: the 2026-07-08 baseline (`ccpa/backup/base`) MINUS OCBM — Carlinkit's projection
 # stack (riddleBox: ARMadb-driver / ARMiPhoneIAP2 / AppleCarPlay / ARMAndroidAuto / ARMHiCar /
@@ -84,17 +84,17 @@
 # Preflight reports the detected variant for the log; it never gates behaviour.
 #
 # ============================== TRANSPORT ==============================================
-# Default is `busybox telnetd -l /bin/sh` on port 23 via tools/boxsh.py: no login, no
-# password, no crypto negotiation — the one channel that behaves identically on the shipped
-# .img, on a half-stripped unit, and on the finished base. The box's dropbear is old enough
-# (SHA-1 kex, ssh-rsa host key) that modern OpenSSH refuses it without a pile of overrides
-# and cannot be given a blank password without sshpass. `--via ssh` selects it anyway.
+# `--via ssh` is preferred when the adapter has Dropbear and the NCM host key is installed.
+# Stock-derived 2026 firmware can have no Dropbear executable even though rcS calls it; use
+# `--via telnet` for that initial bootstrap. Telnet on port 23 remains the rescue transport
+# because it needs no login or host-key negotiation and survives SSH changes.
 #
 # ============================== USAGE ==================================================
 #   tools/ncm_base_install.sh install             # interactive: connect, show specs, confirm
 #   tools/ncm_base_install.sh preflight
 #   tools/ncm_base_install.sh backup
 #   tools/ncm_base_install.sh earlyaccess
+#   tools/ncm_base_install.sh bootstrap_handoff  # after bootpath + ncm_only are staged
 #   tools/ncm_base_install.sh coldtest            # issues the reboot itself, then waits
 #   tools/ncm_base_install.sh strip --dry-run     # prints the kill list, deletes nothing
 #   tools/ncm_base_install.sh strip
@@ -112,7 +112,8 @@
 #                    it exists so a unit whose dropbear/authorized_keys is broken can be repaired,
 #                    and it moves files as 2 KB base64 chunks through a line-oriented shell. Do not
 #                    route a deploy through it because it happens to be the older default —
-#                    measured 2026-09-05, SFTP-mode scp does 1.8 MB over USB-NCM in ~0.6 s.
+#                    SSH file transfers use a checksum-verified `cat` byte stream; this firmware
+#                    does not include an SFTP subsystem for `scp` to use.
 #   --host-if enX    your USB-NCM interface; forced to a static 192.168.50.1 while waiting
 #                    for a cold boot, for when macOS will not re-DHCP the new interface
 #   --run-dir DIR    where backups/reports land (default scratchpad/ncmbase_<stamp>)
@@ -205,20 +206,33 @@ box_slow() { BOX_TIMEOUT=600 box "$1"; }   # 528 MHz ARM: whole-rootfs scans nee
 boxq() { box "$1" >/dev/null 2>&1; }
 push() {  # $1 local  $2 remote  [$3 mode]
   if [ "$VIA" = telnet ]; then python3 "$BOXSH" --host "$BOX" --mode "${3:-755}" put "$1" "$2" >/dev/null
-  else scp "${SSH_OPTS[@]}" "$1" "root@$BOX:$2" >/dev/null && ssh "${SSH_OPTS[@]}" "root@$BOX" "chmod ${3:-755} $2"; fi
+  else
+    local remote_tmp="$2.new" want got
+    want=$(md5 -q "$1")
+    ssh "${SSH_OPTS[@]}" "root@$BOX" "cat > '$remote_tmp'" < "$1" \
+      || die "SSH stream to $remote_tmp failed"
+    got=$(box "md5sum '$remote_tmp' 2>/dev/null | cut -d' ' -f1" | tr -d ' \r\n')
+    [ "$got" = "$want" ] || { box "rm -f '$remote_tmp'" >/dev/null 2>&1 || true; die "SSH transfer hash mismatch for $2"; }
+    box "chmod ${3:-755} '$remote_tmp' && mv '$remote_tmp' '$2' && sync" >/dev/null
+  fi
 }
 pull() {  # $1 remote  $2 local
-  # Under ssh use modern scp/SFTP. `-O` selects the legacy SCP protocol and requires a remote `scp`
-  # executable, which the adapter does not ship; the SSH-minimal image provides an SFTP server.
-  # The nc path below stays for TELNET mode only, where the alternative is 2 KB base64 chunks. Do
-  # not promote it back to the default — measured 2026-09-05 on this USB-NCM link, a single-shot
-  # `busybox nc` truncated a 1.8 MB binary at 380 KB and again at 432 KB (different points, so it
-  # is the tool and its backgrounded listener dying with the shell session, not the link).
+  # Use the SSH byte stream directly. The appliance has no SFTP subsystem; modern scp therefore
+  # fails, and legacy scp requires a remote helper that is not installed. Verify every stream by
+  # MD5, then use the telnet/base64 path only if SSH transfer fails.
   if [ "$VIA" != telnet ]; then
-    scp "${SSH_OPTS[@]}" "root@$BOX:$1" "$2" >/dev/null && [ -s "$2" ] && return 0
-    warn "SFTP pull of $1 failed; falling back to telnet/base64"
-    python3 "$BOXSH" --host "$BOX" --timeout 180 get "$1" "$2" >/dev/null
-    return
+    local want got
+    want=$(box "md5sum '$1' 2>/dev/null | cut -d' ' -f1" | tr -d ' \r\n')
+    if [ -n "$want" ] && ssh "${SSH_OPTS[@]}" "root@$BOX" "cat '$1'" > "$2" 2>/dev/null && [ -s "$2" ]; then
+      got=$(md5 -q "$2")
+      [ "$got" = "$want" ] && return 0
+      warn "SSH pull hash mismatch for $1 (host $got, adapter $want)"
+    else
+      warn "SSH stream pull of $1 failed; falling back to telnet/base64"
+    fi
+    rm -f "$2"
+    python3 "$BOXSH" --host "$BOX" --timeout 180 get "$1" "$2" >/dev/null && return 0
+    die "both SSH stream and telnet fallback failed pulling $1"
   fi
   local size; size=$(box "wc -c < $1" | tr -d ' \r\n')
   if [ "${size:-0}" -gt 262144 ] && command -v nc >/dev/null 2>&1; then
@@ -369,15 +383,16 @@ phase_specs() {
   say "=== specs ==="
   local pf="$RUN_DIR/preflight.txt"
   [ -f "$pf" ] || { phase_preflight; }
-  local sw ser var sid free used tot vb ncm ec
-  sw=$(grep -o 'sw_version : .*' "$pf" | cut -d: -f2- | tr -d ' ')
-  var=$(grep -o 'wlan_variant=.*' "$pf" | cut -d= -f2)
-  sid=$(grep -o 'sdio_card_id=.*' "$pf" | cut -d= -f2)
+  local sw ser var sid free used tot vb ncm ncm_wifi ec
+  sw=$(grep -o 'sw_version : .*' "$pf" | cut -d: -f2- | tr -d ' \r\n')
+  var=$(grep -o 'wlan_variant=.*' "$pf" | cut -d= -f2 | tr -d ' \r\n')
+  sid=$(grep -o 'sdio_card_id=.*' "$pf" | cut -d= -f2 | tr -d ' \r\n')
   ser=$(box 'cat /etc/serial_number 2>/dev/null' | tr -d ' \r\n')
   set -- $(box 'df -k / | tail -1' | tr -d '\r')
   tot=$2; used=$3; free=$4
   vb=$(grep -o 'vendor_binaries=[0-9]*' "$pf" | cut -d= -f2)
-  ncm=$(grep -o 'custom_init=[A-Za-z]*' "$pf" | cut -d= -f2)
+  ncm=$(grep -o 'ncm_only=[A-Za-z]*' "$pf" | cut -d= -f2)
+  ncm_wifi=$(grep -o 'ncm_wifi=[A-Za-z]*' "$pf" | cut -d= -f2)
   ec=$(grep -o 'early_console=[a-zA-Z]*' "$pf" | cut -d= -f2)
 
   # What the strip would reclaim, measured on THIS box rather than estimated.
@@ -399,7 +414,7 @@ echo \$t" 2>/dev/null | tr -d ' \r\n')
   │  WLAN variant   ${var:-?}   (SDIO id ${sid:-?})
   │  rootfs         ${tot}K total, ${used}K used, ${free}K free
   ├─ CURRENT STATE ──────────────────────────────────────────────────
-  │  NCM persistent ${ncm:-?}        (custom_init.sh installed)
+  │  NCM flags      ncm_only=${ncm:-?} ncm_wifi=${ncm_wifi:-?}
   │  UART console   ${ec:-?}        (early_console.sh before rcS)
   │  Carlinkit stack ${vb:-?} projection binaries still installed
   ├─ WHAT THIS WILL DO ──────────────────────────────────────────────
@@ -436,6 +451,7 @@ echo "phone_side=$([ -e /sys/class/android_usb/android0/enable ] && echo present
 busybox ifconfig ncm0 2>/dev/null | head -2
 echo "== ncm persistence =="
 echo "ncm_only=$([ -e /script/ncm_only ] && echo YES || echo no) ncm_wifi=$([ -e /script/ncm_wifi ] && echo YES || echo no)"
+echo "stock_bootstrap_hook=$([ -e /script/ocbm_stock_shell.sh ] && echo present || echo absent) profile_calls_bootstrap=$(grep -q /script/ocbm_stock_shell.sh /etc/profile 2>/dev/null && echo YES || echo no)"
 echo "custom_init=$([ -e /script/custom_init.sh ] && echo YES || echo no) early_armed=$([ -e /tmp/ncm_early_armed ] && echo YES || echo no)"
 echo "custom_init_md5=$(md5sum /script/custom_init.sh 2>/dev/null | cut -c1-32)"
 grep -c "custom_init" /script/start_main_service.sh >/dev/null 2>&1 && echo "sms_hook=YES" || echo "sms_hook=NO"
@@ -473,6 +489,12 @@ ps | grep -vE "\[.*\]" | tail -30
   grep -q "acc_sysfs=present" "$pf" || die "the host-facing accessory gadget sysfs is missing — NCM has nothing to bind to."
   grep -q "sms_hook=YES"      "$pf" || die "/script/start_main_service.sh has no custom_init hook: this is not the NCM .img boot path. Stop and check the image."
   grep -q "custom_init=YES"   "$pf" || die "/script/custom_init.sh absent — this unit is not running the NCM .img. This script continues from that image; it does not create the link."
+  if grep -q 'stock_bootstrap_hook=present' "$pf"; then
+    grep -q 'sw_version : 2026.07.31.1733' "$pf" || die "the stock USB shell is enabled on an unreviewed firmware; expected 2026.07.31.1733"
+    grep -q 'profile_calls_bootstrap=YES' "$pf" || die "bootstrap marker exists but its profile hook is not active; inspect adapter state before continuing"
+    box 'grep -q "^mtd0: 00040000 .*\"uboot\"$" /proc/mtd && grep -q "^mtd1: 00340000 .*\"kernel\"$" /proc/mtd && grep -q "^mtd2: 00c80000 .*\"rootfs\"$" /proc/mtd' \
+      || die "2026 flash partition layout differs from the reviewed 16 MB unit"
+  fi
   say "wlan variant: $(grep -o 'wlan_variant=.*' "$pf" | head -1 | cut -d= -f2) — kept intact either way (guard is by pattern, not whitelist)"
   local n; n=$(grep -o "vendor_binaries=[0-9]*" "$pf" | cut -d= -f2)
   say "vendor projection binaries still present: ${n:-?}"
@@ -489,7 +511,11 @@ rm -rf /tmp/bk; mkdir -p /tmp/bk
 for i in 0 1 2; do dd if=/dev/mtd$i of=/tmp/bk/mtd$i.bin bs=64k 2>/dev/null; done
 cd / && tar czf /tmp/bk/rootfs.tar.gz --exclude=./proc --exclude=./sys --exclude=./dev \
         --exclude=./tmp --exclude=./mnt --exclude=./media . 2>/dev/null || true
-{ echo "state=NCM-IMG (pre-strip; Carlinkit stack intact)";
+{ if [ -e /script/ocbm_stock_shell.sh ] && grep -q /script/ocbm_stock_shell.sh /etc/profile; then state=stock_usb_shell_bootstrap;
+  elif [ -e /script/ocbm_stock_shell.sh ]; then state=stock_usb_handoff_staged;
+  elif [ -e /script/ncm_only ] || [ -e /script/ncm_wifi ]; then state=ncm_base;
+  else state=stock_or_unclassified; fi
+  echo "state=$state";
   echo "sw=$(cat /etc/software_version 2>/dev/null)";
   echo "uptime=$(cut -d. -f1 /proc/uptime)s"; df -h /; echo "--- ps ---"; ps;
   echo "--- /script ---"; ls /script; echo "--- /usr/sbin ---"; ls -S /usr/sbin;
@@ -687,6 +713,9 @@ phase_strip() {
   fi
   [ -f "$RUN_DIR/backup_pre/full_nor_16MB.bin" ] || [ "$DRY" = 1 ] || [ "$ASSUME_YES" = 1 ] \
     || die "no verified backup in this run dir — run 'backup' first"
+  if [ "$DRY" != 1 ]; then
+    gate "confirm a root recovery shell was verified after cold boot (UART, or NCM telnet/SSH). This run has passing NCM telnet and SSH cold-boot checks; do not strip without at least one verified recovery path."
+  fi
 
   local payload="$RUN_DIR/strip_payload.sh"
   {
@@ -770,6 +799,7 @@ for s in $SCRIPT_A; do kill_one "/script/$s"; done
 
 echo "--- vendor config (/etc) ---"
 for e in $ETC_A; do kill_one "/etc/$e"; done
+kill_one /script/ocbm_stock_shell.sh
 if [ "$KEEP_WEB" = 1 ]; then echo "  KEEP /etc/boa + /usr/sbin/boa (--keep-web)"; else kill_one /etc/boa; fi
 if [ "$DEEP" = 1 ]; then for e in $ETC_B; do kill_one "/etc/$e"; done; kill_one /etc/RiddleBoxData; fi
 
@@ -1040,11 +1070,39 @@ busybox ifconfig ncm0 | head -2' | tee "$RUN_DIR/final_state.txt"
 phase_flag() {
   # Resting boot flag. ncm_only = baseline parity (radios off at boot, NCM the only channel).
   # ncm_wifi = same NCM timing plus the Wi-Fi AP as a second way in.
+  [ "$DRY" = 1 ] && { say "(dry-run) would set the persistent NCM boot flag"; return 0; }
   if [ "$WIFI_BACKSTOP" = 1 ]; then
     box 'touch /script/ncm_wifi; rm -f /script/ncm_only; sync; echo "flag=ncm_wifi"'
   else
     box 'touch /script/ncm_only; rm -f /script/ncm_wifi; sync; echo "flag=ncm_only"'
   fi
+}
+
+phase_bootstrap_handoff() {
+  say "=== bootstrap handoff — restore the repo profile after staging the NCM boot path ==="
+  boxq '[ -e /script/ocbm_stock_shell.sh ] && grep -q /script/ocbm_stock_shell.sh /etc/profile' \
+    || { say "no active stock USB profile hook; handoff already complete"; return 0; }
+  boxq '[ -e /script/ncm_only ] && [ -x /script/early_console.sh ] && [ -x /script/start_main_service.sh ] && [ -x /etc/init.d/rcS ]' \
+    || die "refusing profile handoff until ncm_only, the UART console, and the owned NCM boot path are staged"
+  [ "$DRY" = 1 ] && { say "(dry-run) would preserve the bootstrap files and atomically install the repo profile"; return 0; }
+
+  box '
+set -e
+[ -e /script/ocbm_stock_shell.sh ] && grep -q /script/ocbm_stock_shell.sh /etc/profile \
+  || { echo "active bootstrap profile hook not found"; exit 1; }
+[ -e /etc/profile.ocbm-stock-bootstrap.pre ] || cp -p /etc/profile /etc/profile.ocbm-stock-bootstrap.pre
+[ -e /script/ocbm_stock_shell.sh.pre ] || cp -p /script/ocbm_stock_shell.sh /script/ocbm_stock_shell.sh.pre
+echo "saved stock-shell bootstrap profile and hook"
+'
+  push "$OVERLAY/etc/profile" /etc/profile.new 644
+  local want got
+  want=$(md5 -q "$OVERLAY/etc/profile")
+  got=$(box 'md5sum /etc/profile.new | cut -c1-32' | tr -d ' \r\n')
+  [ "$got" = "$want" ] || die "canonical profile transfer failed verification (host=$want box=$got)"
+  box 'set -e; sh -n /etc/profile.new; ! grep -q /script/ocbm_stock_shell.sh /etc/profile.new; chmod 644 /etc/profile.new; mv /etc/profile.new /etc/profile; sync; echo "profile handoff complete"' \
+    | tee "$RUN_DIR/profile_handoff.txt"
+  grep -q 'profile handoff complete' "$RUN_DIR/profile_handoff.txt" || die "profile handoff did not complete"
+  say "bootstrap hook is inactive; the saved profile and hook remain on the adapter until NCM passes its cold boot"
 }
 
 run_phase() {
@@ -1055,6 +1113,7 @@ run_phase() {
     preflight)   phase_preflight ;;
     backup)      phase_backup ;;
     earlyaccess|bootpath) phase_earlyaccess ;;
+    bootstrap_handoff) phase_bootstrap_handoff ;;
     coldtest)    phase_coldtest coldtest ;;
     coldtest2)   phase_coldtest coldtest2 ;;
     strip)       phase_strip ;;
@@ -1072,6 +1131,8 @@ run_phase() {
       gate "backup pulled and verified. Next: earlyaccess — arms the UART console before rcS and pins the NCM early arm. Removes NOTHING."
       phase_earlyaccess
       phase_flag
+      gate "owned NCM boot path and ncm_only flag are staged. Next: restore the repo profile and deactivate the stock USB bootstrap hook."
+      phase_bootstrap_handoff
       gate "next is a REBOOT. If the box does not come back on NCM the run stops there, with the Carlinkit stack still fully intact."
       phase_coldtest coldtest
       gate "NCM cold boot proven. Next: strip — this DELETES the Carlinkit projection stack. Restore image: $RUN_DIR/backup_pre/full_nor_16MB.bin"

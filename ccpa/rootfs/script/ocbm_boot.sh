@@ -49,6 +49,7 @@ touch /tmp/UDiskPassThroughMode
   # usb_device_filter.xml + runtime allowlist, or Android never matches USB_DEVICE_ATTACHED and they
   # lose the implicit permission grant. See docs/carplay/00_ARCHITECTURE.md.
   echo 2d00 > "$A/idProduct"                # stable OCBM accessory PID (see comment above)
+  echo 1314 > "$A/idVendor"                 # native receiver app matches VID:PID 1314:2d00
   echo accessory > "$A/functions"; echo 1 > "$A/enable"
   i=0; while [ ! -e /dev/usb_accessory ] && [ "$i" -lt 50 ]; do i=$((i+1)); sleep 0.1; done
   /usr/sbin/ocbmd >> /tmp/box.log 2>&1 &

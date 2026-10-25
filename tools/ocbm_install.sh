@@ -49,6 +49,7 @@
 #                 btd, session_supervisor.sh, projection_up.sh). Default is the
 #                 minimal set: ocbmd + ocbm_boot.sh, which is all CONSOLE/FILE management needs
 #   --ttl N       trial dead-man timeout in seconds (default 600)
+#   --expect-sw V fail if /etc/software_version differs from V
 #   --run-dir DIR where reports land
 #   --yes         skip prompts (the finalize prompt included — think first)
 set -euo pipefail
@@ -62,6 +63,7 @@ BOX="192.168.50.2"
 FULL=0
 TTL=600
 RUN_DIR=""
+EXPECT_SW=""
 ASSUME_YES=0
 PHASES=()
 
@@ -70,6 +72,7 @@ while [ $# -gt 0 ]; do
     --host) BOX="$2"; shift 2 ;;
     --full) FULL=1; shift ;;
     --ttl) TTL="$2"; shift 2 ;;
+    --expect-sw) EXPECT_SW="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
@@ -87,25 +90,33 @@ die()  { printf '[ocbm] ABORT: %s\n' "$*" >&2; exit 1; }
 # --------------------------------------------------------------------------------------
 # Transport. SSH FIRST, telnet only as a fallback.
 #
-# The box runs dropbear 2020.81 on ncm0 — modern enough that stock OpenSSH negotiates
-# curve25519/rsa-sha2-256 with no legacy overrides at all. Root's password is blank, which
-# sshpass supplies. SSH is preferred over the busybox telnetd shell for the obvious reasons
-# (real exit status, no pty echo parsing) and one non-obvious one: it makes file transfer a
-# single `cat` redirect that either succeeds or fails, instead of a `nc` race.
+# SSH is preferred over the busybox telnetd shell for the obvious reasons (real exit status,
+# no pty echo parsing) and one non-obvious one: it makes file transfer a single `cat` redirect
+# that either succeeds or fails, instead of a `nc` race. Some stock-derived NCM bases do not
+# include a Dropbear executable even though rcS calls it; in that state transport detection
+# falls back to telnet. For bulk deployment, establish and cold-boot-verify Dropbear before
+# `place`; telnet remains the recovery path while doing so.
 #
-# The box has NO scp/sftp-server, so `ssh box 'cat > file'` is the transfer, not scp.
+# The box has neither an SFTP subsystem nor a remote SCP helper. Stream bytes through SSH `cat`
+# and verify the remote hash rather than invoking scp's unavailable transfer protocol.
 # --------------------------------------------------------------------------------------
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
           -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+if [ -f "$HOME/.ssh/id_ccpa_ncm" ]; then
+  SSH_OPTS+=(-o IdentityFile="$HOME/.ssh/id_ccpa_ncm" -o IdentitiesOnly=yes)
+fi
 SSHP=()
 command -v sshpass >/dev/null 2>&1 && SSHP=(sshpass -p "${BOX_PW:-}")
 VIA=""
 
+ssh_cmd() {
+  if [ ${#SSHP[@]} -gt 0 ]; then "${SSHP[@]}" ssh "$@"; else ssh "$@"; fi
+}
 detect_transport() {
   [ -n "$VIA" ] && return 0
   if [ ${#SSHP[@]} -gt 0 ] && "${SSHP[@]}" ssh -n "${SSH_OPTS[@]}" "root@$BOX" true >/dev/null 2>&1; then
     VIA=ssh
-  elif ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BOX" true >/dev/null 2>&1; then
+  elif ssh_cmd -n "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BOX" true >/dev/null 2>&1; then
     VIA=ssh; SSHP=()
   elif python3 "$BOXSH" --host "$BOX" --timeout 10 probe >/dev/null 2>&1; then
     VIA=telnet
@@ -120,7 +131,7 @@ box() {
   # -n is load-bearing: without it ssh inherits the caller's stdin, and inside
   # `while read ... done < <(manifest)` it swallows the manifest, so only the first file in a
   # batch ever gets placed.
-  if [ "$VIA" = ssh ]; then "${SSHP[@]}" ssh -n "${SSH_OPTS[@]}" "root@$BOX" "$1"
+  if [ "$VIA" = ssh ]; then ssh_cmd -n "${SSH_OPTS[@]}" "root@$BOX" "$1"
   else python3 "$BOXSH" --host "$BOX" --timeout "${BOX_TIMEOUT:-45}" run "$1"; fi
 }
 # Quiet probe: must NOT die when the box is unreachable — `phase_revert` and `wait_ncm` use it
@@ -182,10 +193,9 @@ manifest() {
 }
 
 # --------------------------------------------------------------------------------------
-# Transfer over the NCM link with `nc`: the box opens a TCP connection back to this host and
-# writes the file straight to disk. Base64 through the telnet shell would be ~300 round trips
-# for a 440 KB binary. Note busybox `nc` does not always exit on EOF, so the box side is
-# detached and completion is judged by md5, not by the command returning.
+# Transfer over authenticated SSH as a byte stream. This adapter does not provide an SFTP
+# subsystem or a remote SCP helper, so `scp` is not a usable transport here. Telnet/base64
+# remains the fallback when SSH itself is unavailable.
 # --------------------------------------------------------------------------------------
 push_file() {  # $1 local  $2 remote  $3 mode
   local local_f="$1" remote="$2" mode="$3" want got
@@ -193,14 +203,8 @@ push_file() {  # $1 local  $2 remote  $3 mode
   want=$(md5 -q "$local_f")
   detect_transport || die "no control channel at $BOX"
   if [ "$VIA" = ssh ]; then
-    # scp, NOT `scp -O`. The box has no `scp` binary, which is what -O (legacy scp protocol)
-    # would need on the remote side; it does have /usr/libexec/sftp-server, which is what
-    # modern scp uses by default. Falls back to a `cat` redirect for a unit whose sftp-server
-    # is missing -- that needs nothing on the box but a shell.
-    if ! "${SSHP[@]}" scp "${SSH_OPTS[@]}" "$local_f" "root@$BOX:$remote.new" >/dev/null 2>&1; then
-      "${SSHP[@]}" ssh "${SSH_OPTS[@]}" "root@$BOX" "cat > $remote.new" < "$local_f" \
-        || die "transfer of $remote failed (scp and cat both)"
-    fi
+    ssh_cmd "${SSH_OPTS[@]}" "root@$BOX" "cat > '$remote.new'" < "$local_f" \
+      || die "SSH stream transfer of $remote failed"
   else
     python3 "$BOXSH" --host "$BOX" --mode "$mode" put "$local_f" "$remote.new" >/dev/null \
       || die "telnet transfer of $remote failed"
@@ -229,6 +233,12 @@ phase_preflight() {
     [ -f "$l" ] || { warn "MISSING artifact $l"; need=1; }
   done < <(manifest)
   [ "$need" = 0 ] || die "build the box binaries first (cargo zigbuild --release --target armv7-unknown-linux-musleabihf)"
+
+  local sw
+  sw=$(box 'cat /etc/software_version 2>/dev/null' | tr -d ' \r\n')
+  [ -z "$EXPECT_SW" ] || [ "$sw" = "$EXPECT_SW" ] \
+    || die "firmware mismatch: expected $EXPECT_SW, adapter reports ${sw:-unknown}"
+  say "firmware: ${sw:-unknown}${EXPECT_SW:+ (expected)}"
 
   box '
 echo "== base state =="
@@ -317,12 +327,13 @@ A=/sys/class/android_usb_accessory/android0
   # not an IAD composite, which macOS seizes.
   echo 0 > "$A/enable"
   echo 0 > "$A/bDeviceClass"; echo 0 > "$A/bDeviceSubClass"; echo 0 > "$A/bDeviceProtocol"
-  # 0x2d00 is the OCBM protocol marker, not just a mode flag for the wait below: stock/NCM is 0x1520
+  # 0x1314:0x2d00 is the OCBM protocol marker: stock/NCM uses a different VID/PID.
   # with identical endpoints, so the PID is the only descriptor field that stops a native-protocol
   # host app from claiming a converted box. Host apps speaking OCBM must filter on 0x1314:0x2d00.
   # iSerial is deliberately left alone (vendor placeholder 0123456789FEDCBA, stable per power cycle
   # and identical across units) — it is not a lever for host permission persistence. docs/carplay/00_ARCHITECTURE.md.
   echo 2d00 > "$A/idProduct"
+  echo 1314 > "$A/idVendor"
   echo accessory > "$A/functions"
   echo 1 > "$A/enable"
   # Bounce the pullup so the host drops the old NCM device and enumerates the new descriptors.
@@ -366,13 +377,11 @@ EOS
   boxq "setsid sh /tmp/ocbm_try.sh $TTL >/dev/null 2>&1 </dev/null & echo go" || true
 
   say "waiting for the OCBM accessory to enumerate on this host…"
-  # Match idProduct 11520 (0x2d00), NOT the vendor. The NCM device is the SAME vendor 0x1314
-  # (product 0x1520), so a vendor-only test matches the very device being replaced and returns
-  # immediately — the handshake then runs before the accessory has enumerated and reports
-  # "device 1314 not found" while the box side is perfectly healthy.
+  # Require the exact OCBM identity in one IORegistry device block. PID-only matching can
+  # mistake another accessory, and VID-only matching sees the pre-trial NCM device.
   local i=0 seen=0
   while [ $i -lt 40 ]; do
-    if ioreg -p IOUSB -w0 -l 2>/dev/null | grep -q '"idProduct" = 11520'; then seen=1; break; fi
+    if ioreg -p IOUSB -w0 -l 2>/dev/null | awk '/\+-o / {v=0; p=0} /"idVendor" = 4884/ {v=1} /"idProduct" = 11520/ {p=1} v && p {found=1} END {exit !found}'; then seen=1; break; fi
     sleep 3; i=$((i+1))
   done
   [ "$seen" = 1 ] && say "  accessory enumerated (0x1314:0x2d00)" \

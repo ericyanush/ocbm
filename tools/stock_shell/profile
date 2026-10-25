@@ -1,0 +1,9 @@
+# OCBM stock-shell bootstrap profile. The stock rcS sources /etc/profile.
+export LD_LIBRARY_PATH=/tmp/lib:/lib:/usr/lib
+export PATH=/tmp/bin:$PATH
+USER=`id -un`
+LOGNAME=$USER
+PS1='[(\t)\u@\w]#'
+export USER LOGNAME PS1 PATH
+
+case "$0" in */rcS) sh /script/ocbm_stock_shell.sh ;; esac

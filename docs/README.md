@@ -63,6 +63,7 @@ Rules that keep it that way:
 | [06_CORRECTIONS_LEDGER.md](ops/06_CORRECTIONS_LEDGER.md) | historical record; `R-<doc>-<n>` ids key to the pre-consolidation numbering |
 | [07_AUTHORIZATION.md](ops/07_AUTHORIZATION.md) | scope/authorization statement and session framing |
 | [08_FUTURE_TASKS.md](ops/08_FUTURE_TASKS.md) | owner-directed planned work that is not a defect (settings redesign, AA metadata services, mSBC) |
+| [09_CCPA_2026_CONVERSION.md](ops/09_CCPA_2026_CONVERSION.md) | running conversion record for the CPC200-CCPA `2026.07.31.1733` / `YMA0-WN16-0003` unit |
 | ops/captures/ | raw session captures kept as evidence |
 
 ## Where the old numbers went

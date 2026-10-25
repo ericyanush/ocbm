@@ -8,6 +8,10 @@ description = "Host-side OCBM client (libusb/rusb): handshake, ECHO benchmark, M
 name = "ocbm-host"
 path = "src/main.rs"
 
+[[bin]]
+name = "ocbm-stock-shell"
+path = "src/stock_shell.rs"
+
 [dependencies]
 ocbm-proto = { path = "../../crates/ocbm-proto" }
 rusb = "0.9"
