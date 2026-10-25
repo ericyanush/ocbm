@@ -8,6 +8,7 @@ use carplay_start_session::{Endpoint, Event, Gate, Request};
 use std::{
     cell::RefCell,
     fs,
+    fmt::Write as _,
     time::{Duration, Instant},
 };
 
@@ -140,7 +141,7 @@ pub fn finish() {
     });
 }
 
-pub fn incoming(id: u16, body: &[u8]) -> bool {
+pub fn incoming(id: u16, body: &[u8], link_seq: u8, session: u8, frame_bytes: usize, message_bytes: usize) -> bool {
     CURRENT.with(|c| {
         let mut current = c.borrow_mut(); let Some(b) = current.as_mut() else { return false; };
         if id == 0x4300 {
@@ -148,14 +149,21 @@ pub fn incoming(id: u16, body: &[u8]) -> bool {
                 Ok(a) => {
                     b.gate.available = a.wireless.as_ref().and_then(|w| w.available) == Some(true);
                     b.saw_available |= b.gate.available;
-                    crate::log(&format!("RX 0x4300 peer={} wireless={:?} transport={:?}", b.event.peer_mac,
+                    crate::log(&format!("RX 0x4300 peer={} slot={} link_seq={} session={} frame_bytes={} message_bytes={} body_bytes={} wireless={:?} transport={:?}",
+                        b.event.peer_mac, b.event.slot_id, link_seq, session, frame_bytes, message_bytes, body.len(),
                         a.wireless.as_ref().and_then(|w| w.available), a.wireless.as_ref().and_then(|w| w.transport_identifier.as_ref())));
                     publish(b, if b.gate.available { "available" } else { "unavailable" }, "");
                 }
                 Err(error) => {
-                    // Availability contains bearer state/identifiers, never Wi-Fi credentials.
-                    crate::log(&format!("RX 0x4300 parse failed peer={} error={error:?} body_bytes={} body_prefix={:02x?}",
-                        b.event.peer_mac, body.len(), &body[..body.len().min(128)]));
+                    // Keep one bounded log line while retaining the complete body for typical
+                    // messages; this body contains bearer metadata, not Wi-Fi credentials.
+                    const MAX_BODY_DIAGNOSTIC_BYTES: usize = 320;
+                    let captured = &body[..body.len().min(MAX_BODY_DIAGNOSTIC_BYTES)];
+                    let mut body_hex = String::with_capacity(captured.len() * 2);
+                    for byte in captured { let _ = write!(body_hex, "{byte:02x}"); }
+                    crate::log(&format!("RX 0x4300 parse failed peer={} slot={} link_seq={} session={} frame_bytes={} message_bytes={} body_bytes={} body_hex={} body_hex_truncated={} error={error:?}",
+                        b.event.peer_mac, b.event.slot_id, link_seq, session, frame_bytes, message_bytes,
+                        body.len(), body_hex, captured.len() != body.len()));
                     b.gate.available = false;
                     publish(b, "failed", &format!("malformed CarPlayAvailability ({error:?})"));
                     b.terminal = true;

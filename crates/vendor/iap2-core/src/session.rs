@@ -379,32 +379,37 @@ pub struct CarPlayAvailability {
 /// Failure reason for `parse_carplay_availability`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
-    /// A TLV group's declared length is < 4 or overruns the buffer at the given offset.
-    Truncated(usize),
-    InvalidAvailability,
+    /// A TLV's declared length is < 4 or overruns the buffer.
+    Truncated { offset: usize, declared_len: Option<usize>, remaining: usize },
+    /// An availability boolean was not exactly one canonical 0/1 byte.
+    InvalidBoolean { offset: usize, parameter: u16, value_len: usize },
+    /// A known parameter was repeated where the message allows one occurrence.
+    Duplicate { offset: usize, parameter: u16 },
+    /// A bearer group did not contain its required Available parameter.
+    Missing { offset: usize, parameter: u16 },
 }
 
 /// Walk a flat TLV buffer (`[group_len BE16][pid BE16][value(group_len-4)]`…) yielding
-/// `(param_id, value)` pairs. Returns `Err` on a malformed length.
-fn walk_tlvs(buf: &[u8]) -> Result<Vec<(u16, &[u8])>, ParseError> {
+/// `(param_id, value, absolute_offset)` tuples. Returns `Err` on a malformed length.
+fn walk_tlvs(buf: &[u8], base_offset: usize) -> Result<Vec<(u16, &[u8], usize)>, ParseError> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 4 <= buf.len() {
         let glen = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
         let pid = u16::from_be_bytes([buf[i + 2], buf[i + 3]]);
         if glen < 4 || i + glen > buf.len() {
-            return Err(ParseError::Truncated(i));
+            return Err(ParseError::Truncated { offset: base_offset + i, declared_len: Some(glen), remaining: buf.len() - i });
         }
-        out.push((pid, &buf[i + 4..i + glen]));
+        out.push((pid, &buf[i + 4..i + glen], base_offset + i));
         i += glen;
     }
-    if i != buf.len() { return Err(ParseError::Truncated(i)); }
+    if i != buf.len() { return Err(ParseError::Truncated { offset: base_offset + i, declared_len: None, remaining: buf.len() - i }); }
     Ok(out)
 }
 
 /// A present availability flag must contain exactly one canonical Boolean byte.
-fn decode_bool(v: &[u8]) -> Result<bool, ParseError> {
-    match v { [0] => Ok(false), [1] => Ok(true), _ => Err(ParseError::InvalidAvailability) }
+fn decode_bool(v: &[u8], offset: usize, parameter: u16) -> Result<bool, ParseError> {
+    match v { [0] => Ok(false), [1] => Ok(true), _ => Err(ParseError::InvalidBoolean { offset, parameter, value_len: v.len() }) }
 }
 
 /// Decode an iAP2 NUL-terminated `utf8` value into an owned `String` (lossy on invalid UTF-8),
@@ -418,15 +423,16 @@ fn decode_str(v: &[u8]) -> String {
 /// ignored (forward-compatible); a malformed TLV length is a hard error.
 pub fn parse_carplay_availability(body: &[u8]) -> Result<CarPlayAvailability, ParseError> {
     let mut out = CarPlayAvailability::default();
-    for (pid, value) in walk_tlvs(body)? {
+    for (pid, value, offset) in walk_tlvs(body, 0)? {
         match pid {
             availability::WIRED_ATTRIBUTES => {
-                if out.wired.is_some() { return Err(ParseError::InvalidAvailability); }
+                if out.wired.is_some() { return Err(ParseError::Duplicate { offset, parameter: pid }); }
                 let mut b = BearerAvailability::default();
-                for (sub, sv) in walk_tlvs(value)? {
+                for (sub, sv, sub_offset) in walk_tlvs(value, offset + 4)? {
                     match sub {
                         availability::wired::AVAILABLE => {
-                            if b.available.replace(decode_bool(sv)?).is_some() { return Err(ParseError::InvalidAvailability); }
+                            let decoded = decode_bool(sv, sub_offset, sub)?;
+                            if b.available.replace(decoded).is_some() { return Err(ParseError::Duplicate { offset: sub_offset, parameter: sub }); }
                         }
                         availability::wired::USB_TRANSPORT_IDENTIFIER => {
                             b.transport_identifier = Some(decode_str(sv))
@@ -434,16 +440,17 @@ pub fn parse_carplay_availability(body: &[u8]) -> Result<CarPlayAvailability, Pa
                         _ => {}
                     }
                 }
-                if b.available.is_none() { return Err(ParseError::InvalidAvailability); }
+                if b.available.is_none() { return Err(ParseError::Missing { offset, parameter: availability::wired::AVAILABLE }); }
                 out.wired = Some(b);
             }
             availability::WIRELESS_ATTRIBUTES => {
-                if out.wireless.is_some() { return Err(ParseError::InvalidAvailability); }
+                if out.wireless.is_some() { return Err(ParseError::Duplicate { offset, parameter: pid }); }
                 let mut b = BearerAvailability::default();
-                for (sub, sv) in walk_tlvs(value)? {
+                for (sub, sv, sub_offset) in walk_tlvs(value, offset + 4)? {
                     match sub {
                         availability::wireless::AVAILABLE => {
-                            if b.available.replace(decode_bool(sv)?).is_some() { return Err(ParseError::InvalidAvailability); }
+                            let decoded = decode_bool(sv, sub_offset, sub)?;
+                            if b.available.replace(decoded).is_some() { return Err(ParseError::Duplicate { offset: sub_offset, parameter: sub }); }
                         }
                         availability::wireless::BLUETOOTH_TRANSPORT_IDENTIFIER => {
                             b.transport_identifier = Some(decode_str(sv))
@@ -451,18 +458,19 @@ pub fn parse_carplay_availability(body: &[u8]) -> Result<CarPlayAvailability, Pa
                         _ => {}
                     }
                 }
-                if b.available.is_none() { return Err(ParseError::InvalidAvailability); }
+                if b.available.is_none() { return Err(ParseError::Missing { offset, parameter: availability::wireless::AVAILABLE }); }
                 out.wireless = Some(b);
             }
             availability::THEME_ASSETS_ATTRIBUTES => {
-                if out.theme_assets.is_some() { return Err(ParseError::InvalidAvailability); }
+                if out.theme_assets.is_some() { return Err(ParseError::Duplicate { offset, parameter: pid }); }
                 let mut b = BearerAvailability::default();
-                for (sub, sv) in walk_tlvs(value)? {
+                for (sub, sv, sub_offset) in walk_tlvs(value, offset + 4)? {
                     if sub == availability::theme_assets::AVAILABLE {
-                        if b.available.replace(decode_bool(sv)?).is_some() { return Err(ParseError::InvalidAvailability); }
+                        let decoded = decode_bool(sv, sub_offset, sub)?;
+                        if b.available.replace(decoded).is_some() { return Err(ParseError::Duplicate { offset: sub_offset, parameter: sub }); }
                     }
                 }
-                if b.available.is_none() { return Err(ParseError::InvalidAvailability); }
+                if b.available.is_none() { return Err(ParseError::Missing { offset, parameter: availability::theme_assets::AVAILABLE }); }
                 out.theme_assets = Some(b);
             }
             _ => {}
@@ -740,7 +748,7 @@ mod tests {
         let bad = [0x00, 0x20, 0x00, 0x00, 0x01];
         assert!(matches!(
             parse_carplay_availability(&bad),
-            Err(ParseError::Truncated(0))
+            Err(ParseError::Truncated { offset: 0, declared_len: Some(32), remaining: 5 })
         ));
     }
 

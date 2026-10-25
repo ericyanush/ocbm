@@ -526,10 +526,14 @@ fn process_one(
     if crate::native_start::enabled() && matches!(msg_id, 0x4300 | 0x1D03) {
         // Rx.payload includes the already-verified link checksum. It is NOT a TLV byte.
         let Some(body) = link::parse_msg_body(&rx.payload) else {
-            log(&format!("RX 0x{msg_id:04X} invalid control-message length ({} B)", rx.payload.len()));
+            let declared = rx.payload.get(2..4).map(|v| u16::from_be_bytes([v[0], v[1]]) as usize);
+            log(&format!("RX 0x{msg_id:04X} invalid control-message envelope peer={} link_seq={} session={} frame_bytes={} payload_bytes={} declared_message_bytes={declared:?} payload_prefix={:02x?}",
+                crate::control::fmt_addr(peer), rx.seq, rx.sess, data.len(), rx.payload.len(),
+                &rx.payload[..rx.payload.len().min(64)]));
             return true;
         };
-        if crate::native_start::incoming(msg_id, body) { return true; }
+        let message_bytes = rx.payload.get(2..4).map(|v| u16::from_be_bytes([v[0], v[1]]) as usize).unwrap_or(0);
+        if crate::native_start::incoming(msg_id, body, rx.seq, rx.sess, data.len(), message_bytes) { return true; }
     }
 
     // Phase A3 — WiFi credential handoff (device→accessory path). The iPhone asks the accessory to
