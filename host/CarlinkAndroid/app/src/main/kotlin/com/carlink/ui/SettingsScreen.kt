@@ -1,6 +1,8 @@
 package com.carlink.ui
 
 import android.app.Activity
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.view.HapticFeedbackConstants
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -32,6 +35,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -133,7 +137,7 @@ fun SettingsScreen(
                         LogsPane(diagnostics, exporting, logRevision, onExport = {
                             exporting = true
                             exportLauncher.launch("carlink-diagnostics-${System.currentTimeMillis()}.zip")
-                        }, onPurge = { showPurgeConfirmation = true })
+                        }, onOpenFiles = { openFilesApp(context) }, onPurge = { showPurgeConfirmation = true })
                 }
             }
         }
@@ -165,6 +169,7 @@ private fun LogsPane(
     exporting: Boolean,
     revision: Int,
     onExport: () -> Unit,
+    onOpenFiles: () -> Unit,
     onPurge: () -> Unit,
 ) {
     val files = remember(diagnostics, revision) { diagnostics?.files().orEmpty() }
@@ -185,6 +190,10 @@ private fun LogsPane(
         androidx.compose.material3.Button(onClick = onExport, enabled = diagnostics != null && !exporting) {
             Text(if (exporting) "Preparing export…" else "Export logs to USB / storage")
         }
+        OutlinedButton(
+            onClick = onOpenFiles,
+            modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight),
+        ) { Text("Open Files app") }
         TextButton(onClick = onPurge, enabled = diagnostics != null) { Text("Purge all app logs") }
         files.forEach { file ->
             Text("${file.name} · ${file.length()} bytes", style = MaterialTheme.typography.bodySmall)
@@ -193,6 +202,26 @@ private fun LogsPane(
             Text("Logging has not initialized yet.", color = MaterialTheme.colorScheme.error)
         }
     }
+}
+
+/** Open the AAOS file browser directly, using the working components from FilesLauncher. */
+private fun openFilesApp(context: Context) {
+    val targets = listOf(
+        "com.android.documentsui" to "com.android.documentsui.files.FilesActivity",
+        "com.android.documentsui" to "com.android.documentsui.LauncherActivity",
+        "com.google.android.documentsui" to "com.android.documentsui.LauncherActivity",
+    )
+    for ((packageName, activityName) in targets) {
+        val intent = Intent().setClassName(packageName, activityName).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            context.startActivity(intent)
+            logInfo("[UI_ACTION] Open Files app: $packageName/$activityName", tag = "UI")
+            return
+        } catch (error: RuntimeException) {
+            logWarn("[UI_ACTION] Files target unavailable: $packageName/$activityName (${error.javaClass.simpleName})", tag = "UI")
+        }
+    }
+    Toast.makeText(context, "Files app is unavailable on this head unit", Toast.LENGTH_LONG).show()
 }
 
 /** The known-device grid, centred in the pane and scrolling when the pane is shorter than it. */
