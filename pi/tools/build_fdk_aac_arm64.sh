@@ -32,7 +32,7 @@ FDK_DIR="$here/scratchpad/fdk"
 SRC_TARBALL="$FDK_DIR/fdk-aac-$VERSION.tar.gz"
 PREFIX="$FDK_DIR/install-android-arm64"
 STUB="$FDK_DIR/stub"
-API=34
+API="${ANDROID_API:-34}"
 
 # Build OUT of ~/Documents. That tree is covered by iCloud "Desktop & Documents" sync, which
 # resolves its own races by writing conflict copies next to the original — the vendored source
@@ -142,10 +142,12 @@ make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" > build.log 2>&1 || { tail -2
 say "install -> $PREFIX"
 make install > install.log 2>&1 || { tail -20 install.log; exit 1; }
 
-# Guard against the classic cross-build failure: a host-arch archive that links on the dev machine
-# and is rejected on the device.
-if ! "$PREBUILT/bin/llvm-nm" --archive-headers "$PREFIX/lib/libfdk-aac.a" >/dev/null 2>&1; then
-    echo "built archive is not readable by the NDK toolchain — wrong arch?" >&2
+# Guard against a host-arch archive. The NDK's llvm-nm does not support --archive-headers;
+# inspect an actual object from the archive instead.
+first_member=$("$PREBUILT/bin/llvm-ar" t "$PREFIX/lib/libfdk-aac.a" | head -1)
+"$PREBUILT/bin/llvm-ar" p "$PREFIX/lib/libfdk-aac.a" "$first_member" > "$BUILD_ROOT/archive_member.o"
+if ! "$PREBUILT/bin/llvm-readelf" -h "$BUILD_ROOT/archive_member.o" | grep -q 'Machine:.*AArch64'; then
+    echo "built archive is not AArch64 ELF" >&2
     exit 1
 fi
 

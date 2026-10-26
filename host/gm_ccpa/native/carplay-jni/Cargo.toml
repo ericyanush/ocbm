@@ -40,16 +40,11 @@ receiver = { path = "../../../../crates/vendor/receiver", default-features = fal
 pairing  = { path = "../../../../crates/vendor/pairing" }
 mfi      = { path = "../../../../crates/vendor/mfi" }
 
-# `mic-uplink-eld` statically links a cross-built libfdk-aac, so it needs FDK_AAC_PREFIX pointing at
-# a prefix built for the SAME ABI. Only `install-android-x86_64` exists today, which is why the
-# aarch64 (Raspberry Pi) build cannot enable it yet.
-#
-# It is DEFAULT-ON so the x86_64 truck build is byte-for-byte unaffected — `tools/build_apk.sh`
-# needs no change and keeps producing the same artifact. The Pi build opts out with
-# `--no-default-features`, which costs only the Siri mic uplink — already a known gap
-# (README "Remaining known gaps"), not a blocker for a video/audio/touch session.
-# To restore it on arm64: build libfdk-aac 2.0.3 for aarch64 per docs/13_AUDIO_ROUTING.md
-# §229-250 and drop `--no-default-features`.
+# `mic-uplink-eld` statically links libfdk-aac. FDK_AAC_PREFIX must point to an archive built for
+# the SAME ABI. The CarlinkAndroid build uses install-android-x86_64 and install-android-arm64,
+# building the arm64 archive with pi/tools/build_fdk_aac_arm64.sh when needed. The feature stays
+# default-on for both Android JNI variants. Other callers that opt out with
+# `--no-default-features` do not include the Siri mic uplink.
 [features]
 default = ["mic-uplink-eld"]
 mic-uplink-eld = ["receiver/mic-uplink-eld"]

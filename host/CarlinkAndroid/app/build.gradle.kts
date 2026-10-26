@@ -26,33 +26,42 @@ val gmRepoRoot = rootProject.projectDir.parentFile.parentFile
 val carPlayJniDir = gmCcpaRoot.resolve("native/carplay-jni")
 val cargoTargetDir =
     file("${System.getProperty("user.home")}/.cache/cargo-targets/carlink-android-carplay-jni")
-val cargoJniOutput =
-    layout.buildDirectory.file("generated/carplayJni/jniLibs/x86_64/libcarplayjni.so")
+val cargoJniOutputDir = layout.buildDirectory.dir("generated/carplayJni/jniLibs")
+val cargoJniOutputs = listOf("x86_64", "arm64-v8a").map { abi ->
+    cargoJniOutputDir.map { it.file("$abi/libcarplayjni.so") }
+}
 val ndkBin =
     file(
         "${System.getProperty("user.home")}/Library/Android/sdk/ndk/30.0.15729638/toolchains/llvm/prebuilt/darwin-x86_64/bin",
     )
 val cargoExecutable = file("${System.getProperty("user.home")}/.cargo/bin/cargo")
 val fdkAacPrefix = gmRepoRoot.resolve("scratchpad/fdk/install-android-x86_64")
+val fdkAacArm64Prefix = gmRepoRoot.resolve("scratchpad/fdk/install-android-arm64")
 
 val buildCarPlayJni =
     tasks.register<Exec>("buildCarPlayJni") {
         group = "build"
-        description = "Builds gm_ccpa's x86_64 Android CarPlay receiver JNI library."
+        description = "Builds gm_ccpa's x86_64 and arm64-v8a Android CarPlay receiver JNI libraries."
         executable = "bash"
         args(
             rootProject.projectDir.resolve("tools/build_carplay_jni.sh").absolutePath,
             cargoTargetDir.absolutePath,
-            cargoJniOutput.get().asFile.absolutePath,
+            cargoJniOutputDir.get().asFile.absolutePath,
             ndkBin.absolutePath,
             cargoExecutable.absolutePath,
             fdkAacPrefix.absolutePath,
+            fdkAacArm64Prefix.absolutePath,
         )
         inputs.files(fileTree(carPlayJniDir) { include("**/*.rs", "**/*.toml", "Cargo.lock") })
         inputs.files(fileTree(gmRepoRoot.resolve("crates")) { include("**/*.rs", "**/*.toml") })
+        inputs.file(rootProject.projectDir.resolve("tools/build_carplay_jni.sh"))
+        inputs.file(gmRepoRoot.resolve("pi/tools/build_fdk_aac_arm64.sh"))
         inputs.file(fdkAacPrefix.resolve("lib/libfdk-aac.a"))
+        // The JNI build bootstraps this archive on a fresh checkout; fileTree allows it to be absent initially.
+        inputs.files(fileTree(fdkAacArm64Prefix) { include("lib/libfdk-aac.a") })
         inputs.file(ndkBin.resolve("x86_64-linux-android32-clang"))
-        outputs.file(cargoJniOutput)
+        inputs.file(ndkBin.resolve("aarch64-linux-android32-clang"))
+        outputs.files(cargoJniOutputs)
     }
 
 android {

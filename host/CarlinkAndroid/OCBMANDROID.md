@@ -16,7 +16,7 @@ control/MFi traffic. The legacy OCBM A/V path remains available when the native 
 > audio 9002, voice 9003, metadata 9004), and runs the receiver mic gate/uplink on 9112. Touch,
 > keyframe requests, media buttons, night mode, and limited-UI commands are routed to the native
 > receiver while it is active. Receiver Kotlin logs are forwarded into Carlink's rolling diagnostics.
-> The x86_64 Android JNI library is built from `host/gm_ccpa/native/carplay-jni` by
+> The x86_64 and arm64-v8a Android JNI libraries are built from `host/gm_ccpa/native/carplay-jni` by
 > `tools/build_carplay_jni.sh`; the GM `info.bplist` asset is bundled from gm_ccpa. Debug unit tests,
 > sideload APK assembly, Play-release Kotlin compilation, and R8 minification passed. The path has
 > **not** yet been exercised on the truck; verify phone discovery, pairing/MFi, first video/audio,
