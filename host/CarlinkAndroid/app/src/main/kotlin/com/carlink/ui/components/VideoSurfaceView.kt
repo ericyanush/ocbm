@@ -78,6 +78,8 @@ class VideoSurfaceView
         private var viewAreaIndex = 0
         private var panelWidth = 2400
         private var panelHeight = 960
+        /** A Compose update can arrive before Android has created the SurfaceControl. */
+        private var geometryPending = false
 
         /** Crop/position the HWC layer in the panel's coordinates, without scaling the video. */
         fun setCarPlayViewArea(index: Int, panelWidth: Int, panelHeight: Int) {
@@ -107,12 +109,14 @@ class VideoSurfaceView
                     "view=${width}x$height holderFrame=${holder.surfaceFrame}",
                 tag = "UI",
             )
+            geometryPending = true
             applyViewAreaGeometry()
         }
 
         private fun applyViewAreaGeometry() {
             if (Build.VERSION.SDK_INT < 31) return
-            val control = surfaceControl
+            geometryPending = true
+            val control = surfaceControl ?: return
             if (!control.isValid) return
             val area = viewArea(viewAreaIndex)
             runCatching {
@@ -120,8 +124,12 @@ class VideoSurfaceView
                     transaction.setGeometry(control, area, area, Surface.ROTATION_0)
                     transaction.apply()
                 }
+                geometryPending = false
                 logInfo("[VIDEO_SURFACE_VIEW] SurfaceControl geometry applied: source=$area destination=$area", tag = "UI")
-            }.onFailure { logWarn("[VIDEO_SURFACE_VIEW] view-area geometry failed: ${it.message}", tag = "UI") }
+            }.onFailure {
+                geometryPending = true
+                logWarn("[VIDEO_SURFACE_VIEW] view-area geometry failed: ${it.message}", tag = "UI")
+            }
         }
 
         private fun viewArea(index: Int): Rect =
@@ -175,6 +183,7 @@ class VideoSurfaceView
         override fun surfaceCreated(holder: SurfaceHolder) {
             isSurfaceCreated = true
             logInfo("[VIDEO_SURFACE_VIEW] Surface created", tag = "UI")
+            if (geometryPending) post { applyViewAreaGeometry() }
         }
 
         /**
@@ -196,7 +205,7 @@ class VideoSurfaceView
             // Known log-spam hazard: fires on every rotation/resize/HDR/format change.
             // Acceptable at INFO for debugging surface sizing; switch to logDebugOnly if noisy.
             logInfo("[VIDEO_SURFACE_VIEW] Surface: ${width}x$height", tag = "UI")
-            if (viewAreaIndex != 0) applyViewAreaGeometry()
+            if (geometryPending || viewAreaIndex != 0) applyViewAreaGeometry()
 
             if (isSurfaceCreated) {
                 isSurfaceCreated = false
@@ -215,6 +224,7 @@ class VideoSurfaceView
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             logWarn("[VIDEO_SURFACE_VIEW] Surface destroyed", tag = "UI")
             isSurfaceCreated = false
+            if (viewAreaIndex != 0) geometryPending = true
             callback?.onSurfaceDestroyed()
         }
     }
