@@ -187,7 +187,12 @@ class NativeStartSession(
         return peer to (e.optBoolean("available") && stage !in setOf("failed", "unsupported", "ended", "unavailable"))
     }
 
-    fun select(peer: String?) {
+    /**
+     * Select the iAP2 slot to start. An explicit user phone switch may retry a slot that was
+     * blocked after an earlier automatic dial-back timeout; automatic selection keeps the block
+     * to avoid repeatedly nudging a phone that did not answer.
+     */
+    fun select(peer: String?, retryBlocked: Boolean = false) {
         if (!enabled || receiver()?.sessionLive == true) return
         if (peer == null) {
             cancel(clearSlots = false)
@@ -196,10 +201,22 @@ class NativeStartSession(
         }
         if (request?.optString("peerMac")?.equals(peer, true) == false || pendingPeer?.equals(peer, true) == false) cancel(clearSlots = false)
         val slot = slots[peer.uppercase()]
-        if (slot == null || !slot.optBoolean("available") || slot.optString("slotId") in blocked) {
+        if (slot == null || !slot.optBoolean("available")) {
             cancel(clearSlots = false)
             reportWaitingUnlessFailed()
             return
+        }
+        val slotId = slot.optString("slotId")
+        if (slotId in blocked) {
+            if (retryBlocked) {
+                blocked.remove(slotId)
+                log("explicit selection retrying previously blocked peer=$peer slot=$slotId")
+            } else {
+                log("automatic selection suppressed for blocked peer=$peer slot=$slotId; awaiting new slot or explicit retry")
+                cancel(clearSlots = false)
+                reportWaitingUnlessFailed()
+                return
+            }
         }
         val previous = request
         if (previous?.optString("peerMac") == peer.uppercase() && previous.optString("slotId") == slot.optString("slotId")) return

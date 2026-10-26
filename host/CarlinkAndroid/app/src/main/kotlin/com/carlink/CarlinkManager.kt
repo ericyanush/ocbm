@@ -3361,7 +3361,10 @@ class CarlinkManager(
         // clears the target globally and makes the later matching handoff impossible to identify.
         adapterActiveBtPeer = target
         receiver.setHandoffTarget(target, ready = phase == Ocbm.BTP_WIFI_HANDOFF)
-        if (nativeStartForConnection) nativeStart.select(target)
+        // A user-selected temporary switch is an explicit retry. A prior automatic StartSession
+        // timeout may have blocked this still-live iAP2 slot, so allow that one retry while normal
+        // preferred/fallback selection continues to respect timeout blocks.
+        if (nativeStartForConnection) nativeStart.select(target, retryBlocked = temporary == target)
     }
 
     private fun onMetadata(
