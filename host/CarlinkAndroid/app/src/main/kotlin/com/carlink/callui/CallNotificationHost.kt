@@ -46,10 +46,12 @@ import com.carlink.ocbm.Ocbm
 class CallNotificationHost(
     private val context: Context,
     private val onButton: (index: Byte) -> Unit,
+    initialMode: CallNotificationMode = CallNotificationMode.HIGH_PRIORITY,
 ) {
     private val nm = context.getSystemService(NotificationManager::class.java)
     private val roster = CallRoster()
     private var shown: CallRoster.Presentation = CallRoster.Presentation.None
+    private var mode: CallNotificationMode = initialMode
     private var registered = false
 
     private val receiver =
@@ -70,14 +72,22 @@ class CallNotificationHost(
         }
 
     init {
-        val ch =
-            NotificationChannel(CHANNEL_ID, "Phone calls", NotificationManager.IMPORTANCE_HIGH).apply {
+        val highChannel =
+            NotificationChannel(HIGH_CHANNEL_ID, "CarPlay calls", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "Incoming and ongoing CarPlay calls"
                 setShowBadge(false)
                 setSound(null, null) // ringing is the phone's job (ALERT lane); see setSilent below
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
-        nm.createNotificationChannel(ch)
+        val silentChannel =
+            NotificationChannel(SILENT_CHANNEL_ID, "CarPlay call status", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Quiet status for incoming and ongoing CarPlay calls"
+                setShowBadge(false)
+                setSound(null, null)
+                lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+            }
+        nm.createNotificationChannel(highChannel)
+        nm.createNotificationChannel(silentChannel)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !nm.canUseFullScreenIntent()) {
             logWarn("[CALL_UI] USE_FULL_SCREEN_INTENT not granted — CallStyle will fall back to a plain card", tag = TAG)
         }
@@ -104,6 +114,14 @@ class CallNotificationHost(
         render(roster.update(state, SystemClock.elapsedRealtime()))
     }
 
+    /** Apply a setting immediately, including updating or removing a notification already shown. */
+    fun setMode(value: CallNotificationMode) {
+        if (mode == value) return
+        mode = value
+        logInfo("[CALL_UI] notification mode=${value.name.lowercase()}", tag = TAG)
+        renderCurrent()
+    }
+
     /** The current reduced view, for anyone arbitrating audio against it. */
     val presentation: CallRoster.Presentation get() = shown
 
@@ -124,13 +142,29 @@ class CallNotificationHost(
         if (p == shown) return
         val previous = shown
         shown = p
+        renderCurrent(previous)
+    }
+
+    private fun renderCurrent(previous: CallRoster.Presentation = shown) {
+        val p = shown
         when (p) {
             CallRoster.Presentation.None -> {
                 nm.cancel(NOTIFICATION_ID)
                 if (previous != CallRoster.Presentation.None) logInfo("[CALL_UI] cleared", tag = TAG)
             }
-            is CallRoster.Presentation.Incoming -> post(styled(p), "incoming ${p.call.displayLine}")
-            is CallRoster.Presentation.Ongoing -> post(styled(p), "ongoing ${p.call.displayLine}")
+            is CallRoster.Presentation.Incoming -> postForMode(p, "incoming ${p.call.displayLine}")
+            is CallRoster.Presentation.Ongoing -> postForMode(p, "ongoing ${p.call.displayLine}")
+        }
+    }
+
+    private fun postForMode(p: CallRoster.Presentation, what: String) {
+        when (mode) {
+            CallNotificationMode.HIGH_PRIORITY -> post(styled(p), what)
+            CallNotificationMode.SILENT -> post(quiet(p), "quiet $what")
+            CallNotificationMode.DISABLED -> {
+                nm.cancel(NOTIFICATION_ID)
+                logInfo("[CALL_UI] suppressed $what (notifications disabled)", tag = TAG)
+            }
         }
     }
 
@@ -138,13 +172,13 @@ class CallNotificationHost(
     private fun styled(p: CallRoster.Presentation): Notification =
         when (p) {
             is CallRoster.Presentation.Incoming ->
-                plainBuilder(p.call, "Incoming call")
+                plainBuilder(p.call, "Incoming call", HIGH_CHANNEL_ID)
                     .setStyle(NotificationCompat.CallStyle.forIncomingCall(person(p.call), pending(ACTION_DECLINE), pending(ACTION_ANSWER)))
                     .setFullScreenIntent(activityIntent(), true)
                     .build()
             is CallRoster.Presentation.Ongoing -> {
                 val b =
-                    plainBuilder(p.call, "Ongoing call")
+                    plainBuilder(p.call, "Ongoing call", HIGH_CHANNEL_ID)
                         .setStyle(NotificationCompat.CallStyle.forOngoingCall(person(p.call), pending(ACTION_HANGUP)))
                         .setFullScreenIntent(activityIntent(), true)
                 if (p.sinceMs > 0) {
@@ -155,6 +189,30 @@ class CallNotificationHost(
             }
             CallRoster.Presentation.None -> error("nothing to style")
         }
+
+    /** A low-importance ordinary notification, deliberately not classified as an Android call. */
+    private fun quiet(p: CallRoster.Presentation): Notification {
+        val incoming = p is CallRoster.Presentation.Incoming
+        val call = when (p) {
+            is CallRoster.Presentation.Incoming -> p.call
+            is CallRoster.Presentation.Ongoing -> p.call
+            CallRoster.Presentation.None -> error("nothing to show")
+        }
+        val builder = plainBuilder(
+            call,
+            if (incoming) "Incoming CarPlay call" else "CarPlay call in progress",
+            SILENT_CHANNEL_ID,
+            quiet = true,
+        ).setCategory(NotificationCompat.CATEGORY_STATUS)
+        if (incoming) {
+            builder
+                .addAction(action("Answer", ACTION_ANSWER))
+                .addAction(action("Decline", ACTION_DECLINE))
+        } else {
+            builder.addAction(action("Hang up", ACTION_HANGUP))
+        }
+        return builder.build()
+    }
 
     private fun post(
         n: Notification,
@@ -175,8 +233,8 @@ class CallNotificationHost(
             val plain =
                 when (p) {
                     is CallRoster.Presentation.Incoming ->
-                        plainBuilder(p.call, "Incoming call").addAction(action("Answer", ACTION_ANSWER)).addAction(action("Decline", ACTION_DECLINE))
-                    is CallRoster.Presentation.Ongoing -> plainBuilder(p.call, "Ongoing call").addAction(action("Hang up", ACTION_HANGUP))
+                plainBuilder(p.call, "Incoming call", HIGH_CHANNEL_ID).addAction(action("Answer", ACTION_ANSWER)).addAction(action("Decline", ACTION_DECLINE))
+                    is CallRoster.Presentation.Ongoing -> plainBuilder(p.call, "Ongoing call", HIGH_CHANNEL_ID).addAction(action("Hang up", ACTION_HANGUP))
                     CallRoster.Presentation.None -> return
                 }
             runCatching { nm.notify(NOTIFICATION_ID, plain.build()) }
@@ -187,20 +245,26 @@ class CallNotificationHost(
     private fun plainBuilder(
         call: CallState,
         text: String,
+        channelId: String,
+        quiet: Boolean = false,
     ): NotificationCompat.Builder =
         NotificationCompat
-            .Builder(context, CHANNEL_ID)
+            .Builder(context, channelId)
             .setSmallIcon(R.drawable.ic_carlink_attribution)
             .setContentTitle(call.displayLine)
             .setContentText(call.label?.let { "$text · $it" } ?: text)
-            .setCategory(NotificationCompat.CATEGORY_CALL)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setCategory(if (quiet) NotificationCompat.CATEGORY_STATUS else NotificationCompat.CATEGORY_CALL)
+            .setPriority(if (quiet) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(if (quiet) NotificationCompat.VISIBILITY_PRIVATE else NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true) // iOS rings through the ALERT audio lane; a second ringtone here would double up.
-            .addPerson(person(call))
-            .setContentIntent(activityIntent())
+            .also { builder ->
+                if (!quiet) builder.addPerson(person(call)).setContentIntent(activityIntent())
+            }
+
+    private fun action(label: String, broadcast: String): NotificationCompat.Action =
+        NotificationCompat.Action.Builder(0, label, pending(broadcast)).build()
 
     private fun person(call: CallState): Person =
         Person
@@ -230,7 +294,8 @@ class CallNotificationHost(
 
     companion object {
         private const val TAG = "CALL_UI"
-        const val CHANNEL_ID = "carlink_calls"
+        const val HIGH_CHANNEL_ID = "carlink_calls_high_priority"
+        const val SILENT_CHANNEL_ID = "carlink_calls_silent"
 
         /** Distinct from the media FGS slot (1001) so the two never replace each other. */
         const val NOTIFICATION_ID = 1002

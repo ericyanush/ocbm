@@ -20,6 +20,7 @@ import com.carlink.av.VideoCodecs
 import com.carlink.av.VideoRenderer
 import com.carlink.av.VoiceRouter
 import com.carlink.callui.CallNotificationHost
+import com.carlink.callui.CallNotificationMode
 import com.carlink.callui.CallRoster
 import com.carlink.callui.CallState
 import com.carlink.car.AppFocusClaimer
@@ -515,6 +516,9 @@ class CarlinkManager(
         context.getSharedPreferences("carlink_multi_phone", Context.MODE_PRIVATE)
     }
     private val gpsForwardingPreference by lazy { GpsForwardingPreference(context) }
+    private val callNotificationPrefs by lazy {
+        context.getSharedPreferences("carlink_call_notifications", Context.MODE_PRIVATE)
+    }
     private val gnssForwarder by lazy {
         GnssForwarder(context, NativeCore::updateVehicleLocationReport) { message ->
             logInfo("$message controlGeneration=${carPlayReceiver?.activeControlGeneration ?: 0}", tag = Logger.Tags.ADAPTR)
@@ -522,6 +526,14 @@ class CarlinkManager(
     }
 
     val gpsForwardingEnabled: Boolean get() = gpsForwardingPreference.enabled
+
+    val callNotificationMode: CallNotificationMode
+        get() = CallNotificationMode.fromStored(callNotificationPrefs.getString("mode", null))
+
+    fun setCallNotificationMode(mode: CallNotificationMode) {
+        callNotificationPrefs.edit().putString("mode", mode.name).apply()
+        callNotificationHost?.setMode(mode)
+    }
 
     /** Persist the user's opt-in. Identification advertises this capability on the next session. */
     fun setGpsForwardingEnabled(enabled: Boolean) {
@@ -960,7 +972,7 @@ class CarlinkManager(
                 m.start()
             }
         appFocusClaimer = AppFocusClaimer(context).also { it.start() }
-        callNotificationHost = CallNotificationHost(context) { idx -> sendTelephony(idx) }
+        callNotificationHost = CallNotificationHost(context, { idx -> sendTelephony(idx) }, callNotificationMode)
 
         microphoneManager =
             MicrophoneCaptureManager(context, logCallback).also { mgr ->

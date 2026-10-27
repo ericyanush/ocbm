@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -37,6 +38,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -58,6 +60,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import com.carlink.CarlinkManager
+import com.carlink.callui.CallNotificationMode
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.ui.DisplayModeOutcome
@@ -113,6 +116,7 @@ internal fun ControlTabContent(
     val connected = connectionState != CarlinkManager.State.DISCONNECTED
     val context = LocalContext.current
     var gpsEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.gpsForwardingEnabled) }
+    var callNotificationMode by remember(carlinkManager) { mutableStateOf(carlinkManager.callNotificationMode) }
     var startSessionEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.startSessionExperimentEnabled) }
     val locationPermission =
         rememberLauncherForActivityResult(
@@ -197,6 +201,42 @@ internal fun ControlTabContent(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            ControlCard(title = "CarPlay call notifications", icon = Icons.Default.PhoneDisabled) {
+                Text(
+                    "Choose how AAOS displays calls reported by the iPhone over CarPlay.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                CallNotificationMode.entries.forEach { option ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 64.dp)
+                            .clickable {
+                                callNotificationMode = option
+                                carlinkManager.setCallNotificationMode(option)
+                            },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = callNotificationMode == option,
+                            onClick = {
+                                callNotificationMode = option
+                                carlinkManager.setCallNotificationMode(option)
+                            },
+                        )
+                        Column(modifier = Modifier.weight(1f).padding(vertical = 8.dp)) {
+                            Text(option.title, style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                option.description,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
             }
         }
     }
