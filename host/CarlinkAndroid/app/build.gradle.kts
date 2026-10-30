@@ -83,15 +83,14 @@ android {
 // ###############################################
 
     defaultConfig {
-        // DISTINCT from the riddleBox app's `zeno.carlink` ON PURPOSE. carlink_native_personal is
-        // the working, favored app against stock firmware and is the fallback while this one is
-        // built; sharing an applicationId would install over it and leave no way back on a head
-        // unit that is also the daily driver. Both can be installed side by side and A/B'd.
-        applicationId = "zeno.carlink.ocbm"
+        // This is the fork's Play listing identity. Keep the sideload flavor on its separate
+        // OCBM package so it can coexist with the Play-installed build during testing.
+        applicationId = "ey.carlink"
         minSdk = 32 // GM gminfo = Android 12L / API 32
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0-ocbm"
+        // Carlink's last published build is 187 / 1.2.2. Increment for this Play update.
+        versionCode = 188
+        versionName = "1.2.3-ocbm"
 
 // ###############################################
 // ###############################################
@@ -115,13 +114,24 @@ android {
         }
     }
 
-    // Distribution identities: Play updates the existing Carlink application; sideload remains
-    // a distinct OCBM package so it can coexist with the Play-installed app during testing.
+    // Distribution identities: Play updates the fork's existing ey.carlink listing; sideload
+    // remains the original distinct OCBM package so both builds can coexist during testing.
     flavorDimensions += "distribution"
 
     productFlavors {
         create("sideload") {
             dimension = "distribution"
+            applicationId = "zeno.carlink.ocbm"
+            manifestPlaceholders["clusterIconAuthority"] =
+                "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
+        }
+        create("play") {
+            dimension = "distribution"
+            // Forks cannot claim GM's globally reserved Templates Host provider authority on
+            // Play. Use a unique authority so Play accepts the bundle; sideload retains the GM
+            // authority for on-device cluster icon integration.
+            manifestPlaceholders["clusterIconAuthority"] =
+                "ey.carlink.ClusterIconContentProvider"
         }
     }
 
@@ -169,6 +179,13 @@ android {
         // - Instantiatable / InvalidUsesTagAttribute — their justifications
         //   (CarAppActivity AAR, the "navigation" uses-tag) died with the cluster /
         //   Car App Library removal; re-enabled.
+    }
+}
+
+// Play Console rejects debuggable bundles; keep only the release variant for that flavor.
+androidComponents {
+    beforeVariants(selector().withName("playDebug")) { variant ->
+        variant.enable = false
     }
 }
 
