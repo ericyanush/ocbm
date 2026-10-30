@@ -237,6 +237,7 @@ pub fn start_route_guidance() -> Vec<u8> {
                                                    // "maneuver"/"lane" as previously commented). ExitInfo/timezone/EV are gated by ids 3/4/5.
     o.extend_from_slice(&tlv(0x0001, &[])); // SourceName
     o.extend_from_slice(&tlv(0x0002, &[])); // SourceSupportsRouteGuidance
+    o.extend_from_slice(&tlv(0x0003, &[])); // ExitInfo
     o
 }
 
@@ -312,6 +313,10 @@ impl J {
     /// Signed JSON number (for signed iAP2 params like the timezone offset).
     fn i(&mut self, k: &str, v: i64) {
         self.0.push(format!("\"{k}\":{v}"));
+    }
+    fn ints(&mut self, k: &str, values: &[i16]) {
+        let body = values.iter().map(i16::to_string).collect::<Vec<_>>().join(",");
+        self.0.push(format!("\"{k}\":[{body}]"));
     }
     fn finish(self, kind: &str) -> String {
         let mut o = format!("{{\"kind\":\"{kind}\"");
@@ -486,6 +491,15 @@ pub fn route_guidance(body: &[u8]) -> String {
                 j.n("maneuverTotalCount", n)
             }
         }
+        16 => {
+            if let Some(n) = uint(v) { j.n("laneGuidanceCurrentIndex", n) }
+        }
+        17 => {
+            if let Some(n) = uint(v) { j.n("laneGuidanceTotalCount", n) }
+        }
+        18 => {
+            if let Some(n) = u8v(v) { j.n("presentLaneGuidance", n as u64) }
+        }
         // id 21 = DestinationTimeZoneOffsetMinutes (int16, SIGNED — e.g. UTC-8 = -480). Apple's catalog.
         21 => {
             if v.len() >= 2 {
@@ -513,6 +527,7 @@ pub fn route_guidance(body: &[u8]) -> String {
 /// its `index`; the host keys maneuvers by it and renders whichever index `0x5201` says is current.
 pub fn maneuver(body: &[u8]) -> String {
     let mut j = J::default();
+    let mut junction_angles = Vec::new();
     walk(body, |id, v| match id {
         1 => {
             if let Some(n) = uint(v) {
@@ -547,9 +562,21 @@ pub fn maneuver(body: &[u8]) -> String {
                 j.n("junctionType", n)
             }
         }
+        10 => {
+            if v.len() >= 2 {
+                junction_angles.push(i16::from_be_bytes([v[0], v[1]]));
+            }
+        }
+        11 => {
+            if v.len() >= 2 { j.i("junctionExitAngle", i16::from_be_bytes([v[0], v[1]]) as i64) }
+        }
+        12 => {
+            if let Some(n) = uint(v) { j.n("linkedLaneGuidance", n) }
+        }
         13 => j.s("exitInfo", s(v)),
         _ => {}
     });
+    if !junction_angles.is_empty() { j.ints("junctionAngles", &junction_angles); }
     if j.0.is_empty() {
         return String::new();
     }
@@ -989,10 +1016,12 @@ pub fn app_icon(body: &[u8]) -> String {
 /// angle the lane leads to. `laneStatus`: 0 do not take, 1 usable, 2 preferred.
 pub fn lane_guidance(body: &[u8], out: &mut Vec<String>) {
     let mut index = None;
+    let mut lane_count = 0usize;
     walk(body, |id, v| {
         if id == 1 {
             index = uint(v);
         }
+        if id == 2 { lane_count += 1; }
     });
     walk(body, |gid, gv| {
         if gid != 2 {
@@ -1002,6 +1031,8 @@ pub fn lane_guidance(body: &[u8], out: &mut Vec<String>) {
         if let Some(i) = index {
             j.n("guidanceIndex", i);
         }
+        j.n("laneCount", lane_count as u64);
+        let mut angles = Vec::new();
         walk(gv, |id, v| match id {
             0 => {
                 if let Some(n) = uint(v) {
@@ -1013,18 +1044,22 @@ pub fn lane_guidance(body: &[u8], out: &mut Vec<String>) {
                     j.n("laneStatus", n)
                 }
             }
-            // LaneAngle (2) is Apple-repeatable `[0+]`; emit only the first occurrence to avoid
-            // duplicate JSON keys (unpredictable per RFC 8259, and Foundation keeps only the last).
-            2 | 3 => {
+            2 => {
                 if let (Some(a), Some(b)) = (v.first(), v.get(1)) {
-                    let key = if id == 2 { "laneAngle" } else { "laneAngleHighlight" };
-                    if !j.0.iter().any(|f| f.starts_with(&format!("\"{key}\""))) {
-                        j.i(key, i16::from_be_bytes([*a, *b]) as i64)
-                    }
+                    angles.push(i16::from_be_bytes([*a, *b]));
+                }
+            }
+            3 => {
+                if let (Some(a), Some(b)) = (v.first(), v.get(1)) {
+                    j.i("laneAngleHighlight", i16::from_be_bytes([*a, *b]) as i64)
                 }
             }
             _ => {}
         });
+        if !angles.is_empty() {
+            j.i("laneAngle", angles[0] as i64);
+            j.ints("laneAngles", &angles);
+        }
         if j.0.len() > 1 {
             out.push(j.finish("laneGuidance"));
         }
