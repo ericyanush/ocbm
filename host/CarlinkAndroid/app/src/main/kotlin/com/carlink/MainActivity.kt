@@ -1,6 +1,8 @@
 package com.carlink
 
 import android.Manifest
+import android.app.Activity
+import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -17,6 +19,7 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.Window
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -268,6 +271,10 @@ class MainActivity : ComponentActivity() {
         // Initialize logging
         initializeLogging()
 
+        // Match Enigy's hidden Templates Host launch: keep CarAppActivity's short-lived window
+        // invisible and pass touches through so the native CarPlay screen does not resize/flicker.
+        application.registerActivityLifecycleCallbacks(carAppActivityWindow)
+
         // The persisted display mode is applied to the window before the display is detected, so
         // the content area DisplayProfile.detect() derives matches the bars actually on screen.
         displayModeStore = DisplayModeStore(this)
@@ -352,6 +359,7 @@ class MainActivity : ComponentActivity() {
             } else if (carlinkManager == null) {
                 carlinkManager = retained.manager
                 retained.manager.addBoxStatusListener(displayModeApplier)
+                retained.manager.addCarPlaySessionListener(clusterPhoneSessionListener)
                 carlinkManagerState.value = retained.manager
                 logInfo("[LIFECYCLE] reattached to retained CarlinkManager", tag = "MAIN")
             }
@@ -427,6 +435,8 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
 
+        application.unregisterActivityLifecycleCallbacks(carAppActivityWindow)
+
         // Unregister USB detachment receiver
         unregisterUsbDetachReceiver()
 
@@ -435,6 +445,7 @@ class MainActivity : ComponentActivity() {
         // The MediaSession itself is owned by CarlinkMediaBrowserService; it releases
         // on its own onDestroy. Just drop the local reference here.
         carlinkManager?.removeBoxStatusListener(displayModeApplier)
+        carlinkManager?.removeCarPlaySessionListener(clusterPhoneSessionListener)
         // onStop already scheduled a delayed release. Do not synchronously write CT_STOP here:
         // this callback is on the main thread and the USB bridge intentionally rejects main-thread
         // bulk I/O. The process-level grace survives Activity destruction/recreation.
@@ -516,6 +527,7 @@ class MainActivity : ComponentActivity() {
             if (carlinkManager !== retained) {
                 carlinkManager = retained
                 retained.addBoxStatusListener(displayModeApplier)
+                retained.addCarPlaySessionListener(clusterPhoneSessionListener)
             }
             carlinkManagerState.value = retained
             logInfo("[LIFECYCLE] reusing live CarlinkManager across Activity recreation", tag = "MAIN")
@@ -528,6 +540,7 @@ class MainActivity : ComponentActivity() {
         carlinkManager =
             CarlinkManager(this, config, mediaSessionManager, profile).also {
                 it.addBoxStatusListener(displayModeApplier)
+                it.addCarPlaySessionListener(clusterPhoneSessionListener)
             }
         carlinkManagerState.value = carlinkManager
     }
@@ -618,6 +631,14 @@ class MainActivity : ComponentActivity() {
             reinitialize()
         }
 
+    /** Refresh the Templates Host binding after an iAP2 phone session is accepted. */
+    private val clusterPhoneSessionListener =
+        CarlinkManager.CarPlaySessionListener {
+            if (ClusterNavigationController.isEnabled(applicationContext)) {
+                ClusterNavigationController.restartTemplatesBinding(applicationContext)
+            }
+        }
+
     /**
      * Map the new config's `audioTransferMode` onto the app-scope [MediaSessionManager]
      * singleton (owned by [CarlinkMediaBrowserService]).
@@ -699,6 +720,7 @@ class MainActivity : ComponentActivity() {
             // Clear Compose reference FIRST — stops surface callbacks into the old manager.
             carlinkManagerState.value = null
             oldManager.removeBoxStatusListener(displayModeApplier)
+            oldManager.removeCarPlaySessionListener(clusterPhoneSessionListener)
             carlinkManager = null
         }
 
@@ -784,13 +806,17 @@ class MainActivity : ComponentActivity() {
      * its negotiated compact view area is applied as a SurfaceControl crop independently of bars.
      */
     private fun applyDisplayMode() {
-        val lp = window.attributes
+        applyDisplayModeToWindow(window, appliedDisplayMode)
+        logInfo("[DISPLAY] Applied display mode ${appliedDisplayMode.name}", tag = "MAIN")
+    }
+
+    private fun applyDisplayModeToWindow(targetWindow: Window, mode: DisplayMode) {
+        val lp = targetWindow.attributes
         // Draw edge-to-edge into the cutout (gminfo3.7 has none, so this is a no-op there).
         lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        window.attributes = lp
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        applyCarPlaySystemUi(compact = false)
-        logInfo("[DISPLAY] Applied display mode ${appliedDisplayMode.name}", tag = "MAIN")
+        targetWindow.attributes = lp
+        WindowCompat.setDecorFitsSystemWindows(targetWindow, false)
+        applyCarPlaySystemUi(targetWindow, mode, compact = false)
     }
 
     /**
@@ -800,14 +826,19 @@ class MainActivity : ComponentActivity() {
      */
     @Suppress("DEPRECATION")
     private fun applyCarPlaySystemUi(compact: Boolean) {
-        val hidden = if (compact) 0 else appliedDisplayMode.hiddenBarTypes
+        applyCarPlaySystemUi(window, appliedDisplayMode, compact)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyCarPlaySystemUi(targetWindow: Window, mode: DisplayMode, compact: Boolean) {
+        val hidden = if (compact) 0 else mode.hiddenBarTypes
         val hideStatus = hidden and WindowInsetsCompat.Type.statusBars() != 0
         val hideNavigation = hidden and WindowInsetsCompat.Type.navigationBars() != 0
 
         // GM's TopCarSystemBar is independently suppressed by FLAG_FULLSCREEN, so keep this in
         // sync with the visibility bits rather than relying on decor visibility alone.
-        if (hideStatus) window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
-        else window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        if (hideStatus) targetWindow.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        else targetWindow.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
 
         var visibility =
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
@@ -818,7 +849,28 @@ class MainActivity : ComponentActivity() {
             if (hideStatus) visibility = visibility or View.SYSTEM_UI_FLAG_FULLSCREEN
             if (hideNavigation) visibility = visibility or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
         }
-        window.decorView.systemUiVisibility = visibility
+        targetWindow.decorView.systemUiVisibility = visibility
+    }
+
+    private val carAppActivityWindow = object : Application.ActivityLifecycleCallbacks {
+        override fun onActivityStarted(activity: Activity) {
+            if (activity.javaClass.name != "androidx.car.app.activity.CarAppActivity") return
+            val carWindow = activity.window
+            applyDisplayModeToWindow(carWindow, appliedDisplayMode)
+            carWindow.attributes = carWindow.attributes.apply { alpha = 0f }
+            carWindow.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+            logInfo(
+                "[CLUSTER] CarAppActivity window hidden with ${appliedDisplayMode.name} bars; touches pass through",
+                tag = "MAIN",
+            )
+        }
+
+        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+        override fun onActivityResumed(activity: Activity) = Unit
+        override fun onActivityPaused(activity: Activity) = Unit
+        override fun onActivityStopped(activity: Activity) = Unit
+        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+        override fun onActivityDestroyed(activity: Activity) = Unit
     }
 
     /** Reveal vehicle system bars around the cropped CarPlay surface in the compact area. */

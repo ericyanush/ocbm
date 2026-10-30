@@ -50,6 +50,8 @@ object Logger {
         const val USB_RAW = "USB_RAW"
         const val AUDIO_DEBUG = "AUDIO_DEBUG"
         const val ERROR_RECOVERY = "ERROR_RECOVERY"
+        const val NAVI = "NAVI"
+        const val CLUSTER = "CLUSTER"
 
         /** Protocol unknowns — always emitted, even in release builds. */
         const val PROTO_UNKNOWN = "PROTO_UNKNOWN"
@@ -186,6 +188,8 @@ fun log(
     message: String,
     tag: String? = null,
 ) = Logger.d(message, tag)
+
+inline fun logNavi(message: () -> String) = logDebugOnly(Logger.Tags.NAVI, message)
 
 fun isTagEnabled(tag: String): Boolean = Logger.isTagEnabled(tag)
 

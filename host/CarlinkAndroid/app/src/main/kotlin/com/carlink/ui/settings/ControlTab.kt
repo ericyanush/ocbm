@@ -64,6 +64,9 @@ import com.carlink.callui.CallNotificationMode
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.navigation.ClusterNavigationController
+import com.carlink.ui.settings.LaneGuidanceStore
+import com.carlink.ui.settings.TurnAlertStore
+import com.carlink.ui.settings.AlertTiming
 import com.carlink.ui.DisplayModeOutcome
 import com.carlink.ui.adaptive.DashboardArrangement
 import com.carlink.ui.adaptive.DashboardLayout
@@ -120,6 +123,17 @@ internal fun ControlTabContent(
     var callNotificationMode by remember(carlinkManager) { mutableStateOf(carlinkManager.callNotificationMode) }
     var startSessionEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.startSessionExperimentEnabled) }
     var clusterNavigationEnabled by remember(context) { mutableStateOf(ClusterNavigationController.isEnabled(context)) }
+    val laneStore = remember(context) { LaneGuidanceStore.get(context) }
+    val turnAlertStore = remember(context) { TurnAlertStore.get(context) }
+    var laneDisplayEnabled by remember(context) { mutableStateOf(laneStore.current.strip) }
+    var laneIconMode by remember(context) { mutableStateOf(laneStore.current.icon) }
+    var laneColor by remember(context) { mutableStateOf(laneStore.current.laneColor) }
+    var turnAlertEnabled by remember(context) { mutableStateOf(turnAlertStore.current.enabled) }
+    var turnAlertTiming by remember(context) { mutableStateOf(turnAlertStore.current.timing) }
+    var turnAlertSpeed by remember(context) { mutableStateOf(turnAlertStore.current.speed) }
+    var turnAlertColor by remember(context) { mutableStateOf(turnAlertStore.current.color) }
+    var turnAlertStyle by remember(context) { mutableStateOf(turnAlertStore.current.style) }
+    var turnAlertSolidLast by remember(context) { mutableStateOf(turnAlertStore.current.solidLast) }
     val locationPermission =
         rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission(),
@@ -213,8 +227,8 @@ internal fun ControlTabContent(
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Show CarPlay guidance on the instrument cluster", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "Sends the current route, destination, ETA, and iAP2 maneuvers to the AAOS navigation service. " +
-                                "This is turn-by-turn guidance; it does not mirror the CarPlay map. The setting is off by default.",
+                            "Relays CarPlay turn-by-turn guidance, exit labels, junction geometry, and lane guidance " +
+                                "to the vehicle cluster. It does not mirror the CarPlay map.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -226,6 +240,108 @@ internal fun ControlTabContent(
                             ClusterNavigationController.setEnabled(context, enabled)
                         },
                     )
+                }
+            }
+            ControlCard(title = "Cluster guidance details", icon = Icons.Default.DisplaySettings) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(20.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Show lane guidance", style = MaterialTheme.typography.titleMedium)
+                        Text("Display recommended lanes with the upcoming turn.", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Switch(checked = laneDisplayEnabled, onCheckedChange = {
+                        laneDisplayEnabled = it
+                        laneStore.setStrip(it)
+                    })
+                }
+                Text("Lane icon", style = MaterialTheme.typography.titleSmall)
+                LaneIconMode.entries.forEach { option ->
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable {
+                        laneIconMode = option
+                        laneStore.setIcon(option)
+                    }, verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(selected = laneIconMode == option, onClick = {
+                            laneIconMode = option
+                            laneStore.setIcon(option)
+                        })
+                        Text(option.label)
+                    }
+                }
+                Text("Recommended lane color", style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { laneColor = null; laneStore.setLaneColor(null) }) { Text("White") }
+                    InlayColor.entries.forEach { color ->
+                        TextButton(onClick = { laneColor = color; laneStore.setLaneColor(color) }) {
+                            Text(if (laneColor == color) "✓ ${color.label}" else color.label)
+                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(20.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Turn alert", style = MaterialTheme.typography.titleMedium)
+                        Text("Flash the turn icon as the vehicle approaches a maneuver.", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Switch(checked = turnAlertEnabled, onCheckedChange = {
+                        turnAlertEnabled = it
+                        turnAlertStore.setEnabled(it)
+                    })
+                }
+                Text("Alert distance", style = MaterialTheme.typography.titleSmall)
+                AlertTiming.entries.forEach { option ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).clickable {
+                            turnAlertTiming = option
+                            turnAlertStore.setTiming(option)
+                        },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = turnAlertTiming == option, onClick = {
+                            turnAlertTiming = option
+                            turnAlertStore.setTiming(option)
+                        })
+                        Column {
+                            Text(option.label, style = MaterialTheme.typography.bodyLarge)
+                            Text(option.hint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+                Text("Flash speed", style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FlashSpeed.entries.forEach { option ->
+                        TextButton(onClick = { turnAlertSpeed = option; turnAlertStore.setSpeed(option) }) {
+                            Text(if (turnAlertSpeed == option) "✓ ${option.label}" else option.label)
+                        }
+                    }
+                }
+                Text("Alert color", style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    InlayColor.entries.forEach { option ->
+                        TextButton(onClick = { turnAlertColor = option; turnAlertStore.setColor(option) }) {
+                            Text(if (turnAlertColor == option) "✓ ${option.label}" else option.label)
+                        }
+                    }
+                }
+                Text("Alert style", style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    AlertStyle.entries.forEach { option ->
+                        TextButton(onClick = { turnAlertStyle = option; turnAlertStore.setStyle(option) }) {
+                            Text(if (turnAlertStyle == option) "✓ ${option.label}" else option.label)
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Hold alert color for the final 3 seconds", modifier = Modifier.weight(1f))
+                    Switch(checked = turnAlertSolidLast, onCheckedChange = {
+                        turnAlertSolidLast = it
+                        turnAlertStore.setSolidLast(it)
+                    })
                 }
             }
             ControlCard(title = "CarPlay call notifications", icon = Icons.Default.PhoneDisabled) {

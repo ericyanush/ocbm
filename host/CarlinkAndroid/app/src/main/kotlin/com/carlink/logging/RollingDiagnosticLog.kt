@@ -1,10 +1,14 @@
 package com.carlink.logging
 
 import android.content.Context
+import android.app.Application
+import android.os.Build
 import android.net.Uri
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -25,6 +29,7 @@ class RollingDiagnosticLog private constructor(
     appVersion: String,
 ) {
     private val appContext = context.applicationContext
+    private val versionLabel = appVersion
     private val logsDir = File(appContext.filesDir, "diagnostics").apply { mkdirs() }
     private val queue = ConcurrentLinkedQueue<String>()
     private val queueCount = AtomicInteger()
@@ -41,7 +46,7 @@ class RollingDiagnosticLog private constructor(
         buildString {
             appendLine("Carlink OCBM diagnostics")
             appendLine("Session: $sessionPrefix")
-            appendLine("App: $appVersion")
+            appendLine("App: $versionLabel")
             appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
             appendLine("Android: ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})")
             appendLine("=".repeat(72))
@@ -84,6 +89,50 @@ class RollingDiagnosticLog private constructor(
         enqueue("${timestamp.format(Instant.now())} I [ADAPTER] $line")
     }
 
+    /** Persist an uncaught exception synchronously before Android's handler terminates the process. */
+    fun appendCrash(
+        thread: Thread,
+        throwable: Throwable,
+    ) {
+        val now = Instant.now()
+        val stack = StringWriter().also { writer -> throwable.printStackTrace(PrintWriter(writer)) }.toString()
+        val processName = if (Build.VERSION.SDK_INT >= 28) Application.getProcessName() else appContext.packageName
+        val record = buildString {
+            appendLine("Carlink uncaught exception")
+            appendLine("Time: ${timestamp.format(now)}")
+            appendLine("Process: $processName (pid=${android.os.Process.myPid()})")
+            appendLine("Thread: ${thread.name}")
+            appendLine("App: $versionLabel")
+            appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            appendLine("Android: ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})")
+            appendLine()
+            appendLine(stack)
+        }
+
+        // First drain queued normal logs, then synchronously write both the active session log and
+        // a standalone crash record. FileDescriptor.sync() ensures the crash survives process death.
+        flushInternal()
+        lock.withLock {
+            runCatching {
+                val crashFile = File(logsDir, "crash_${fileTimestamp.format(now)}_${now.toEpochMilli()}.txt")
+                FileOutputStream(crashFile, false).use { output ->
+                    output.write(record.toByteArray(Charsets.UTF_8))
+                    output.fd.sync()
+                }
+                currentFile?.let { sessionFile ->
+                    FileOutputStream(sessionFile, true).use { output ->
+                        output.write("\n===== UNCAUGHT EXCEPTION =====\n".toByteArray(Charsets.UTF_8))
+                        output.write(record.toByteArray(Charsets.UTF_8))
+                        output.fd.sync()
+                    }
+                }
+                pruneLocked()
+            }.onFailure { error ->
+                Log.e("CARLINK", "[CRASH_LOG] Failed to persist uncaught exception", error)
+            }
+        }
+    }
+
     private fun enqueue(line: String) {
         if (!enabled.get()) return
         // Bound memory in case a faulty hot path floods diagnostics faster than storage can flush.
@@ -96,7 +145,7 @@ class RollingDiagnosticLog private constructor(
 
     fun files(): List<File> =
         logsDir
-            .listFiles { file -> file.isFile && file.name.endsWith(".log") }
+            .listFiles { file -> file.isFile && (file.name.endsWith(".log") || file.name.endsWith(".txt")) }
             ?.sortedByDescending(File::lastModified) ?: emptyList()
 
     fun totalBytes(): Long = files().sumOf(File::length)

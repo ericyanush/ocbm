@@ -20,6 +20,11 @@
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Car App Library navigation templates need these normal permissions for the AAOS
+         Templates Host to accept the cluster navigation service and provide its render surface. -->
+    <uses-permission android:name="androidx.car.app.NAVIGATION_TEMPLATES" />
+    <uses-permission android:name="androidx.car.app.ACCESS_SURFACE" />
+    <uses-permission android:name="android.car.permission.READ_CAR_DISPLAY_UNITS" />
     <!-- CallStyle call notifications: on Android 14+ a CallStyle card must belong to a foreground
          service or carry a fullScreenIntent, and the latter needs this. Normal permission on the
          12L target; on 14+ the OS grants it at install for a sideloaded app (Play is what revokes
@@ -34,6 +39,7 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <queries>
         <package android:name="android.car.usb.handler" />
+        <provider android:authorities="com.google.android.apps.automotive.templates.host.ClusterIconContentProvider" />
     </queries>
 
     <!-- USB Host. required=false on purpose: the CPC200 adapter needs USB host at
@@ -60,6 +66,7 @@
     <uses-feature android:name="android.software.car.templates_host" android:required="false" />
 
     <application
+        android:name=".CarlinkApplication"
         android:allowBackup="false"
         android:appCategory="audio"
         android:icon="@mipmap/ic_launcher"
@@ -68,6 +75,8 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.CarlinkNative"
         tools:targetApi="36">
+
+        <meta-data android:name="androidx.car.app.minCarApiLevel" android:value="6" />
 
         <!-- Optional: present on AAOS, absent on a phone. required="false" keeps the APK
              installable on both; DriveStateMonitor checks FEATURE_AUTOMOTIVE before touching
@@ -128,8 +137,11 @@
         </activity>
 
         <!-- Hidden launcher used to establish a Templates Host binding for cluster guidance. -->
+        <!-- CarAppActivity is supplied by app-automotive and extends FragmentActivity; lint's
+             manifest resolver misses that AAR superclass chain in this declaration. -->
         <activity
             android:name="androidx.car.app.activity.CarAppActivity"
+            tools:ignore="Instantiatable"
             android:exported="false"
             android:launchMode="singleTask"
             android:taskAffinity="${applicationId}.templates"

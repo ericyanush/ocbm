@@ -23,7 +23,9 @@ import com.carlink.callui.CallNotificationHost
 import com.carlink.callui.CallNotificationMode
 import com.carlink.callui.CallRoster
 import com.carlink.callui.CallState
-import com.carlink.navigation.CarPlayNavigationState
+import com.carlink.navigation.OcbmNavigationFeed
+import com.carlink.navigation.NavigationStateManager
+import com.carlink.navigation.VehicleDistanceUnits
 import com.carlink.car.AppFocusClaimer
 import com.carlink.car.DriveStateMonitor
 import com.carlink.device.KnownDevice
@@ -92,6 +94,7 @@ import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Main Carlink Manager — OCBM.
@@ -159,6 +162,8 @@ class CarlinkManager(
 
     init {
         live = this
+        NavigationStateManager.initialize(context)
+        VehicleDistanceUnits.start(context)
     }
 
     companion object {
@@ -391,6 +396,28 @@ class CarlinkManager(
 
     fun removeDeviceListener(listener: DeviceListener) {
         synchronized(deviceListeners) { deviceListeners.remove(listener) }
+    }
+
+    /** Fires when the native receiver accepts an iAP2 control session from a phone. */
+    fun interface CarPlaySessionListener {
+        fun onPhoneSessionAccepted()
+    }
+
+    private val carPlaySessionListeners = CopyOnWriteArrayList<CarPlaySessionListener>()
+
+    fun addCarPlaySessionListener(listener: CarPlaySessionListener) {
+        carPlaySessionListeners.addIfAbsent(listener)
+    }
+
+    fun removeCarPlaySessionListener(listener: CarPlaySessionListener) {
+        carPlaySessionListeners.remove(listener)
+    }
+
+    private fun notifyCarPlaySessionAccepted() {
+        carPlaySessionListeners.forEach { listener ->
+            runCatching { listener.onPhoneSessionAccepted() }
+                .onFailure { logWarn("[CP_RX] session listener failed: ${it.message}", tag = Logger.Tags.PHONE) }
+        }
     }
 
     private fun notifyDeviceListeners() {
@@ -1394,6 +1421,7 @@ class CarlinkManager(
             streamingPhoneMac = null
             wirelessRecoveryAttempted.set(false)
             logInfo("[CP_RX] native receiver accepted a phone control session", tag = Logger.Tags.ADAPTR)
+            notifyCarPlaySessionAccepted()
             if (gpsForwardingPreference.enabled) gnssForwarder.start()
             scope.launch {
                 if (carPlayReceiver !== receiver ||
@@ -1453,7 +1481,7 @@ class CarlinkManager(
                     logInfo("[CP_RX] stale session-down cleanup skipped; replacement session is live", tag = Logger.Tags.ADAPTR)
                     return@launch
                 }
-                CarPlayNavigationState.clear("native iAP2 session ended")
+                OcbmNavigationFeed.clear()
                 appFocusClaimer?.setNavigating(false)
                 carPlayMicUplink?.stop("CarPlay control session ended")
                 if (nativeStartForConnection) nativeStart.connectionEnded()
@@ -1656,7 +1684,7 @@ class CarlinkManager(
         reboot: Boolean = false,
         preserveEscalation: Boolean = false,
     ) {
-        CarPlayNavigationState.clear("Carlink session stopped")
+        OcbmNavigationFeed.clear()
         scope.launch { appFocusClaimer?.setNavigating(false) }
         nativeStart.cancel()
         nativeStartEndpoint = null
@@ -3414,12 +3442,15 @@ class CarlinkManager(
                     // phone is now the navigator; a native maps app mid-route is told it lost it.
                     "routeGuidance" ->
                         if (obj.has("routeGuidanceState")) {
-                            CarPlayNavigationState.accept(obj)
+                            OcbmNavigationFeed.onRouteGuidance(obj)
                             val routeState = obj.optInt("routeGuidanceState")
                             val active = routeState != 0 && routeState != 2
                             scope.launch { appFocusClaimer?.setNavigating(active) }
                         }
-                    "maneuver" -> CarPlayNavigationState.accept(obj)
+                    "maneuver" -> {
+                        OcbmNavigationFeed.onManeuver(obj)
+                    }
+                    "laneGuidance" -> OcbmNavigationFeed.onLaneGuidance(obj)
                     else -> Unit
                 }
             }

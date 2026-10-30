@@ -18,6 +18,13 @@
             android:name="com.carlink.usbhelper.UsbBridgeService"
             android:exported="true" />
 
+        <!-- GoogleTemplatesHost uses this provider to transfer maneuver icons to the cluster. -->
+        <provider
+            android:name="com.carlink.usbhelper.ClusterIconProvider"
+            android:authorities="com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
     </application>
 
 </manifest>
