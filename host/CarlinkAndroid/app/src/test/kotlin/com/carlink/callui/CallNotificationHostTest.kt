@@ -33,7 +33,7 @@ class CallNotificationHostTest {
     @Test
     fun `a ringing call posts an ongoing CallStyle card with a full-screen intent and both actions`() {
         val pressed = mutableListOf<Byte>()
-        val host = CallNotificationHost(ctx) { pressed += it }
+        val host = CallNotificationHost(ctx, onButton = { pressed += it })
         host.onCallState(call(CallState.STATUS_RINGING))
 
         val n = shadowOf(nm).getNotification(CallNotificationHost.NOTIFICATION_ID)
@@ -57,7 +57,7 @@ class CallNotificationHostTest {
     @Test
     fun `active then idle replaces the card with hang-up and clears it`() {
         val pressed = mutableListOf<Byte>()
-        val host = CallNotificationHost(ctx) { pressed += it }
+        val host = CallNotificationHost(ctx, onButton = { pressed += it })
         host.onCallState(call(CallState.STATUS_RINGING))
         host.onCallState(call(CallState.STATUS_ACTIVE))
         val n = shadowOf(nm).getNotification(CallNotificationHost.NOTIFICATION_ID)
