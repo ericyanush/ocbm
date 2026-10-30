@@ -23,6 +23,7 @@ import com.carlink.callui.CallNotificationHost
 import com.carlink.callui.CallNotificationMode
 import com.carlink.callui.CallRoster
 import com.carlink.callui.CallState
+import com.carlink.navigation.CarPlayNavigationState
 import com.carlink.car.AppFocusClaimer
 import com.carlink.car.DriveStateMonitor
 import com.carlink.device.KnownDevice
@@ -1452,6 +1453,8 @@ class CarlinkManager(
                     logInfo("[CP_RX] stale session-down cleanup skipped; replacement session is live", tag = Logger.Tags.ADAPTR)
                     return@launch
                 }
+                CarPlayNavigationState.clear("native iAP2 session ended")
+                appFocusClaimer?.setNavigating(false)
                 carPlayMicUplink?.stop("CarPlay control session ended")
                 if (nativeStartForConnection) nativeStart.connectionEnded()
                 carPlayMicUplink = null
@@ -1653,6 +1656,8 @@ class CarlinkManager(
         reboot: Boolean = false,
         preserveEscalation: Boolean = false,
     ) {
+        CarPlayNavigationState.clear("Carlink session stopped")
+        scope.launch { appFocusClaimer?.setNavigating(false) }
         nativeStart.cancel()
         nativeStartEndpoint = null
         // Invalidate receiver/MFi work before stopping the receiver and USB pipe. Native control
@@ -2794,7 +2799,9 @@ class CarlinkManager(
 
         wireBoxStatus(c)
 
-        c.onMetadata = { marker, payload -> onMetadata(marker, payload) }
+        c.onMetadata = { marker, payload ->
+            if (client === c) onMetadata(marker, payload)
+        }
 
         // FATAL only. A box-side SEV_HOST_GONE is recoverable and the client's own backoff
         // re-subscribes; tearing down on it would fight that recovery.
@@ -2835,7 +2842,8 @@ class CarlinkManager(
         // Adapt those streams into these exact same render/audio pipes; the USB OCBM decrypt seams
         // remain in place for the adapter's normal data path and the two sources never need separate
         // renderer or AudioTrack implementations.
-        val bridge = CarPlaySocketMediaBridge(
+        lateinit var bridge: CarPlaySocketMediaBridge
+        bridge = CarPlaySocketMediaBridge(
             log = ProbeLog.sub("CP_RX_BRIDGE"),
             output = object : CarPlaySocketMediaBridge.Output {
                 override fun video(payload: ByteArray): Boolean {
@@ -2865,7 +2873,9 @@ class CarlinkManager(
                         ),
                     )
 
-                override fun metadata(marker: Int, payload: ByteArray) = onMetadata(marker, payload)
+                override fun metadata(marker: Int, payload: ByteArray) {
+                    if (carPlaySocketBridge === bridge) onMetadata(marker, payload)
+                }
             },
         )
         if (bridge.start()) {
@@ -3404,9 +3414,12 @@ class CarlinkManager(
                     // phone is now the navigator; a native maps app mid-route is told it lost it.
                     "routeGuidance" ->
                         if (obj.has("routeGuidanceState")) {
-                            val active = obj.optInt("routeGuidanceState") != 0
+                            CarPlayNavigationState.accept(obj)
+                            val routeState = obj.optInt("routeGuidanceState")
+                            val active = routeState != 0 && routeState != 2
                             scope.launch { appFocusClaimer?.setNavigating(active) }
                         }
+                    "maneuver" -> CarPlayNavigationState.accept(obj)
                     else -> Unit
                 }
             }

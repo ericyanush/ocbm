@@ -4,11 +4,11 @@
     - media : required so AAOS Media Center lists Carlink as a selectable source
               (the MediaBrowserService intent-filter is necessary but not sufficient)
 
-    (Removed in cp-stripped: `template` and `navigation` — they belonged to the
-    Car App Library cluster sessions / CarlinkClusterService, which this variant
-    deleted. Stale capability declarations feed GM's app-classification heuristics
-    — e.g. MediaSource.isMediaTemplate() — so they must not outlive the feature.)
+    - template/navigation : opt-in Car App Library service for turn-by-turn cluster guidance.
+      The service starts disabled and is enabled by the user's Cluster Navigation setting.
 -->
 <automotiveApp>
     <uses name="media"/>
+    <uses name="template"/>
+    <uses name="navigation"/>
 </automotiveApp>

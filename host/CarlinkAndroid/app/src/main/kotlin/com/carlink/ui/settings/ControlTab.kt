@@ -63,6 +63,7 @@ import com.carlink.CarlinkManager
 import com.carlink.callui.CallNotificationMode
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
+import com.carlink.navigation.ClusterNavigationController
 import com.carlink.ui.DisplayModeOutcome
 import com.carlink.ui.adaptive.DashboardArrangement
 import com.carlink.ui.adaptive.DashboardLayout
@@ -118,6 +119,7 @@ internal fun ControlTabContent(
     var gpsEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.gpsForwardingEnabled) }
     var callNotificationMode by remember(carlinkManager) { mutableStateOf(carlinkManager.callNotificationMode) }
     var startSessionEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.startSessionExperimentEnabled) }
+    var clusterNavigationEnabled by remember(context) { mutableStateOf(ClusterNavigationController.isEnabled(context)) }
     val locationPermission =
         rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission(),
@@ -201,6 +203,30 @@ internal fun ControlTabContent(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            ControlCard(title = "Cluster navigation", icon = Icons.Default.DisplaySettings) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(20.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Show CarPlay guidance on the instrument cluster", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Sends the current route, destination, ETA, and iAP2 maneuvers to the AAOS navigation service. " +
+                                "This is turn-by-turn guidance; it does not mirror the CarPlay map. The setting is off by default.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = clusterNavigationEnabled,
+                        onCheckedChange = { enabled ->
+                            clusterNavigationEnabled = enabled
+                            ClusterNavigationController.setEnabled(context, enabled)
+                        },
+                    )
+                }
             }
             ControlCard(title = "CarPlay call notifications", icon = Icons.Default.PhoneDisabled) {
                 Text(

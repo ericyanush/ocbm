@@ -44,6 +44,7 @@ import com.carlink.logging.Logger
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.media.MediaSessionManager
+import com.carlink.navigation.ClusterNavigationController
 import com.carlink.ocbm.Ocbm
 import com.carlink.protocol.AdapterConfig
 import com.carlink.protocol.KnownDevices
@@ -295,6 +296,14 @@ class MainActivity : ComponentActivity() {
 
         // Register USB detachment receiver for immediate disconnect detection
         registerUsbDetachReceiver()
+
+        // Restore the optional Templates Host binding on process/activity recreation.
+        // Delay it so it cannot cover the USB or microphone permission/startup UI.
+        if (ClusterNavigationController.isEnabled(this)) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (!isDestroyed && !isFinishing) ClusterNavigationController.startTemplatesBinding(this)
+            }, 4000L)
+        }
 
         // Set up Compose UI
         // CarlinkManager is observed via mutableStateOf — replacement during display mode

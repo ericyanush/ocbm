@@ -222,6 +222,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
     implementation("androidx.activity:activity-compose:1.13.0")
+    // Car App Library provides AAOS cluster navigation templates and NavigationManager.
+    implementation("androidx.car.app:app:1.7.0")
+    implementation("androidx.car.app:app-automotive:1.7.0")
 
     // (Removed: androidx.datastore — AdapterConfigPreference's DataStore layer was
     // write-only dead I/O; SharedPreferences was always the effective store and is now
