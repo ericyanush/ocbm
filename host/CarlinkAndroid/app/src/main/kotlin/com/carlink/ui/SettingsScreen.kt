@@ -1,6 +1,7 @@
 package com.carlink.ui
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -35,7 +36,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -190,7 +190,7 @@ private fun LogsPane(
         androidx.compose.material3.Button(onClick = onExport, enabled = diagnostics != null && !exporting) {
             Text(if (exporting) "Preparing export…" else "Export logs to USB / storage")
         }
-        OutlinedButton(
+        androidx.compose.material3.Button(
             onClick = onOpenFiles,
             modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight),
         ) { Text("Open Files app") }
@@ -204,23 +204,51 @@ private fun LogsPane(
     }
 }
 
-/** Open the AAOS file browser directly, using the working components from FilesLauncher. */
+/** Open the AAOS file browser, preferring its package-provided launch intent. */
 private fun openFilesApp(context: Context) {
+    // The built-in export uses Android's document picker successfully on AAOS. Prefer its
+    // generic open intent: GM builds may provide a DocumentsUI provider without exposing the
+    // hard-coded FilesActivity/LauncherActivity components below.
+    try {
+        context.startActivity(
+            Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+        logInfo("[UI_ACTION] Open Files app via system document picker", tag = "UI")
+        return
+    } catch (error: RuntimeException) {
+        logWarn("[UI_ACTION] System document picker unavailable (${error.javaClass.simpleName})", tag = "UI")
+    }
+
     val targets = listOf(
         "com.android.documentsui" to "com.android.documentsui.files.FilesActivity",
         "com.android.documentsui" to "com.android.documentsui.LauncherActivity",
         "com.google.android.documentsui" to "com.android.documentsui.LauncherActivity",
     )
     for ((packageName, activityName) in targets) {
-        val intent = Intent().setClassName(packageName, activityName).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val launchIntent =
+            try {
+                context.packageManager.getLaunchIntentForPackage(packageName)
+            } catch (error: RuntimeException) {
+                logWarn("[UI_ACTION] Cannot query Files launcher $packageName (${error.javaClass.simpleName})", tag = "UI")
+                null
+            }
+        val intent =
+            (launchIntent ?: Intent().setClassName(packageName, activityName))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
             context.startActivity(intent)
-            logInfo("[UI_ACTION] Open Files app: $packageName/$activityName", tag = "UI")
+            logInfo("[UI_ACTION] Open Files app: ${intent.component ?: packageName}", tag = "UI")
             return
-        } catch (error: RuntimeException) {
+        } catch (error: ActivityNotFoundException) {
             logWarn("[UI_ACTION] Files target unavailable: $packageName/$activityName (${error.javaClass.simpleName})", tag = "UI")
+        } catch (error: SecurityException) {
+            logWarn("[UI_ACTION] Files target denied: $packageName/$activityName (${error.message})", tag = "UI")
         }
     }
+
     Toast.makeText(context, "Files app is unavailable on this head unit", Toast.LENGTH_LONG).show()
 }
 
