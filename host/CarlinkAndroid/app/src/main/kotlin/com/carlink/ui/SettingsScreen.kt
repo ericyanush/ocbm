@@ -6,8 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
-import android.provider.Settings
 import android.view.HapticFeedbackConstants
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -91,38 +89,6 @@ fun SettingsScreen(
     var exporting by remember { mutableStateOf(false) }
     var logRevision by remember { mutableStateOf(0) }
     var showPurgeConfirmation by remember { mutableStateOf(false) }
-    var pendingApkInstall by remember { mutableStateOf<Uri?>(null) }
-    val installSourceSettingsLauncher =
-        rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            val uri = pendingApkInstall
-            pendingApkInstall = null
-            if (uri != null) {
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls()) {
-                    launchApkInstaller(context, uri)
-                } else {
-                    Toast.makeText(context, "Allow Carlink to install apps, then choose the APK again", Toast.LENGTH_LONG).show()
-                }
-            }
-        }
-    val apkPickerLauncher =
-        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-            if (uri != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !context.packageManager.canRequestPackageInstalls()) {
-                    pendingApkInstall = uri
-                    try {
-                        installSourceSettingsLauncher.launch(
-                            Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")),
-                        )
-                    } catch (error: RuntimeException) {
-                        pendingApkInstall = null
-                        logWarn("[UI_ACTION] Cannot open unknown-app install settings (${error.javaClass.simpleName})", tag = "UI")
-                        Toast.makeText(context, "Enable app installs for Carlink in system settings", Toast.LENGTH_LONG).show()
-                    }
-                } else {
-                    launchApkInstaller(context, uri)
-                }
-            }
-        }
     val exportLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri: Uri? ->
             if (uri != null && diagnostics != null) {
@@ -171,7 +137,7 @@ fun SettingsScreen(
                         LogsPane(diagnostics, exporting, logRevision, onExport = {
                             exporting = true
                             exportLauncher.launch("carlink-diagnostics-${System.currentTimeMillis()}.zip")
-                        }, onOpenFiles = { apkPickerLauncher.launch(arrayOf("application/vnd.android.package-archive")) }, onPurge = { showPurgeConfirmation = true })
+                        }, onOpenFiles = { openFilesApp(context) }, onPurge = { showPurgeConfirmation = true })
                 }
             }
         }
@@ -227,7 +193,7 @@ private fun LogsPane(
         androidx.compose.material3.Button(
             onClick = onOpenFiles,
             modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight),
-        ) { Text("Choose APK to install") }
+        ) { Text("Open Files app") }
         TextButton(onClick = onPurge, enabled = diagnostics != null) { Text("Purge all app logs") }
         files.forEach { file ->
             Text("${file.name} · ${file.length()} bytes", style = MaterialTheme.typography.bodySmall)
@@ -238,23 +204,49 @@ private fun LogsPane(
     }
 }
 
-/** Hand the selected APK URI to Android's package installer. */
-private fun launchApkInstaller(context: Context, uri: Uri) {
+/** Open DocumentsUI's Files view, which can hand APK taps to Package Installer itself. */
+private fun openFilesApp(context: Context) {
+    // CATEGORY_APP_FILES must be supplied as the selector category; placing it directly on an
+    // ACTION_MAIN intent does not match the Android 14 DocumentsUI launcher filter.
+    val filesSelector = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_FILES)
+    val candidates =
+        try {
+            context.packageManager.queryIntentActivities(filesSelector, PackageManager.MATCH_DEFAULT_ONLY)
+                .map { "${it.activityInfo.packageName}/${it.activityInfo.name}" }
+        } catch (error: RuntimeException) {
+            logWarn("[UI_ACTION] Cannot query Files activities (${error.javaClass.simpleName})", tag = "UI")
+            emptyList()
+        }
+    logInfo("[UI_ACTION] APP_FILES resolved candidates=${candidates.joinToString().ifEmpty { "none" }}", tag = "UI")
     try {
-        val intent =
-            Intent(Intent.ACTION_VIEW)
-                .setDataAndType(uri, "application/vnd.android.package-archive")
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        intent.clipData = android.content.ClipData.newRawUri("APK", uri)
-        context.startActivity(intent)
-        logInfo("[UI_ACTION] Hand selected APK to Package Installer uri=$uri", tag = "UI")
+        context.startActivity(filesSelector)
+        logInfo("[UI_ACTION] Open Files app via APP_FILES selector", tag = "UI")
+        return
     } catch (error: ActivityNotFoundException) {
-        logWarn("[UI_ACTION] No package installer handles APKs (${error.javaClass.simpleName})", tag = "UI")
-        Toast.makeText(context, "No package installer is available", Toast.LENGTH_LONG).show()
+        logWarn("[UI_ACTION] APP_FILES selector unavailable (${error.javaClass.simpleName})", tag = "UI")
     } catch (error: SecurityException) {
-        logWarn("[UI_ACTION] Package install launch denied (${error.message})", tag = "UI")
-        Toast.makeText(context, "Carlink is not allowed to install APKs on this device", Toast.LENGTH_LONG).show()
+        logWarn("[UI_ACTION] APP_FILES selector denied (${error.message})", tag = "UI")
     }
+
+    val targets = listOf(
+        "com.android.documentsui" to "com.android.documentsui.files.FilesActivity",
+        "com.google.android.documentsui" to "com.google.android.documentsui.files.FilesActivity",
+        "com.android.documentsui" to "com.android.documentsui.LauncherActivity",
+        "com.google.android.documentsui" to "com.android.documentsui.LauncherActivity",
+    )
+    for ((packageName, activityName) in targets) {
+        val intent = Intent(Intent.ACTION_MAIN).setClassName(packageName, activityName)
+        try {
+            context.startActivity(intent)
+            logInfo("[UI_ACTION] Open Files app: $packageName/$activityName", tag = "UI")
+            return
+        } catch (error: ActivityNotFoundException) {
+            logWarn("[UI_ACTION] Files target unavailable: $packageName/$activityName", tag = "UI")
+        } catch (error: SecurityException) {
+            logWarn("[UI_ACTION] Files target denied: $packageName/$activityName (${error.message})", tag = "UI")
+        }
+    }
+    Toast.makeText(context, "Files app is unavailable on this head unit", Toast.LENGTH_LONG).show()
 }
 
 /** The known-device grid, centred in the pane and scrolling when the pane is shorter than it. */
