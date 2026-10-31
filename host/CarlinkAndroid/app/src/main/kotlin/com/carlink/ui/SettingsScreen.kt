@@ -204,22 +204,21 @@ private fun LogsPane(
     }
 }
 
-/** Open the AAOS file browser, preferring its package-provided launch intent. */
+/** Open the AAOS file manager so it, rather than Carlink, handles APK installation. */
 private fun openFilesApp(context: Context) {
-    // The built-in export uses Android's document picker successfully on AAOS. Prefer its
-    // generic open intent: GM builds may provide a DocumentsUI provider without exposing the
-    // hard-coded FilesActivity/LauncherActivity components below.
+    // ACTION_OPEN_DOCUMENT is a file-selection contract: choosing an APK returns its URI to
+    // Carlink and closes the picker. Launch the file manager's home category so DocumentsUI
+    // receives the APK tap itself and can hand it to Package Installer.
     try {
         context.startActivity(
-            Intent(Intent.ACTION_OPEN_DOCUMENT)
-                .addCategory(Intent.CATEGORY_OPENABLE)
-                .setType("*/*")
+            Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_APP_FILES)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
         )
-        logInfo("[UI_ACTION] Open Files app via system document picker", tag = "UI")
+        logInfo("[UI_ACTION] Open Files app via APP_FILES category", tag = "UI")
         return
     } catch (error: RuntimeException) {
-        logWarn("[UI_ACTION] System document picker unavailable (${error.javaClass.simpleName})", tag = "UI")
+        logWarn("[UI_ACTION] APP_FILES handler unavailable (${error.javaClass.simpleName})", tag = "UI")
     }
 
     val targets = listOf(
