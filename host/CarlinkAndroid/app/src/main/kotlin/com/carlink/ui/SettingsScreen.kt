@@ -206,6 +206,35 @@ private fun LogsPane(
 
 /** Open DocumentsUI's Files view, which can hand APK taps to Package Installer itself. */
 private fun openFilesApp(context: Context) {
+    val downloadsIntent = Intent("android.intent.action.VIEW_DOWNLOADS")
+    try {
+        context.startActivity(downloadsIntent)
+        logInfo("[UI_ACTION] Open Files app via VIEW_DOWNLOADS", tag = "UI")
+        return
+    } catch (error: ActivityNotFoundException) {
+        logWarn("[UI_ACTION] VIEW_DOWNLOADS handler unavailable", tag = "UI")
+    } catch (error: SecurityException) {
+        logWarn("[UI_ACTION] VIEW_DOWNLOADS denied (${error.message})", tag = "UI")
+    }
+
+    // Android 14 DocumentsUI exposes FilesActivity as VIEW vnd.android.document/root. Opening
+    // the primary root reaches its browser UI without depending on a launcher activity.
+    val rootIntent =
+        Intent(Intent.ACTION_VIEW)
+            .setDataAndType(
+                Uri.parse("content://com.android.externalstorage.documents/root/primary"),
+                "vnd.android.document/root",
+            )
+    try {
+        context.startActivity(rootIntent)
+        logInfo("[UI_ACTION] Open Files app via primary document root", tag = "UI")
+        return
+    } catch (error: ActivityNotFoundException) {
+        logWarn("[UI_ACTION] Document-root browser unavailable", tag = "UI")
+    } catch (error: SecurityException) {
+        logWarn("[UI_ACTION] Document-root browser denied (${error.message})", tag = "UI")
+    }
+
     // CATEGORY_APP_FILES must be supplied as the selector category; placing it directly on an
     // ACTION_MAIN intent does not match the Android 14 DocumentsUI launcher filter.
     val filesSelector = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_FILES)
