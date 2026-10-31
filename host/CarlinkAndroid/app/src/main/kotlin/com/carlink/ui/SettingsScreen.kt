@@ -206,35 +206,6 @@ private fun LogsPane(
 
 /** Open DocumentsUI's Files view, which can hand APK taps to Package Installer itself. */
 private fun openFilesApp(context: Context) {
-    val downloadsIntent = Intent("android.intent.action.VIEW_DOWNLOADS")
-    try {
-        context.startActivity(downloadsIntent)
-        logInfo("[UI_ACTION] Open Files app via VIEW_DOWNLOADS", tag = "UI")
-        return
-    } catch (error: ActivityNotFoundException) {
-        logWarn("[UI_ACTION] VIEW_DOWNLOADS handler unavailable", tag = "UI")
-    } catch (error: SecurityException) {
-        logWarn("[UI_ACTION] VIEW_DOWNLOADS denied (${error.message})", tag = "UI")
-    }
-
-    // Android 14 DocumentsUI exposes FilesActivity as VIEW vnd.android.document/root. Opening
-    // the primary root reaches its browser UI without depending on a launcher activity.
-    val rootIntent =
-        Intent(Intent.ACTION_VIEW)
-            .setDataAndType(
-                Uri.parse("content://com.android.externalstorage.documents/root/primary"),
-                "vnd.android.document/root",
-            )
-    try {
-        context.startActivity(rootIntent)
-        logInfo("[UI_ACTION] Open Files app via primary document root", tag = "UI")
-        return
-    } catch (error: ActivityNotFoundException) {
-        logWarn("[UI_ACTION] Document-root browser unavailable", tag = "UI")
-    } catch (error: SecurityException) {
-        logWarn("[UI_ACTION] Document-root browser denied (${error.message})", tag = "UI")
-    }
-
     // CATEGORY_APP_FILES must be supplied as the selector category; placing it directly on an
     // ACTION_MAIN intent does not match the Android 14 DocumentsUI launcher filter.
     val filesSelector = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_FILES)
@@ -255,6 +226,60 @@ private fun openFilesApp(context: Context) {
         logWarn("[UI_ACTION] APP_FILES selector unavailable (${error.javaClass.simpleName})", tag = "UI")
     } catch (error: SecurityException) {
         logWarn("[UI_ACTION] APP_FILES selector denied (${error.message})", tag = "UI")
+    }
+
+    // GM may ship DocumentsUI with a renamed launcher or with the APP_FILES filter removed.
+    // Inspect only the two known platform package names and launch an exported native activity.
+    for (packageName in listOf("com.android.documentsui", "com.google.android.documentsui")) {
+        val packageInfo =
+            try {
+                context.packageManager.getPackageInfo(
+                    packageName,
+                    PackageManager.GET_ACTIVITIES or PackageManager.MATCH_DISABLED_COMPONENTS,
+                )
+            } catch (error: PackageManager.NameNotFoundException) {
+                logInfo("[UI_ACTION] Native Files package absent: $packageName", tag = "UI")
+                continue
+            } catch (error: RuntimeException) {
+                logWarn("[UI_ACTION] Cannot inspect $packageName (${error.javaClass.simpleName})", tag = "UI")
+                continue
+            }
+
+        val activities = packageInfo.activities.orEmpty()
+        val candidates = activities.filter { activity ->
+            activity.exported && activity.enabled &&
+                (activity.name.contains("files", ignoreCase = true) || activity.name.contains("launcher", ignoreCase = true))
+        }
+        logInfo(
+            "[UI_ACTION] Native Files package=$packageName appEnabled=${packageInfo.applicationInfo?.enabled} " +
+                "candidates=${candidates.joinToString { it.name }}",
+            tag = "UI",
+        )
+        val launchIntent =
+            try {
+                context.packageManager.getLaunchIntentForPackage(packageName)
+            } catch (error: RuntimeException) {
+                logWarn("[UI_ACTION] Cannot get launcher for $packageName (${error.javaClass.simpleName})", tag = "UI")
+                null
+            }
+        val components =
+            buildList {
+                launchIntent?.component?.let(::add)
+                candidates.forEach { activity ->
+                    add(android.content.ComponentName(packageName, activity.name))
+                }
+            }.distinct()
+        for (component in components) {
+            try {
+                context.startActivity(Intent(Intent.ACTION_MAIN).setComponent(component))
+                logInfo("[UI_ACTION] Open native Files activity: $component", tag = "UI")
+                return
+            } catch (error: ActivityNotFoundException) {
+                logWarn("[UI_ACTION] Native Files activity unavailable: $component", tag = "UI")
+            } catch (error: SecurityException) {
+                logWarn("[UI_ACTION] Native Files activity denied: $component (${error.message})", tag = "UI")
+            }
+        }
     }
 
     val targets = listOf(
