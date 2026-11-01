@@ -46,7 +46,28 @@ class OcbmSocketTunnel(
     }
 
     data class BindResult(val port: Int)
-    private data class Registration(val protocol: Byte, val localPort: Int)
+    private data class Registration(val protocol: Byte, val localPort: Int, val udp: UdpTiming = UdpTiming())
+    private class UdpTiming {
+        var packets = 0L; var bytes = 0L; var errors = 0L
+        var lastNs = 0L; var maxGapUs = 0L; var maxSendUs = 0L
+    }
+    private var lastUdpStatsNs = System.nanoTime()
+    private val dispatchDrops = AtomicLong()
+    private fun reportUdpStats() {
+        val now = System.nanoTime()
+        if (now - lastUdpStatsNs < 5_000_000_000L) return
+        val intervalMs = (now - lastUdpStatsNs) / 1_000_000
+        for ((id, registration) in registrations) {
+            if (registration.protocol != Ocbm.TUNNEL_BIND_UDP) continue
+            val t = registration.udp
+            log("UDP tunnel stats id=$id port=${registration.localPort} intervalMs=$intervalMs " +
+                "packets=${t.packets} bytes=${t.bytes} errors=${t.errors} maxGapUs=${t.maxGapUs} " +
+                "maxSendUs=${t.maxSendUs} idleMs=${if (t.lastNs == 0L) -1 else (now-t.lastNs)/1_000_000} " +
+                "dispatchQueue=${incoming.size} dispatchDrops=${dispatchDrops.get()}")
+            t.packets=0; t.bytes=0; t.errors=0; t.maxGapUs=0; t.maxSendUs=0
+        }
+        lastUdpStatsNs = now
+    }
     private data class TunnelStream(
         val socket: Socket,
         val incoming: ByteBoundedQueue,
@@ -226,11 +247,15 @@ class OcbmSocketTunnel(
     /** OCBM read-thread callback: bounded enqueue only, never connect/write sockets here. */
     private fun offerFrame(payload: ByteArray) {
         if (!alive.get()) return
-        if (!incoming.offer(payload.copyOf())) log("tunnel event queue full; incoming frame refused")
+        if (!incoming.offer(payload.copyOf())) {
+            dispatchDrops.incrementAndGet()
+            log("tunnel event queue full; incoming frame refused opcode=${payload.firstOrNull()} bytes=${payload.size}")
+        }
     }
 
     private fun dispatchLoop() {
         while (alive.get()) {
+            reportUdpStats()
             val frame = try { incoming.poll(250, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { null } ?: continue
             if (frame.size < 9 || readU32(frame, 1) != epoch) continue
             val id = readU32(frame, 5)
@@ -428,6 +453,12 @@ class OcbmSocketTunnel(
         if (registration.protocol != Ocbm.TUNNEL_BIND_UDP) return
         val peer = decodePeerAddress(frame, 9) ?: return
         val bodyOffset = peer.second
+        val timing = registration.udp
+        val arrived = System.nanoTime()
+        if (timing.lastNs != 0L) timing.maxGapUs = maxOf(timing.maxGapUs, (arrived-timing.lastNs)/1000)
+        timing.lastNs = arrived
+        timing.packets++
+        timing.bytes += frame.size - bodyOffset
         val key = "$id/${peer.first.address.hostAddress}:${peer.first.port}"
         if (!udpPeers.containsKey(key) && udpPeers.size >= MAX_UDP_PEERS) {
             log("UDP tunnel peer cap reached; dropping datagram registration=$id")
@@ -444,7 +475,8 @@ class OcbmSocketTunnel(
             val packet = DatagramPacket(frame, bodyOffset, frame.size - bodyOffset,
                 IPV4_LOOPBACK, registration.localPort)
             flow.proxy.send(packet)
-        }
+        }.onFailure { timing.errors++ }
+        timing.maxSendUs = maxOf(timing.maxSendUs, (System.nanoTime()-arrived)/1000)
     }
 
     private fun pumpUdpResponse(id: Int, flow: UdpPeer, localPort: Int) {

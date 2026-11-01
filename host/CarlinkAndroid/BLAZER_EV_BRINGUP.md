@@ -92,3 +92,15 @@ New captures identify `tunnel-wake-v3` and `accessory_reader=threaded`. `[loop-p
 The `reader_split_perf` capture reduced control-connect-to-first-frame time to about 3.47 seconds and phase-one socket setup to 22 ms. Steady tunnel event delays mostly fell to milliseconds. A remaining approximately 1.68-second event spike matched synchronous MFi signing on the main dispatch thread.
 
 `ocbmd` now serializes host MFi requests on a dedicated worker with bounded request/reply queues and a pollable completion notification. Protocol status and optional correlation tags are preserved. HELLO and session teardown invalidate the worker generation: queued stale work is skipped and completed old-session signatures are discarded. Queue saturation returns a tagged failure instead of blocking USB. The shared chip driver's interprocess locking remains responsible for coordination with btd. `[mfi-perf]` records operation/tag, queue wait, chip elapsed time and response status through CH_LOG. Chip elapsed time may remain around 1.7 seconds; it should no longer produce the same tunnel event stall. Update only `ocbmd`, and verify the exported marker includes `mfi_worker=serialized`.
+
+## UDP/audio and radio instrumentation
+
+The longer `update_mfi_worker` capture contained foreground audio gaps of 1562 ms and 1138 ms at approximately 00:42:04 and 00:42:14, while broker event delays remained below 39 ms. TCP timing does not measure the UDP media stream, so additional diagnostics now trace the audio path:
+
+- Adapter `[udp-perf]`: per-registration port/ID, interval packet and byte counts, maximum receive gap, time since last receipt, rejected peers, event-queue drops and socket errors. These use the existing CH_LOG diagnostic path.
+- Adapter `[wifi-perf]`: cumulative interface packet/error/drop counters and available `iw station dump` signal, retry, failure and bitrate fields. A dedicated worker samples every ten seconds with a two-second query deadline; absent/unsupported iw statistics are explicitly unavailable. These do not prove radio loss by themselves.
+- Android `UDP tunnel stats`: per-port incoming counts/gaps, maximum local forwarding duration, send errors, global dispatch queue depth and cumulative refused-frame count. Five-second reports continue when a registered socket is idle.
+- Native `[audio-perf]`: per-stream receive counts/gaps, idle time, maximum processing duration and cumulative drops. Processing includes decryption and seam forwarding; a slow value needs further separation before attributing it to one operation.
+- Player `audio-perf`: tagged-seam arrival gaps, read wait and decode/AudioTrack-write duration. Player reports are emitted when frames arrive, so a long stalled read reports its duration on resumption.
+
+Compare local elapsed times and matching ports/IDs; adapter and Android wall clocks are not synchronized enough for cross-device one-way timing. Idle/static video alone is not proof of a stall. Update `ocbmd` plus the main APK with rebuilt JNI libraries for this instrumentation; no supervisor or btd update is needed.

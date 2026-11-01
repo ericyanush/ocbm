@@ -3032,7 +3032,17 @@ fn spawn_audio(
         // packet-rate audio case, so this removes the one remaining audio-lane alloc there.
         let mut framed_buf: Vec<u8> = Vec::new();
         let mut first_packet = true;
+        let mut perf_since = Instant::now();
+        let mut perf_last_rx: Option<Instant> = None;
+        let mut perf_processing: Option<Instant> = None;
+        let (mut perf_packets, mut perf_bytes) = (0u64, 0u64);
+        let (mut perf_gap_us, mut perf_process_us) = (0u128, 0u128);
         loop {
+            if let Some(start) = perf_processing.take() { perf_process_us = perf_process_us.max(start.elapsed().as_micros()); }
+            if perf_since.elapsed() >= Duration::from_secs(5) {
+                eprintln!("[audio-perf] stream_type={stream_type} local={:?} interval_ms={} packets={perf_packets} bytes={perf_bytes} max_gap_us={perf_gap_us} max_process_us={perf_process_us} idle_ms={} drops={drops}", sock.local_addr(), perf_since.elapsed().as_millis(), perf_last_rx.map(|t| t.elapsed().as_millis()).unwrap_or(0));
+                perf_since = Instant::now(); perf_packets=0; perf_bytes=0; perf_gap_us=0; perf_process_us=0;
+            }
             let (n, peer) = match sock.recv_from(&mut buf) {
                 Ok(x) => x,
                 Err(ref e) if is_timeout(e) => {
@@ -3043,6 +3053,10 @@ fn spawn_audio(
                 }
                 Err(_) => break,
             };
+            let received_at = Instant::now();
+            if let Some(last) = perf_last_rx { perf_gap_us = perf_gap_us.max(received_at.duration_since(last).as_micros()); }
+            perf_last_rx = Some(received_at); perf_processing = Some(received_at);
+            perf_packets += 1; perf_bytes += n as u64;
             if first_packet {
                 eprintln!("[native-diag] audio first UDP local={:?} peer={peer} bytes={n} stream_type={stream_type}", sock.local_addr());
                 first_packet = false;

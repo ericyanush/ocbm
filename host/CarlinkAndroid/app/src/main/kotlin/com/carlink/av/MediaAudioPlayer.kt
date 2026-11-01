@@ -215,11 +215,30 @@ class MediaAudioPlayer(
         consumeStarted = true
         runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) }
         val hdr = ByteArray(VoiceTag.LEN)
+        var perfSince = System.nanoTime()
+        var lastArrival = 0L
+        var packets = 0L
+        var maxGapUs = 0L
+        var maxReadUs = 0L
+        var maxHandleUs = 0L
         try {
             while (running.get()) {
+                val readBegan = System.nanoTime()
                 val (fmt, au) = readTaggedFrame(ins, hdr, log) ?: break
+                val arrived = System.nanoTime()
+                maxReadUs = maxOf(maxReadUs, (arrived-readBegan)/1000)
+                if (lastArrival != 0L) maxGapUs = maxOf(maxGapUs, (arrived-lastArrival)/1000)
+                lastArrival = arrived
+                packets++
                 bytesIn.addAndGet((VoiceTag.LEN + au.size).toLong())
                 if (au.isNotEmpty()) handle(fmt, au)
+                val done = System.nanoTime()
+                maxHandleUs = maxOf(maxHandleUs, (done-arrived)/1000)
+                if (done-perfSince >= 5_000_000_000L) {
+                    log.i("audio-perf intervalMs=${(done-perfSince)/1_000_000} packets=$packets " +
+                        "maxArrivalGapUs=$maxGapUs maxSeamReadUs=$maxReadUs maxDecodeWriteUs=$maxHandleUs bytes=${bytesIn.get()}")
+                    perfSince=done; packets=0; maxGapUs=0; maxReadUs=0; maxHandleUs=0
+                }
             }
         } finally {
             // No catch: OcbmAvLanes.runConsumer logs a dying consumer; this only has to release.
