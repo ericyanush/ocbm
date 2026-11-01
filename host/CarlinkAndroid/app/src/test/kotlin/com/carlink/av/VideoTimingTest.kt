@@ -19,7 +19,7 @@ class VideoTimingTest {
         assertNull(timing.report())
         now += 5_000_000_000L
         val report = requireNotNull(timing.report())
-        assertTrue(report.contains("maxDecodeUs=2000"))
+        assertTrue(report.contains("maxOutputReleaseUs=2000"))
         assertTrue(report.contains("maxPresentationUs=5000"))
         assertTrue(report.contains("maxArrivalToRenderUs=8000"))
         assertTrue(report.contains("maxCallbackLagUs=3000"))
@@ -44,4 +44,20 @@ class VideoTimingTest {
         assertTrue(clean.contains("evicted=0"))
         assertTrue(clean.contains("unmatched=0"))
     }
+    @Test
+    fun vendorTimestampBeforeOutputReleaseIsFlaggedNotReportedAsZeroLatency() {
+        var now = 1_000_000_000L
+        val timing = VideoTiming { now }
+        timing.arrived(now, 100)
+        timing.queued(10, now)
+        now += 10_000_000
+        timing.released(10)
+        now += 10_000_000
+        timing.rendered(10, now - 15_000_000)
+        now += 6_000_000_000
+        val report = requireNotNull(timing.report())
+        assertTrue(report.contains("timestampAnomalies=1"))
+        assertTrue(report.contains("validPresentations=0"))
+    }
+
 }

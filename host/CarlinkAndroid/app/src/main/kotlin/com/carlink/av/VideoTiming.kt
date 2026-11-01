@@ -15,10 +15,13 @@ internal class VideoTiming(private val clockNs: () -> Long = System::nanoTime) {
     private var unmatched = 0L
     private var maxArrivalGapUs = 0L
     private var maxRenderedGapUs = 0L
-    private var maxDecodeUs = 0L
+    private var maxOutputReleaseUs = 0L
     private var maxPresentationUs = 0L
     private var maxArrivalToRenderUs = 0L
     private var maxCallbackLagUs = 0L
+    private var maxInputQueueAgeUs = 0L
+    private var timestampAnomalies = 0L
+    private var validPresentations = 0L
 
     @Synchronized fun reset() {
         frames.clear()
@@ -31,6 +34,10 @@ internal class VideoTiming(private val clockNs: () -> Long = System::nanoTime) {
         lastArrival = now; messages++; bytes += size; maxMessageBytes = maxOf(maxMessageBytes, size)
     }
 
+    @Synchronized fun inputDequeued(arrivalNs: Long) {
+        maxInputQueueAgeUs = maxOf(maxInputQueueAgeUs, (clockNs()-arrivalNs).coerceAtLeast(0)/1000)
+    }
+
     @Synchronized fun queued(ptsUs: Long, arrivalNs: Long) {
         if (frames.size >= 256) { frames.remove(frames.keys.first()); evicted++ }
         frames[ptsUs] = Frame(arrivalNs, clockNs())
@@ -39,7 +46,7 @@ internal class VideoTiming(private val clockNs: () -> Long = System::nanoTime) {
     @Synchronized fun released(ptsUs: Long) {
         val frame = frames[ptsUs] ?: return
         frame.releasedNs = clockNs()
-        maxDecodeUs = maxOf(maxDecodeUs, (frame.releasedNs-frame.queuedNs).coerceAtLeast(0)/1000)
+        maxOutputReleaseUs = maxOf(maxOutputReleaseUs, (frame.releasedNs-frame.queuedNs).coerceAtLeast(0)/1000)
     }
 
     @Synchronized fun rendered(ptsUs: Long, renderedNs: Long) {
@@ -47,11 +54,17 @@ internal class VideoTiming(private val clockNs: () -> Long = System::nanoTime) {
         presentations++
         if (lastRendered != 0L) maxRenderedGapUs = maxOf(maxRenderedGapUs, (renderedNs-lastRendered).coerceAtLeast(0)/1000)
         lastRendered = maxOf(lastRendered, renderedNs)
-        maxCallbackLagUs = maxOf(maxCallbackLagUs, (now-renderedNs).coerceAtLeast(0)/1000)
+        if (renderedNs <= now) maxCallbackLagUs = maxOf(maxCallbackLagUs, (now-renderedNs)/1000)
+        else timestampAnomalies++
         val frame = frames.remove(ptsUs)
         if (frame == null) { unmatched++; return }
-        if (frame.releasedNs != 0L) maxPresentationUs = maxOf(maxPresentationUs, (renderedNs-frame.releasedNs).coerceAtLeast(0)/1000)
-        maxArrivalToRenderUs = maxOf(maxArrivalToRenderUs, (renderedNs-frame.arrivalNs).coerceAtLeast(0)/1000)
+        if (frame.releasedNs == 0L || renderedNs < frame.releasedNs || renderedNs < frame.arrivalNs || renderedNs > now) {
+            timestampAnomalies++
+            return
+        }
+        validPresentations++
+        maxPresentationUs = maxOf(maxPresentationUs, (renderedNs-frame.releasedNs)/1000)
+        maxArrivalToRenderUs = maxOf(maxArrivalToRenderUs, (renderedNs-frame.arrivalNs)/1000)
     }
 
     @Synchronized fun report(): String? {
@@ -60,8 +73,9 @@ internal class VideoTiming(private val clockNs: () -> Long = System::nanoTime) {
         val oldestAgeUs = frames.values.minOfOrNull { it.queuedNs }?.let { (now-it)/1000 } ?: 0
         val line = "video-timing intervalMs=${(now-since)/1_000_000} messages=$messages bytes=$bytes " +
             "maxMessageBytes=$maxMessageBytes maxArrivalGapUs=$maxArrivalGapUs presentations=$presentations " +
-            "maxRenderedGapUs=$maxRenderedGapUs maxDecodeUs=$maxDecodeUs maxPresentationUs=$maxPresentationUs " +
+            "maxRenderedGapUs=$maxRenderedGapUs maxOutputReleaseUs=$maxOutputReleaseUs maxPresentationUs=$maxPresentationUs " +
             "maxArrivalToRenderUs=$maxArrivalToRenderUs maxCallbackLagUs=$maxCallbackLagUs " +
+            "maxInputQueueAgeUs=$maxInputQueueAgeUs validPresentations=$validPresentations timestampAnomalies=$timestampAnomalies " +
             "inflight=${frames.size} oldestInflightUs=$oldestAgeUs evicted=$evicted unmatched=$unmatched"
         resetInterval(now)
         return line
@@ -69,6 +83,7 @@ internal class VideoTiming(private val clockNs: () -> Long = System::nanoTime) {
 
     private fun resetInterval(now: Long) {
         since=now; messages=0; bytes=0; maxMessageBytes=0; presentations=0; evicted=0; unmatched=0
-        maxArrivalGapUs=0; maxRenderedGapUs=0; maxDecodeUs=0; maxPresentationUs=0; maxArrivalToRenderUs=0; maxCallbackLagUs=0
+        maxArrivalGapUs=0; maxRenderedGapUs=0; maxOutputReleaseUs=0; maxPresentationUs=0; maxArrivalToRenderUs=0; maxCallbackLagUs=0
+        maxInputQueueAgeUs=0; timestampAnomalies=0; validPresentations=0
     }
 }

@@ -33,7 +33,8 @@ import java.util.concurrent.atomic.AtomicLong
  * exactly that: it is message-framed `[u32 BE len][payload]` with one message per screen message.
  *
  * **Threading contract.** [consume] owns the codec for its whole life: it configures, feeds, drains and
- * releases on its own thread. [stop] only flips the flag — it never touches the codec, because
+ * releases on its own thread. A bounded reader feeds it complete seam messages, so it can
+ * service decoder output every 8 ms even when the phone sends no new input. [stop] only flips the flag — it never touches the codec, because
  * MediaCodec lifecycle calls racing a dequeue crash natively.
  */
 class VideoRenderer(
@@ -89,7 +90,7 @@ class VideoRenderer(
         // Match the seam's max message: a seam-legal AU in (old 2 MB, 8 MB] — most dangerously the IDR
         // itself — was silently dropped, and dropping the replacement keyframe stalls video entirely.
         const val MAX_INPUT_SIZE = MAX_SEAM_MESSAGE
-        const val INPUT_DEQUEUE_US = 100_000L
+        const val INPUT_DEQUEUE_US = 5_000L
         const val LOG_EVERY_FRAMES = 300L
     }
 
@@ -162,22 +163,32 @@ class VideoRenderer(
         phase = "reading-seam"
         log.i("consumer entered thread=${Thread.currentThread().name}; ${diagnosticState()}")
         val hdr = ByteArray(4)
+        val input = VideoInputPump(ins) { readSeamMessage(ins, hdr, log) }
+        log.i("output servicing independent of seam input; idleDrainMs=8 inputQueue=1")
         try {
-            while (running.get()) {
-                val msg = readSeamMessage(ins, hdr, log) ?: break
-                lastSeamArrivalNs = System.nanoTime()
-                videoTiming.arrived(lastSeamArrivalNs, msg.size)
-                bytesIn.addAndGet((msg.size + 4).toLong())
-                // A 0-length message is NOT a desync: forward_screen is called unconditionally with
-                // whatever the conversion produced, and an empty VideoConfig is exactly what this head
-                // unit emitted before the sample-description fix.
-                if (msg.isNotEmpty()) handleMessage(msg)
-            }
+            input.consume(
+                running = { running.get() },
+                output = {
+                    codec?.let { c ->
+                        try { drain(c) } catch (e: IllegalStateException) { codecFailed(e) }
+                    }
+                    videoTiming.report()?.let(log::i)
+                },
+                onFrame = { frame ->
+                    lastSeamArrivalNs = frame.arrivedNs
+                    videoTiming.arrived(lastSeamArrivalNs, frame.bytes.size)
+                    videoTiming.inputDequeued(frame.arrivedNs)
+                    bytesIn.addAndGet((frame.bytes.size + 4).toLong())
+                    if (frame.bytes.isNotEmpty()) handleMessage(frame.bytes)
+                },
+                waitMs = { if (codec != null) 8 else 100 },
+            )
         } catch (t: Throwable) {
             phase = "consumer-threw-${t.javaClass.simpleName}"
             log.e("video consumer threw ${t.javaClass.name}: ${t.message}\n${android.util.Log.getStackTraceString(t)}; ${diagnosticState()}")
             throw t
         } finally {
+            input.close()
             phase = "releasing-codec"
             releaseCodec()
             phase = "ended"
@@ -367,14 +378,7 @@ class VideoRenderer(
             c.queueInputBuffer(idx, 0, auBytes.size, ptsUs, 0)
             drain(c)
         } catch (e: IllegalStateException) {
-            // Recover from a codec that threw mid-stream (CodecException is an ISE). Deliberately
-            // does NOT clear configureFailedAt: clearing it meant a codec that threw on every access
-            // unit rebuilt at frame rate — the codec-pool drain the backoff exists to prevent.
-            log.e("codec in error state: ${e.message} — resetting")
-            releaseCodec()
-            sawKeyframe = false
-            configureFailedAt = SystemClock.elapsedRealtime()
-            requestKeyframe()
+            codecFailed(e)
         } finally {
             perfFeedUs += (System.nanoTime() - feedStartedNs) / 1000
             perfInputCount++
@@ -395,16 +399,19 @@ class VideoRenderer(
         }
     }
 
+    private fun codecFailed(e: IllegalStateException) {
+        log.e("codec in error state: ${e.message} — resetting")
+        releaseCodec()
+        sawKeyframe = false
+        configureFailedAt = SystemClock.elapsedRealtime()
+        requestKeyframe()
+    }
+
     private fun drain(c: MediaCodec) {
         val info = MediaCodec.BufferInfo()
         var more = true
         while (more) {
-            val outIdx =
-                try {
-                    c.dequeueOutputBuffer(info, 0)
-                } catch (_: IllegalStateException) {
-                    return
-                }
+            val outIdx = c.dequeueOutputBuffer(info, 0)
             when {
                 outIdx >= 0 -> {
                     // render only a real frame; render=true hands it to the Surface with no CPU copy
