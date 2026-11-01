@@ -59,7 +59,7 @@ impl TunnelBroker {
     pub fn take_metrics(&self) -> Option<String> {
         let mut t = self.timing.lock().unwrap();
         if t.since.elapsed() < Duration::from_secs(5) { return None; }
-        let line = format!("[tunnel-perf] implementation=tunnel-wake-v2 events={} bytes={} interval_ms={} max_event_age_us={}", t.count, t.bytes, t.since.elapsed().as_millis(), t.max_age_us);
+        let line = format!("[tunnel-perf] implementation=tunnel-wake-v3 events={} bytes={} interval_ms={} max_event_age_us={}", t.count, t.bytes, t.since.elapsed().as_millis(), t.max_age_us);
         *t = EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 };
         Some(line)
     }

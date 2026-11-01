@@ -14,6 +14,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 mod tunnel;
+mod accessory_reader;
 
 const ACC_DEV: &str = "/dev/usb_accessory";
 
@@ -38,6 +39,7 @@ const RTSP_INGEST_ADDR: &str = "127.0.0.1:9106";
 #[derive(Clone, Copy)]
 enum Kind {
     TunnelWake,
+    AccessoryReadWake,
     Acc,
     Pty,
     Conn(u16),
@@ -56,7 +58,10 @@ struct LoopTiming {
 impl LoopTiming {
     fn new() -> Self { Self { since: Instant::now(), stages: Default::default() } }
     fn record(&mut self, stage: &'static str, began: Instant) {
-        let us = began.elapsed().as_micros();
+        self.record_duration(stage, began.elapsed());
+    }
+    fn record_duration(&mut self, stage: &'static str, elapsed: Duration) {
+        let us = elapsed.as_micros();
         let entry = self.stages.entry(stage).or_default();
         entry.0 += 1; entry.1 += us; entry.2 = entry.2.max(us);
     }
@@ -4149,7 +4154,7 @@ impl Daemon {
                     self.log.cap = cap_kb as u64 * 1024; // 0 => LogTail::cap_bytes' default
                     self.log.enabled = enable;
                     if enable {
-                        self.log_internal("[tunnel-perf] implementation=tunnel-wake-v2 poll_wakeup=socketpair tcp_nodelay=true metrics=CH_LOG");
+                        self.log_internal("[tunnel-perf] implementation=tunnel-wake-v3 poll_wakeup=socketpair tcp_nodelay=true accessory_reader=threaded metrics=CH_LOG");
                     }
                     // Fire on the very next tick rather than up to LOG_TICK later, the same
                     // `last_*_check = None` trick the phone/box-health mirrors use on SUBSCRIBE.
@@ -4446,7 +4451,9 @@ fn main() {
         last_health_log: None,
     };
     let mut reasm = p::Reassembler::new();
-    let mut rbuf = vec![0u8; p::HDR_LEN + p::MAX_PAYLOAD];
+    let accessory_reader = accessory_reader::AccessoryReader::start(
+        d.acc.try_clone().expect("duplicate accessory descriptor"), p::HDR_LEN + p::MAX_PAYLOAD,
+    ).expect("start accessory reader");
     let mut plbuf = vec![0u8; p::MAX_PAYLOAD];
     // Hoisted out of the Kind::Conn / Kind::AvConn dispatch arms (perf): each declared a fresh
     // ~64 KiB stack array, whose zero-init on EVERY readable wake wipes the Cortex-A7's whole L1D.
@@ -4485,6 +4492,61 @@ fn main() {
     let mut loop_timing = LoopTiming::new();
     loop {
         let loop_started = Instant::now();
+        accessory_reader.clear_wake();
+        let mut read_batch_full = true;
+        for _ in 0..32 {
+            let Some(event) = accessory_reader.next() else { read_batch_full = false; break; };
+            loop_timing.record_duration("accessory_driver_read", event.read_duration);
+            loop_timing.record("accessory_queue_age", event.completed);
+            match event.result {
+                Ok(ref bytes) if bytes.is_empty() => {
+                    eprintln!(
+                        "[ocbmd] accessory EOF on read — USB transport gone; exiting for respawn"
+                    );
+                    clear_session_state_for_exit();
+                    std::process::exit(1);
+                }
+                Ok(bytes) => {
+                    let reassembly_started = Instant::now();
+                    reasm.push(&bytes);
+                    loop_timing.record("reassembly_push", reassembly_started);
+                    while let Some((ch, flags, len)) = reasm.next(&mut plbuf) {
+                        if ch == p::CH_CTRL && plbuf.first() == Some(&p::CT_HELLO) {
+                            // This is intentionally recorded at the runtime framing boundary,
+                            // not Dispatcher::handle: unit tests exercise that method and
+                            // must not mutate the adapter's /tmp state.
+                            #[cfg(not(test))]
+                            write_flag_atomic(USB_HELLO_SEEN_FLAG, true);
+                        }
+                        let handle_started = Instant::now();
+                        d.handle(ch, flags, &plbuf[..len]); // no per-frame copy
+                        loop_timing.record(match ch {
+                            p::CH_CTRL => "handle_ctrl", p::CH_TUNNEL => "handle_tunnel",
+                            p::CH_MFI => "handle_mfi", p::CH_INPUT => "handle_input",
+                            p::CH_MIC => "handle_mic", p::CH_RTSP => "handle_rtsp",
+                            p::CH_FILE => "handle_file", p::CH_IP => "handle_ip",
+                            _ => "handle_other",
+                        }, handle_started);
+                    }
+                }
+                // Spurious wake, or a signal-interrupted read. ocbmd installs no signal
+                // handlers today so EINTR is not expected, but treating it as transport death
+                // would be plainly wrong if that ever changes — retry on the next pass instead.
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[ocbmd] accessory read error ({e}) — USB transport gone; exiting for respawn"
+                    );
+                    clear_session_state_for_exit();
+                    std::process::exit(1);
+                }
+            }
+
+        }
         let broker_started = Instant::now();
         let tunnel_events: Vec<Vec<u8>> = d.tunnel.as_ref().map(|tunnel| {
             tunnel.clear_wake();
@@ -4509,13 +4571,15 @@ fn main() {
             || !d.out_tunnel.is_empty();
         fds.clear();
         kinds.clear();
-        let acc_ev = libc::POLLIN | if want_out { libc::POLLOUT } else { 0 };
-        fds.push(libc::pollfd {
-            fd: d.acc.as_raw_fd(),
-            events: acc_ev,
-            revents: 0,
-        });
-        kinds.push(Kind::Acc);
+        // Never poll accessory POLLIN here: some gadget drivers report readiness then block
+        // read() for seconds despite O_NONBLOCK. Only the dedicated reader touches read().
+        fds.push(libc::pollfd { fd: accessory_reader.wake_fd(), events: libc::POLLIN, revents: 0 });
+        kinds.push(Kind::AccessoryReadWake);
+        let acc_ev = if want_out { libc::POLLOUT } else { 0 };
+        if want_out {
+            fds.push(libc::pollfd { fd: d.acc.as_raw_fd(), events: acc_ev, revents: 0 });
+            kinds.push(Kind::Acc);
+        }
         if let Some(ptm) = d.ptm.as_ref() {
             fds.push(libc::pollfd {
                 fd: ptm.as_raw_fd(),
@@ -4597,7 +4661,7 @@ fn main() {
             kinds.push(Kind::TunnelWake);
         }
         // A bounded batch may leave queued events after clearing its wake notifications.
-        let timeout_ms = if tunnel_batch_full { 0 } else if d.subscribed || d.rearm_deadline.is_some() {
+        let timeout_ms = if tunnel_batch_full || read_batch_full { 0 } else if d.subscribed || d.rearm_deadline.is_some() {
             500
         } else {
             LOG_IDLE_POLL_MS
@@ -4632,6 +4696,7 @@ fn main() {
                 if re & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
                     match kinds[i] {
                         Kind::TunnelWake => {},
+                        Kind::AccessoryReadWake => {},
                         Kind::Pty => d.ptm = None, // console shell exited → drop the master pty
                         Kind::Eth => {
                             if let Some(fd) = d.eth.take() {
@@ -4664,66 +4729,8 @@ fn main() {
             let fd_started = Instant::now();
             match kinds[i] {
                         Kind::TunnelWake => {},
-                Kind::Acc => {
-                    // QC 2026-07-25: the POLLHUP busy-spin guard above only fires when POLLIN is
-                    // CLEAR. Many drivers assert POLLIN alongside POLLERR/POLLHUP on teardown (to
-                    // unblock readers), and in that case dispatch lands here instead — where the old
-                    // `unwrap_or(0)` mapped BOTH a persistent EIO and a genuine EOF to "no data": no
-                    // progress, no exit, and poll returns instantly forever. That is the exact 100%-CPU
-                    // wedge the guard above exists to prevent, on the one fd that matters most.
-                    // Treat Ok(0) (EOF) and any non-WouldBlock error as transport death, taking the
-                    // same exit-for-respawn path.
-                    let read_started = Instant::now();
-                    let read_result = d.acc.read(&mut rbuf);
-                    loop_timing.record("accessory_read", read_started);
-                    match read_result {
-                        Ok(0) => {
-                            eprintln!(
-                                "[ocbmd] accessory EOF on read — USB transport gone; exiting for respawn"
-                            );
-                            clear_session_state_for_exit();
-                            std::process::exit(1);
-                        }
-                        Ok(n) => {
-                            let reassembly_started = Instant::now();
-                            reasm.push(&rbuf[..n]);
-                            loop_timing.record("reassembly_push", reassembly_started);
-                            while let Some((ch, flags, len)) = reasm.next(&mut plbuf) {
-                                if ch == p::CH_CTRL && plbuf.first() == Some(&p::CT_HELLO) {
-                                    // This is intentionally recorded at the runtime framing boundary,
-                                    // not Dispatcher::handle: unit tests exercise that method and
-                                    // must not mutate the adapter's /tmp state.
-                                    #[cfg(not(test))]
-                                    write_flag_atomic(USB_HELLO_SEEN_FLAG, true);
-                                }
-                                let handle_started = Instant::now();
-                                d.handle(ch, flags, &plbuf[..len]); // no per-frame copy
-                                loop_timing.record(match ch {
-                                    p::CH_CTRL => "handle_ctrl", p::CH_TUNNEL => "handle_tunnel",
-                                    p::CH_MFI => "handle_mfi", p::CH_INPUT => "handle_input",
-                                    p::CH_MIC => "handle_mic", p::CH_RTSP => "handle_rtsp",
-                                    p::CH_FILE => "handle_file", p::CH_IP => "handle_ip",
-                                    _ => "handle_other",
-                                }, handle_started);
-                            }
-                        }
-                        // Spurious wake, or a signal-interrupted read. ocbmd installs no signal
-                        // handlers today so EINTR is not expected, but treating it as transport death
-                        // would be plainly wrong if that ever changes — retry on the next pass instead.
-                        Err(ref e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                            ) => {}
-                        Err(e) => {
-                            eprintln!(
-                                "[ocbmd] accessory read error ({e}) — USB transport gone; exiting for respawn"
-                            );
-                            clear_session_state_for_exit();
-                            std::process::exit(1);
-                        }
-                    }
-                }
+                Kind::Acc => {}, // writable accessory; output is drained after dispatch
+                Kind::AccessoryReadWake => {}, // queued reads are processed at the next loop head
                 Kind::Pty => {
                     let mut t = [0u8; 4096];
                     // WouldBlock-aware (audit #5): the master is now O_NONBLOCK, so a spurious POLLIN wake
@@ -4877,7 +4884,7 @@ fn main() {
             loop_timing.record(match kinds[i] {
                 Kind::Acc => "usb_dispatch", Kind::Pty => "console", Kind::Conn(_) => "ip_socket",
                 Kind::Eth => "ethernet", Kind::Mic => "mic_socket", Kind::Rtsp => "rtsp_socket",
-                Kind::AvListen(_) => "av_accept", Kind::AvConn(_) => "av_read", Kind::TunnelWake => "tunnel_wake",
+                Kind::AvListen(_) => "av_accept", Kind::AvConn(_) => "av_read", Kind::TunnelWake => "tunnel_wake", Kind::AccessoryReadWake => "accessory_wake",
             }, fd_started);
         }
         loop_timing.record("dispatch", dispatch_started);
