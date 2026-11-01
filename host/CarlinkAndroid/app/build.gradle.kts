@@ -89,8 +89,8 @@ android {
         minSdk = 32 // GM gminfo = Android 12L / API 32
         targetSdk = 36
         // Carlink's last published build is 187 / 1.2.2. Increment for this Play update.
-        versionCode = 188
-        versionName = "1.2.3-ocbm"
+        versionCode = 272
+        versionName = "1.4.62"
 
 // ###############################################
 // ###############################################
