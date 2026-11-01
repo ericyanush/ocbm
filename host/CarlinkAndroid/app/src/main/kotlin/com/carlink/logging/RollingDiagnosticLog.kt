@@ -133,6 +133,26 @@ class RollingDiagnosticLog private constructor(
         }
     }
 
+    /** Persist a system-provided native-crash/ANR trace as a binary diagnostic artifact. */
+    fun appendProcessExitTrace(
+        pid: Int,
+        reason: String,
+        timestampMs: Long,
+        trace: ByteArray,
+    ): File? = lock.withLock {
+        runCatching {
+            val file = File(logsDir, "process_exit_trace_${pid}_${timestampMs}.pb")
+            FileOutputStream(file, false).use { output ->
+                output.write(trace)
+                output.fd.sync()
+            }
+            pruneLocked()
+            file
+        }.onFailure { error ->
+            Log.e("CARLINK", "[CRASH_LOG] Failed to persist native tombstone", error)
+        }.getOrNull()
+    }
+
     private fun enqueue(line: String) {
         if (!enabled.get()) return
         // Bound memory in case a faulty hot path floods diagnostics faster than storage can flush.
@@ -145,7 +165,7 @@ class RollingDiagnosticLog private constructor(
 
     fun files(): List<File> =
         logsDir
-            .listFiles { file -> file.isFile && (file.name.endsWith(".log") || file.name.endsWith(".txt")) }
+            .listFiles { file -> file.isFile && (file.name.endsWith(".log") || file.name.endsWith(".txt") || file.name.endsWith(".pb")) }
             ?.sortedByDescending(File::lastModified) ?: emptyList()
 
     fun totalBytes(): Long = files().sumOf(File::length)
