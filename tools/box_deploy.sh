@@ -18,11 +18,13 @@
 # through telnet/base64 or a backgrounded `nc` listener; earlier `nc` transfers truncated large files.
 #
 # USAGE
-#   tools/box_deploy.sh [--host SSH_DEST] [--identity KEY] [--return] [--dry-run] SRC:DEST[:MODE] [...]
+#   tools/box_deploy.sh [--host SSH_DEST] [--identity KEY] [--vid HEX] [--pid HEX] [--return] [--dry-run] SRC:DEST[:MODE] [...]
 #   tools/box_deploy.sh [--host SSH_DEST] --return-only # NCM back into accessory mode
 #
 #   --host        SSH destination; default: root@192.168.50.2 (bare hosts also use root)
 #   --identity    SSH private-key path; defaults to ~/.ssh/id_ccpa_ncm when present
+#   --vid         USB vendor ID in hexadecimal, with or without 0x; default: 1314
+#   --pid         USB product ID in hexadecimal, with or without 0x; default: 2d00
 #   --return      after installing, clear /script/ncm_only and reboot back to OCBM, then wait for USB
 #   --dry-run     resolve mode + verify reachability + print the plan; transfer nothing
 #   MODE          octal chmod, default 755
@@ -69,6 +71,18 @@ while [ $# -gt 0 ]; do
       SSH_IDENTITY="$2"
       shift
       ;;
+    --vid)
+      [ $# -ge 2 ] || { echo "ERROR: --vid requires a hexadecimal USB vendor ID" >&2; exit 2; }
+      VID="$2"
+      shift
+      ;;
+    --pid)
+      [ $# -ge 2 ] || { echo "ERROR: --pid requires a hexadecimal USB product ID" >&2; exit 2; }
+      PID="$2"
+      shift
+      ;;
+    --vid=*) VID="${1#*=}" ;;
+    --pid=*) PID="${1#*=}" ;;
     --return)      RETURN=1 ;;
     --dry-run)     DRYRUN=1 ;;
     --return-only) RETURN_ONLY=1; RETURN=1 ;;
@@ -80,6 +94,13 @@ done
 
 say()  { printf '[deploy] %s\n' "$*"; }
 die()  { printf '[deploy] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Normalize IDs once: ocbm-host takes hexadecimal text; ioreg reports decimal values.
+VID="${VID#0x}"; VID="${VID#0X}"
+PID="${PID#0x}"; PID="${PID#0X}"
+[[ "$VID" =~ ^[[:xdigit:]]{1,4}$ ]] || die "invalid --vid '$VID' (expected 1-4 hexadecimal digits)"
+[[ "$PID" =~ ^[[:xdigit:]]{1,4}$ ]] || die "invalid --pid '$PID' (expected 1-4 hexadecimal digits)"
+VID_DEC=$((16#$VID)); PID_DEC=$((16#$PID))
 
 # Do not inherit the Mac login name when --host supplies just an IP or hostname.
 case "$BOX_SSH" in *@*) ;; *) BOX_SSH="root@$BOX_SSH" ;; esac
@@ -100,7 +121,14 @@ ssh_ok()  { ssh_box true >/dev/null; }
 # ioreg, not `system_profiler SPUSBDataType` — the latter returns an empty document on this Mac, so a
 # poll built on it spins the full timeout and reports "no adapter" with one plugged in. Same reasoning
 # as tools/ocbm_push.sh.
-usb_ok()  { ioreg -p IOUSB -w0 -l 2>/dev/null | grep -qi "idProduct.*$((16#$PID))"; }
+usb_ok()  {
+  ioreg -p IOUSB -w0 -l 2>/dev/null | awk -v want_vid="$VID_DEC" -v want_pid="$PID_DEC" '
+    /\+-o / { if (vid == want_vid && pid == want_pid) found = 1; vid = ""; pid = "" }
+    /"idVendor"[[:space:]]*=/ { vid = $NF }
+    /"idProduct"[[:space:]]*=/ { pid = $NF }
+    END { if (vid == want_vid && pid == want_pid) found = 1; exit !found }
+  '
+}
 
 wait_for() { # wait_for <predicate-fn> <seconds> <label>
   local fn="$1" limit="$2" label="$3" waited=0
