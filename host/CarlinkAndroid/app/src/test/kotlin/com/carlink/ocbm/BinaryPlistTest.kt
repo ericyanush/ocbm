@@ -15,6 +15,31 @@ import java.io.File
  * risk with a hand-rolled decoder for someone else's wire format.
  */
 class BinaryPlistTest {
+    @Test
+    fun `Blazer display and both HID contacts share detected geometry`() {
+        var dir = File(System.getProperty("user.dir"))
+        while (dir.parentFile != null && !File(dir, "host/gm_ccpa/netprobe_app/app/src/main/assets/info.bplist").isFile) dir = dir.parentFile
+        val source = File(dir, "host/gm_ccpa/netprobe_app/app/src/main/assets/info.bplist").readBytes()
+        val geometry = com.carlink.util.PanelGeometry(2914, 1134, 60, PixelRect(0, 168, 2628, 966), 200, 15.6, "test", true)
+        val info = BinaryPlist.parseDict(CarPlayInfoCustomizer.withGeometry(source, geometry))!!
+        val display = (info["displays"] as List<*>).first() as Map<*, *>
+        assertEquals(2914L, display["widthPixels"])
+        assertEquals(1134L, display["heightPixels"])
+        val areas = display["viewAreas"] as List<*>
+        val safe = (areas.first() as Map<*, *>)["safeArea"] as Map<*, *>
+        assertEquals(168L, safe["originYPixels"])
+        assertEquals(2628L, safe["widthPixels"])
+        assertEquals(966L, safe["heightPixels"])
+        val original = BinaryPlist.parseDict(source)!!
+        assertEquals(((original["displays"] as List<*>).first() as Map<*, *>)["viewAreas"].let { (it as List<*>)[1] }, areas[1])
+        val hid = ((info["hidDevices"] as List<*>).first() as Map<*, *>)["hidDescriptor"] as ByteArray
+        for ((usage, maximum) in listOf(0x30 to 2914, 0x31 to 1134)) {
+            val values = (0 until hid.size - 6).filter { hid[it] == 0x09.toByte() && hid[it+1] == usage.toByte() && hid[it+4] == 0x26.toByte() }
+                .map { (hid[it+5].toInt() and 255) or ((hid[it+6].toInt() and 255) shl 8) }
+            assertEquals(listOf(maximum, maximum), values)
+        }
+    }
+
     private fun hex(s: String): ByteArray =
         ByteArray(s.length / 2) {
             ((Character.digit(s[it * 2], 16) shl 4) or Character.digit(s[it * 2 + 1], 16)).toByte()

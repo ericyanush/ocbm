@@ -1566,7 +1566,11 @@ class CarlinkManager(
             mfiRelay = carPlayMfiRelay,
             peerFile = java.io.File(context.filesDir, "carplay_peers.bin").absolutePath,
             infoTransformer = { source ->
-                CarPlayInfoCustomizer.withReturnIcon(source, returnIconImages, returnIconLabel)
+                val geometry = displayProfile?.geometry ?: PanelGeometry.fromConfig(config)
+                val customized = CarPlayInfoCustomizer.withReturnIcon(source, returnIconImages, returnIconLabel)
+                CarPlayInfoCustomizer.withGeometry(customized, geometry).also {
+                    logInfo("[CP_RX] /info geometry ${geometry.describe()} HID=${geometry.width}x${geometry.height}", tag = Logger.Tags.ADAPTR)
+                }
             },
             // Diagnostic test: publish only NsdManager's gm-ccpa record, not gmccpa-rx.local.
             selfHostedMdnsEnabled = false,
