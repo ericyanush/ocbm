@@ -178,7 +178,9 @@ fun MainScreen(
             ui,
             surfaceState,
             surfaceRecreateToken,
-                Modifier.fillMaxSize(),
+            Modifier.fillMaxSize().windowInsetsPadding(
+                (profile?.surfaceInsets ?: EdgeInsets.NONE).asWindowInsets(),
+            ),
         )
         if (!ui.projecting) {
             // STREAMING is retained across a brief Surface/decoder loss. Audio and the phone's
