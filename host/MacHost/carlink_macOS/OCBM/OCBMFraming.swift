@@ -29,6 +29,7 @@ enum OCBM {
     static let chMetadata: UInt16 = 0x0023 // box->host session metadata ([u32 len][META_CMD 0x01][plist]) — Metadata window
     static let chAltVideo: UInt16 = 0x0024 // box->host ALT / navigation (cluster) screen stream — dedicated decoder
     static let chIp: UInt16 = 0x0010      // host<->box stream-mux relay (IP_OPEN/IP_DATA/IP_CLOSE by conn id); AA rides this to reach the box aa-bridge (Phase 2 prototype, pre-CH_AA)
+    static let chTunnel: UInt16 = 0x0013  // negotiated dongle Wi-Fi TCP/UDP socket broker (not the outbound-only CH_IP relay)
     static let chInput: UInt16 = 0x0030   // host->box HID input (task #20)
     // CH_IP stream-mux sub-frame types (payload = [type u8][conn_id u16 LE][data]); mirror ocbm-proto IP_*.
     static let ipOpen: UInt8 = 0x01       // data = target "host:port"; box connect()s and relays the stream

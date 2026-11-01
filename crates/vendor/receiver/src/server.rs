@@ -179,6 +179,10 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
                 );
             }
             let resp = self.handle(&req)?;
+            if self.verbose {
+                eprintln!("[receiver] response {} {} status={} body_bytes={} encrypted={}",
+                    req.method, req.path(), resp.status, resp.body.len(), encrypted);
+            }
             let bytes = resp.serialize();
             if encrypted {
                 let ch = self.channel.as_mut().expect("encrypted ⇒ channel present");

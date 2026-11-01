@@ -30,6 +30,7 @@ use pairing::verify::{Identity, PeerStore};
 use receiver::server::ControlServer;
 
 static JVM: OnceLock<JavaVM> = OnceLock::new();
+static LOG_CLASS: OnceLock<GlobalRef> = OnceLock::new();
 static IDENTITY: OnceLock<Identity> = OnceLock::new();
 
 // The one live native session, keyed by a generation token handed back to Kotlin as the `jlong`
@@ -108,14 +109,31 @@ fn redirect_stdio_to_logcat() {
                         if let Ok(c) = std::ffi::CString::new(out) {
                             android_log(&tag, &c);
                         }
+                        export_protocol_log(&String::from_utf8_lossy(&line));
                         line.clear();
                     } else {
-                        line.push(b);
+                        if line.len() < 16 * 1024 { line.push(b); }
                     }
                 }
             }
         });
     }
+}
+
+// Only protocol summaries are exported. Never forward arbitrary native payload/key dumps.
+fn export_protocol_log(line: &str) {
+    if !(line.starts_with("[native-diag]") || line.starts_with("[receiver]")) { return; }
+    let (Some(vm), Some(class)) = (JVM.get(), LOG_CLASS.get()) else { return; };
+    let Ok(mut env) = vm.attach_current_thread() else { return; };
+    let _ = env.with_local_frame(8, |env| -> jni::errors::Result<()> {
+        let message = env.new_string(line)?;
+        let class: &JClass = class.as_obj().into();
+        env.call_static_method(class, "nativeDiagnosticLog", "(Ljava/lang/String;)V",
+            &[jni::objects::JValue::Object(message.as_ref())])?;
+        Ok(())
+    });
+    // Logging failure must not poison this thread's later JNI calls or stop draining the pipe.
+    if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
 }
 
 unsafe fn android_log(tag: &std::ffi::CStr, msg: &std::ffi::CStr) {
@@ -284,6 +302,62 @@ impl MfiSigner for RemoteMfiSigner {
         }
         println!("[jni] MFi signature via OCBM relay: {} bytes", sig.len());
         Ok(sig)
+    }
+}
+
+/// Synchronous callback from receiver SETUP into the Android adapter tunnel. Registration runs
+/// while native CORE is held; the Kotlin implementation must resolve its result on an independent
+/// OCBM dispatch worker and must never call back into NativeCore.
+struct RemoteSocketRegistrar { relay: GlobalRef }
+
+impl RemoteSocketRegistrar {
+    fn call(&self, method: &str, port: u16) -> io::Result<()> {
+        let vm = JVM.get().ok_or_else(|| io::Error::other("JNI_OnLoad never ran"))?;
+        let mut env = vm.attach_current_thread().map_err(|e| io::Error::other(format!("attach: {e}")))?;
+        let result = env.call_method(&self.relay, method, "(I)Z", &[jni::objects::JValue::Int(port as i32)]);
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+            return Err(io::Error::other(format!("socket tunnel {method} threw")));
+        }
+        let ok = result.map_err(|e| io::Error::other(format!("socket tunnel {method}: {e}")))?
+            .z().map_err(|e| io::Error::other(format!("socket tunnel {method} result: {e}")))?;
+        if ok { Ok(()) } else { Err(io::Error::other(format!("socket tunnel {method} failed for {port}"))) }
+    }
+    fn close(&self, method: &str, port: u16) {
+        if let Some(vm) = JVM.get() {
+            if let Ok(mut env) = vm.attach_current_thread() {
+                let _ = env.call_method(&self.relay, method, "(I)V", &[jni::objects::JValue::Int(port as i32)]);
+                if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
+            }
+        }
+    }
+}
+
+impl receiver::session::SocketRegistrar for RemoteSocketRegistrar {
+    fn register_tcp(&self, port: u16) -> io::Result<()> { self.call("registerTcp", port) }
+    fn register_udp(&self, port: u16) -> io::Result<()> { self.call("registerUdp", port) }
+    fn unregister_tcp(&self, port: u16) { self.close("unregisterTcp", port); }
+    fn unregister_udp(&self, port: u16) { self.close("unregisterUdp", port); }
+    fn send_udp(&self, local_port: u16, peer: std::net::SocketAddr, payload: &[u8]) -> io::Result<()> {
+        let vm = JVM.get().ok_or_else(|| io::Error::other("JNI_OnLoad never ran"))?;
+        let mut env = vm.attach_current_thread().map_err(|e| io::Error::other(format!("attach: {e}")))?;
+        let address = env.new_string(peer.ip().to_string()).map_err(|e| io::Error::other(format!("peer address: {e}")))?;
+        let bytes = env.byte_array_from_slice(payload).map_err(|e| io::Error::other(format!("UDP payload: {e}")))?;
+        let values = [
+            jni::objects::JValue::Int(local_port as i32),
+            jni::objects::JValue::Object(address.as_ref()),
+            jni::objects::JValue::Int(peer.port() as i32),
+            jni::objects::JValue::Object(bytes.as_ref()),
+        ];
+        let result = env.call_method(&self.relay, "sendUdp", "(ILjava/lang/String;I[B)Z", &values);
+        if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); return Err(io::Error::other("socket tunnel sendUdp threw")); }
+        if result.map_err(|e| io::Error::other(format!("socket tunnel sendUdp: {e}")))?
+            .z().map_err(|e| io::Error::other(format!("socket tunnel sendUdp result: {e}")))? {
+            Ok(())
+        } else {
+            Err(io::Error::other("socket tunnel rejected UDP datagram"))
+        }
     }
 }
 
@@ -478,11 +552,11 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativePublicKey<'l>(
     })).unwrap_or(std::ptr::null_mut())
 }
 
-/// `nativeInit(pi, edSeed, infoPlist, peerFile, peerAddr, mfiRelay, expectedPhone) -> handle`
+/// `nativeInit(..., localBindAddress, socketRelay, phonePeerAddress) -> handle`
 #[no_mangle]
 pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
     mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
+    native_core: JObject<'l>,
     pi: JString<'l>,
     ed_seed: JByteArray<'l>,
     info_plist: JByteArray<'l>,
@@ -490,8 +564,21 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
     peer_addr: JString<'l>,
     mfi_relay: JObject<'l>,
     expected_phone: JString<'l>,
+    local_bind_address: JString<'l>,
+    socket_relay: JObject<'l>,
+    phone_peer_address: JString<'l>,
 ) -> jlong {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if LOG_CLASS.get().is_none() {
+            // NativeCore is a Kotlin `object`, but nativeInit is an instance-native method (it is
+            // not annotated @JvmStatic). JNI therefore passes NativeCore.INSTANCE here, not a
+            // jclass. Store its actual runtime class for export_protocol_log's CallStaticMethod;
+            // treating the instance pointer as jclass corrupts ART's method lookup and crashes in
+            // Primitive::Descriptor / GetStaticMethodID on the native log-drain thread.
+            let native_core_class = env.get_object_class(&native_core).map_err(|e| e.to_string())?;
+            let class_ref = env.new_global_ref(native_core_class).map_err(|e| e.to_string())?;
+            let _ = LOG_CLASS.set(class_ref);
+        }
         let pi: String = env.get_string(&pi).map_err(|e| e.to_string())?.into();
         let peer_path: String = env.get_string(&peer_file).map_err(|e| e.to_string())?.into();
         let seed_v = env.convert_byte_array(&ed_seed).map_err(|e| e.to_string())?;
@@ -502,8 +589,18 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
         seed.copy_from_slice(&seed_v);
         let info = env.convert_byte_array(&info_plist).map_err(|e| e.to_string())?;
         let relay = env.new_global_ref(mfi_relay).map_err(|e| e.to_string())?;
+        let socket_relay = if socket_relay.is_null() { None } else { Some(env.new_global_ref(socket_relay).map_err(|e| e.to_string())?) };
         let peer: String = env.get_string(&peer_addr).map_err(|e| e.to_string())?.into();
+        let phone_peer: String = env.get_string(&phone_peer_address).map_err(|e| e.to_string())?.into();
         let expected_phone: String = env.get_string(&expected_phone).map_err(|e| e.to_string())?.into();
+
+        let local_bind: String = env.get_string(&local_bind_address).map_err(|e| e.to_string())?.into();
+        let local_bind = if local_bind.is_empty() {
+            None
+        } else {
+            Some(local_bind.parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("invalid session bind address {local_bind:?}: {e}"))?)
+        };
 
         // Take the slot FIRST, bounded (see INIT_LOCK_BUDGET), before anything with a Drop side
         // effect exists. `AvSession::drop` -> `reset()` -> `events::clear()` + `clear_sinks()` act on
@@ -586,8 +683,13 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(
         let mut av = receiver::session::AvSession::new();
         av.set_expected_phone((!expected_phone.is_empty()).then_some(expected_phone));
         av.set_generation(gen);
-        match peer.parse::<std::net::SocketAddr>() {
-            Ok(a) => { av.set_peer_addr(a); println!("[jni] session peer {a}"); }
+        if let Some(addr) = local_bind { av.set_local_bind_addr(addr); }
+        if let Some(relay) = socket_relay {
+            av.set_socket_registrar(std::sync::Arc::new(RemoteSocketRegistrar { relay }));
+        }
+        let peer_for_session = if phone_peer.is_empty() { &peer } else { &phone_peer };
+        match peer_for_session.parse::<std::net::SocketAddr>() {
+            Ok(a) => { av.set_peer_addr(a); println!("[jni] session peer {a}{}", if phone_peer.is_empty() { "" } else { " (adapter tunnel peer)" }); }
             Err(e) => println!("[jni] peer addr {peer:?} unparsed ({e}) — session will use defaults"),
         }
         let server = server.session(Box::new(av));

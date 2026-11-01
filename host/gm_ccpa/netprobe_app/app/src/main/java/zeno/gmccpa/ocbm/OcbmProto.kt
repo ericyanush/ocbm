@@ -30,6 +30,8 @@ object Ocbm {
     const val CH_MFI: Int = 0x0001
     const val CH_CONSOLE: Int = 0x0002
     const val CH_IP: Int = 0x0010
+    const val CH_TUNNEL: Int = 0x0013
+    const val CH_TUNNEL: Int = 0x0013
     const val CH_FILE: Int = 0x0011
     const val CH_ETH: Int = 0x0012
     const val CH_VIDEO: Int = 0x0020
@@ -54,6 +56,7 @@ object Ocbm {
             CH_MFI -> "MFI"
             CH_CONSOLE -> "CONSOLE"
             CH_IP -> "IP"
+            CH_TUNNEL -> "TUNNEL"
             CH_FILE -> "FILE"
             CH_ETH -> "ETH"
             CH_VIDEO -> "VIDEO"

@@ -20,6 +20,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "mic-uplink-eld")]
@@ -30,6 +31,8 @@ use crate::stream::encrypt_audio_aad;
 
 /// The current uplink target (newest type-100 `input` SETUP wins). `None` when no uplink is active.
 static UPLINK: Mutex<Option<UplinkState>> = Mutex::new(None);
+
+pub type UdpSender = Arc<dyn Fn(SocketAddr, &[u8]) -> std::io::Result<()> + Send + Sync>;
 
 /// Write-halves of the connected control-in sockets (the app's `ControlClient`). The receiver pushes
 /// `uplink on <rate> <ch>` / `uplink off` back to the app so it can gate + format the mic capture on the
@@ -93,6 +96,7 @@ struct UplinkState {
     sock: UdpSocket,
     /// iPhone IP + the request's `dataPort` (the uplink receive port the iPhone advertised).
     dst: SocketAddr,
+    sender: Option<UdpSender>,
     /// The stream INPUT key (HKDF "DataStream-Input-Encryption-Key").
     key: [u8; 32],
     codec: UplinkCodec,
@@ -179,7 +183,12 @@ impl UplinkState {
         // `sent`, though, counts DELIVERIES: it feeds the "sent N packets" line, and a wrong `dst` or
         // a closed socket used to look identical there to a healthy uplink. The first error is logged
         // once so a silent uplink is diagnosable without a packet capture.
-        match self.sock.send_to(&pkt, self.dst) {
+        let sent = if let Some(sender) = &self.sender {
+            sender(self.dst, &pkt).map(|_| pkt.len())
+        } else {
+            self.sock.send_to(&pkt, self.dst)
+        };
+        match sent {
             Ok(_) => self.sent += 1,
             Err(e) => {
                 if !self.send_failed {
@@ -206,6 +215,19 @@ pub fn configure(
     codec: AudioCodec,
     sample_rate: u32,
     channels: u16,
+) {
+    configure_with_sender(send_sock, dst, input_key, stream_type, codec, sample_rate, channels, None);
+}
+
+pub fn configure_with_sender(
+    send_sock: UdpSocket,
+    dst: SocketAddr,
+    input_key: [u8; 32],
+    stream_type: u8,
+    codec: AudioCodec,
+    sample_rate: u32,
+    channels: u16,
+    sender: Option<UdpSender>,
 ) {
     let (uc, desc) = match codec {
         AudioCodec::Pcm => {
@@ -248,6 +270,7 @@ pub fn configure(
     *crate::plock(&UPLINK) = Some(UplinkState {
         sock: send_sock,
         dst,
+        sender,
         key: input_key,
         codec: uc,
         rate: sample_rate,

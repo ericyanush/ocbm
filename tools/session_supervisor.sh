@@ -828,11 +828,12 @@ cfg_value() {
     sed -e "s/^[[:space:]]*$1:[[:space:]]*//" -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
 }
 
-# gm_ccpa bridge role: the 0x5702->0x5703 handoff must hand the iPhone the VEHICLE's hotspot, not the
-# box's own AP. `wifi_handoff::read_hostapd_ap_config()` reads /etc/hostapd.conf unconditionally, so
-# the cheapest correct intervention is to write the app-supplied credentials into that file before
-# btd starts. This is safe precisely BECAUSE wifi_ap:false means no hostapd ever runs
-# from it. /etc/hostapd.conf.stock is the pristine base, so repeated runs never drift.
+# The phone's 0x5703 Wi-Fi handoff must describe the network this box actually owns. In bridge mode
+# (wifi_ap:false), that is the VEHICLE hotspot, so copy its SSID/password/channel into hostapd.conf
+# as a config source even though the box does not start hostapd. In dongle-AP mode (wifi_ap:true),
+# the adapter raises its own AP and radio_ap_up.sh gives it a device-unique SSID; never overwrite
+# that SSID with the vehicle's. The host app's password/channel still configure the dongle AP.
+# /etc/hostapd.conf.stock is the pristine base, so repeated runs never drift.
 apply_host_wifi_creds() {
   # NOTE the underscore prefixes. The bare names s/p/c would CLOBBER the main loop's presence
   # variables ($p is the current /tmp/host_present value): wireless_up runs from inside the edge
@@ -843,20 +844,29 @@ apply_host_wifi_creds() {
   [ -n "$_s" ] || return 0
   _p=$(cfg_value wifi_pass)
   _c=$(cfg_value wifi_channel)
+  if wifi_ap_enabled; then _box_ap=1; else _box_ap=0; fi
   if [ ! -f /etc/hostapd.conf.stock ]; then
     cp /etc/hostapd.conf /etc/hostapd.conf.stock || {
       echo "[sup] WARN: could not snapshot /etc/hostapd.conf — not rewriting credentials"; return 0; }
   fi
   _tmp=/etc/hostapd.conf.new   # same filesystem, so the mv below is atomic (jffs2)
+  # For an adapter-owned AP, use the current file as the base: it may already contain the generated
+  # /etc/carplay_ident SSID from radio_ap_up.sh. Rebuilding that case from the pristine stock file
+  # would replace it with the OEM SSID on a later config refresh, even if we did not append the
+  # vehicle SSID ourselves.
+  if [ "$_box_ap" = 1 ]; then _base=/etc/hostapd.conf; else _base=/etc/hostapd.conf.stock; fi
   # Rebuild rather than sed-substitute: an SSID or passphrase can contain regex/delimiter characters.
   # Only strip the keys we are actually going to replace, so an unsupplied channel keeps the stock one
   # (hostapd of this vintage has no ACS and refuses to start with no channel).
-  _strip='^ssid='
+  # An adapter AP's identity comes from radio_ap_up.sh (/etc/carplay_ident), not the vehicle
+  # hotspot. Preserve the stock SSID here; radio_ap_up.sh sets the actual adapter SSID afterward.
+  _strip='^$'
+  [ "$_box_ap" = 0 ] && _strip="$_strip|^ssid="
   [ -n "$_p" ] && _strip="$_strip|^wpa_passphrase="
   [ -n "$_c" ] && _strip="$_strip|^channel="
-  grep -vE "$_strip" /etc/hostapd.conf.stock > "$_tmp" 2>/dev/null || {
+  grep -vE "$_strip" "$_base" > "$_tmp" 2>/dev/null || {
     echo "[sup] WARN: could not read the stock hostapd.conf — not rewriting credentials"; return 0; }
-  echo "ssid=$_s" >> "$_tmp"
+  [ "$_box_ap" = 0 ] && echo "ssid=$_s" >> "$_tmp"
   if [ -n "$_p" ]; then
     echo "wpa_passphrase=$_p" >> "$_tmp"
     # read_hostapd_ap_config() reports Wpa2OrWpa3Personal only when a wpa=/wpa_key_mgmt= line is
@@ -866,7 +876,11 @@ apply_host_wifi_creds() {
   fi
   [ -n "$_c" ] && echo "channel=$_c" >> "$_tmp"
   mv "$_tmp" /etc/hostapd.conf && sync
-  echo "[sup] 0x5703 credentials <- host app: ssid='$_s' channel='${_c:-stock}' pass=$([ -n "$_p" ] && echo set || echo none)"
+  if [ "$_box_ap" = 1 ]; then
+    echo "[sup] 0x5703 config <- host app: adapter AP SSID preserved; channel='${_c:-stock}' pass=$([ -n "$_p" ] && echo set || echo none)"
+  else
+    echo "[sup] 0x5703 config <- host app: vehicle SSID='$_s' channel='${_c:-stock}' pass=$([ -n "$_p" ] && echo set || echo none)"
+  fi
 }
 
 wireless_up() {

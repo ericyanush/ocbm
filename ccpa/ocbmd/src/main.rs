@@ -13,6 +13,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
+mod tunnel;
+
 const ACC_DEV: &str = "/dev/usb_accessory";
 
 /// carplayd's local HID-input ingest (task #20). ocbmd relays each CH_INPUT sub-frame here, length-
@@ -35,6 +37,7 @@ const RTSP_INGEST_ADDR: &str = "127.0.0.1:9106";
 /// What a pollfd slot represents, so the poll loop can dispatch after `poll()`.
 #[derive(Clone, Copy)]
 enum Kind {
+    TunnelWake,
     Acc,
     Pty,
     Conn(u16),
@@ -337,6 +340,8 @@ struct Daemon {
     out_log: OutQueue,       // CH_LOG — below CONSOLE, above bulk: diagnostics must never delay the
     // control plane, A/V, or an interactive rescue console, but they should still beat a file pull.
     out_lo: OutQueue, // bulk output FIFO: ECHO/IP/FILE/ETH (reliable)
+    out_tunnel: OutQueue, // CH_TUNNEL reliable socket bytes, drained ahead of video but below audio
+    tunnel: Option<tunnel::TunnelBroker>,
     /// Universal-log tailer (`/tmp/box.log` -> CH_LOG). Off until the host sends `CT_LOG_CTL`.
     log: LogTail,
     /// Which queue is resting MID-FRAME on the shared accessory fd, if any. While set, that queue must
@@ -821,6 +826,12 @@ const RADIO_OFF_FLAG: &str = "/tmp/ocbmd_selftest_radio_off";
 fn read_trim(path: &str) -> String {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn read_kv(path: &str, key: &str) -> String {
+    std::fs::read_to_string(path).ok().and_then(|text| text.lines()
+        .find_map(|line| line.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v.trim().to_string())))
         .unwrap_or_default()
 }
 
@@ -1443,6 +1454,7 @@ enum Wire {
     Console,
     Log,
     Lo,
+    Tunnel,
 }
 
 impl Daemon {
@@ -1472,6 +1484,22 @@ impl Daemon {
                     self.wire_owner = None;
                 }
                 eprintln!("[ocbmd] out_hi cap hit ({OUT_QUEUE_CAP} B) — cleared (host stalled?)");
+            }
+        } else if ch == p::CH_TUNNEL {
+            if self.out_tunnel.len() + n <= OUT_QUEUE_CAP {
+                self.out_tunnel.push_frame(ch, flags, seq, payload);
+            } else {
+                // A TCP stream cannot survive an arbitrary USB gap. Fail the broker closed and
+                // start a fresh epoch on the next host session; never continue after truncation.
+                self.out_tunnel.clear();
+                if self.wire_owner == Some(Wire::Tunnel) { self.wire_owner = None; }
+                if let Some(tunnel) = &self.tunnel {
+                    let mut stop = vec![p::TUNNEL_STOP];
+                    stop.extend_from_slice(&0u32.to_le_bytes());
+                    stop.extend_from_slice(&0u32.to_le_bytes());
+                    let _ = tunnel.command(&stop);
+                }
+                eprintln!("[ocbmd] CH_TUNNEL output cap hit — broker reset to avoid continuing a truncated TCP stream");
             }
         } else if ch == p::CH_CONSOLE {
             // CH_CONSOLE has its OWN queue drained AFTER audio/video (audit B3): the root console is
@@ -1675,6 +1703,7 @@ impl Daemon {
                 Wire::Console => self.out_console.drain_to(&mut self.acc).done(),
                 Wire::Log => self.out_log.drain_to(&mut self.acc).done(),
                 Wire::Lo => self.out_lo.drain_to(&mut self.acc).done(),
+                Wire::Tunnel => self.out_tunnel.drain_to(&mut self.acc).done(),
             };
             if !done {
                 return; // still mid-frame — nothing else may touch the fd
@@ -1698,6 +1727,7 @@ impl Daemon {
         }
         step!(self.out_hi.drain_to(&mut self.acc), Wire::Hi);
         step!(self.out_audio.drain_to(&mut self.acc), Wire::Audio);
+        step!(self.out_tunnel.drain_to(&mut self.acc), Wire::Tunnel);
         // Strict priority: MAIN video (:9001) before the cluster lane (:9005). A fair-share alternation was
         // tried (perf 2026-08-09) to help the cluster, but it moved pacing jitter onto the primary display
         // (main went choppy) for no gain — the app-side decrypt decouple already cures the cluster's
@@ -1847,6 +1877,14 @@ impl Daemon {
         }
         self.subscribed = false;
         self.cfg.clear();
+        self.out_tunnel.clear();
+        if self.wire_owner == Some(Wire::Tunnel) { self.wire_owner = None; }
+        if let Some(tunnel) = &self.tunnel {
+            let mut stop = vec![p::TUNNEL_STOP];
+            stop.extend_from_slice(&0u32.to_le_bytes());
+            stop.extend_from_slice(&0u32.to_le_bytes());
+            let _ = tunnel.command(&stop);
+        }
         // A latched replacement flag must not outlive the session that set it. It is consumed only by
         // the SUBSCRIBE handler, and a host can send HELLO without ever subscribing (a link-only
         // reattach that deliberately withholds the radio-wake edge), so a stale `true` could survive
@@ -3566,6 +3604,12 @@ impl Daemon {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let wifi_mac = read_trim("/sys/class/net/wlan0/address");
+        // Safe AP metadata for the optional socket tunnel. Never include the PSK in MGMT_INFO.
+        let ap_ip = read_kv("/tmp/.radio_wlan_state", "ap_ip");
+        let ap_iface = read_kv("/tmp/.radio_wlan_state", "ap_iface");
+        let ap_ssid = read_trim("/etc/wifi_name");
+        let ap_channel = read_trim("/etc/hostapd.conf").lines()
+            .find_map(|line| line.strip_prefix("channel=").map(str::trim)).unwrap_or("").to_string();
         // Safe on this thread, unlike the ioctl: `show_address` is a sprintf of `hdev->bdaddr` under
         // no HCI lock, and kernfs makes an unregistering attribute fail the open rather than block
         // the reader. Worst case it returns "" mid-teardown.
@@ -3591,10 +3635,15 @@ impl Daemon {
             "{{\"bt_mac\":\"{bt_mac}\",\"wifi_mac\":\"{wifi_mac}\",\"serial\":\"{ser}\",\
              \"name\":\"{name}\",\"uptime_s\":{uptime_s},\"rootfs_pct\":{rt_pct},\
              \"rootfs_free_kb\":{rt_free},\"ssp\":{ssp},\"hci_up\":{hci_up},\"wlan_ap\":{ap},\
+             \"ap_ip\":\"{ap_ip}\",\"ap_iface\":\"{ap_iface}\",\"ap_ssid\":\"{ap_ssid}\",\"ap_channel\":\"{ap_channel}\",\
              \"transport\":\"{transport}\",\"host_present\":{host},\"phone_present\":{phone},\
              \"daemons\":{{\"ocbmd\":{d0},\"iap2d\":{d1},\"airplayd\":{d2},\"carplay_wireless\":{d3}}},\
              \"host_name\":\"{host_name}\",\"devices\":[{devs}]}}",
             ser = json_escape(&serial),
+            ap_ip = json_escape(&ap_ip),
+            ap_iface = json_escape(&ap_iface),
+            ap_ssid = json_escape(&ap_ssid),
+            ap_channel = json_escape(&ap_channel),
             host_name = json_escape(self.host_name.as_deref().unwrap_or("")),
             ap = procs[4],
             host = self.present,
@@ -3712,7 +3761,8 @@ impl Daemon {
                         | p::CAP_FILE
                         | p::CAP_ETH
                         | p::CAP_MULTI_IAP2
-                        | p::CAP_CARPLAY_START_SESSION;
+                        | p::CAP_CARPLAY_START_SESSION
+                        | p::CAP_SOCKET_TUNNEL;
                     if self.mfi.is_some() {
                         caps |= p::CAP_MFI;
                     }
@@ -4079,6 +4129,13 @@ impl Daemon {
             p::CH_MIC => self.forward_mic(pl), // mic PCM host -> carplayd -> iPhone (type-100 uplink)
             p::CH_RTSP => self.forward_rtsp(pl), // SETUP-relay bytes host -> carplayd (RS_RESP/RS_ERR)
             p::CH_MGMT => self.handle_mgmt(pl),  // box management (the app's "CCPA" tab)
+            p::CH_TUNNEL => {
+                if let Some(tunnel) = &self.tunnel {
+                    if !tunnel.command(pl) {
+                        eprintln!("[ocbmd] CH_TUNNEL command queue full; refusing frame");
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4284,6 +4341,8 @@ fn main() {
         out_audio: OutQueue::default(),
         out_log: OutQueue::default(),
         out_lo: OutQueue::default(),
+        out_tunnel: OutQueue::default(),
+        tunnel: Some(tunnel::TunnelBroker::new()),
         log: LogTail::default(),
         wire_owner: None,
         av_dropped: 0,
@@ -4369,13 +4428,20 @@ fn main() {
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let mut kinds: Vec<Kind> = Vec::new();
     loop {
+        let tunnel_events: Vec<Vec<u8>> = d.tunnel.as_ref().map(|tunnel| {
+            tunnel.clear_wake();
+            (0..64).filter_map(|_| tunnel.event()).collect()
+        }).unwrap_or_default();
+        let tunnel_batch_full = tunnel_events.len() == 64;
+        for payload in tunnel_events { d.send(p::CH_TUNNEL, p::F_SOM | p::F_EOM, &payload); }
         // rebuild the pollfd set each pass: accessory (+POLLOUT if backlog) + PTY + live conns
         let want_out = !d.out_hi.is_empty()
             || !d.out_video.is_empty()
             || !d.out_alt_video.is_empty()
             || !d.out_audio.is_empty()
             || !d.out_console.is_empty()   // audit B3: without this, console-only backlog never arms POLLOUT → the tail freezes when unsubscribed (poll blocks -1)
-            || !d.out_lo.is_empty();
+            || !d.out_lo.is_empty()
+            || !d.out_tunnel.is_empty();
         fds.clear();
         kinds.clear();
         let acc_ev = libc::POLLIN | if want_out { libc::POLLOUT } else { 0 };
@@ -4461,7 +4527,12 @@ fn main() {
         // OR while a presence re-arm dip is pending so presence_tick can restore the flag on an
         // otherwise-idle box (without this the poll blocks on -1 and the dip never resolves).
         // Block indefinitely only when truly idle.
-        let timeout_ms = if d.subscribed || d.rearm_deadline.is_some() {
+        if let Some(tunnel) = &d.tunnel {
+            fds.push(libc::pollfd { fd: tunnel.wake_fd(), events: libc::POLLIN, revents: 0 });
+            kinds.push(Kind::TunnelWake);
+        }
+        // A bounded batch may leave queued events after clearing its wake notifications.
+        let timeout_ms = if tunnel_batch_full { 0 } else if d.subscribed || d.rearm_deadline.is_some() {
             500
         } else {
             LOG_IDLE_POLL_MS
@@ -4491,6 +4562,7 @@ fn main() {
                 // PTY detached.) Actively drop the dead fd so it leaves the pollset next rebuild.
                 if re & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
                     match kinds[i] {
+                        Kind::TunnelWake => {},
                         Kind::Pty => d.ptm = None, // console shell exited → drop the master pty
                         Kind::Eth => {
                             if let Some(fd) = d.eth.take() {
@@ -4521,6 +4593,7 @@ fn main() {
                 continue; // POLLOUT-only wake is handled by the drain() below; dead fds handled above
             }
             match kinds[i] {
+                        Kind::TunnelWake => {},
                 Kind::Acc => {
                     // QC 2026-07-25: the POLLHUP busy-spin guard above only fires when POLLIN is
                     // CLEAR. Many drivers assert POLLIN alongside POLLERR/POLLHUP on teardown (to
@@ -4810,6 +4883,8 @@ mod tests {
             out_audio: OutQueue::default(),
             out_log: OutQueue::default(),
             out_lo: OutQueue::default(),
+        out_tunnel: OutQueue::default(),
+        tunnel: None,
             log: LogTail::default(),
             wire_owner: None,
             av_dropped: 0,

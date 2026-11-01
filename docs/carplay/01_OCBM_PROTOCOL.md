@@ -840,9 +840,46 @@ Consequently:
 5. **TLV / keyed metadata + control**; hard rule: **skip unknown TLVs/keys/streamTypes/codecs**,
    never fatal.
 6. **Reserved + experimental ranges** — add channels/enums without collision or a version bump.
-7. **`IP` tunnel as the universal escape hatch** — any un-modeled CarPlay feature works day one as
-   opaque bytes; later *promote* it to a typed channel by emitting a decoded stream instead of
-   tunneling, **with no protocol change** (progressive enhancement).
+7. **Socket tunnels are capability-scoped.** `CH_IP` is the existing host-initiated outbound relay;
+   it is not an inbound Wi-Fi bridge. `CH_TUNNEL` is the separately negotiated socket broker used
+   when the adapter owns the phone-facing Wi-Fi sockets. It must preserve TCP byte order/EOF and UDP
+   datagram boundaries/peer addresses; it may not silently drop reliable TCP data.
 
 The only thing that could force a real rewrite is changing the envelope itself — which
 capability-versioning lets you avoid even then.
+
+## Dongle Wi-Fi socket tunnel (`CH_TUNNEL`, capability `CAP_SOCKET_TUNNEL`)
+
+This optional path makes the adapter a socket broker only. The AAOS receiver still owns iAP2/MFi,
+AirPlay/CarPlay protocol state, encryption, decoding, media, navigation, and vehicle integration.
+The adapter binds the phone-facing TCP/UDP sockets on its own AP and forwards payloads over USB.
+Direct vehicle-hotspot mode remains the default and does not require this capability.
+
+Implementation status: the adapter advertises `CAP_SOCKET_TUNNEL`; the Android app can start the
+adapter AP, publish the receiver's AirPlay DNS-SD service on that AP, bind receiver TCP/UDP sockets
+to loopback, and relay them over OCBM. Selecting this mode also selects iAP2 StartSession, so the
+adapter's chosen Bluetooth/iAP2 phone is the target and the legacy phone browse/nudge is suppressed.
+The phone-facing AirPlay advertisement is still sent on the adapter AP; it is not an adapter
+discovery or phone-selection mechanism. Hardware validation is still required before treating this
+experimental transport as production-ready.
+
+Every payload begins `[op:u8][epoch:u32 LE][object:u32 LE]`. The host creates a new nonzero epoch
+for each USB session. Old-epoch messages are ignored and `STOP` closes every listener and accepted
+socket owned by that epoch. Object IDs are not reused within an epoch. The supported operations are
+`START`, `LISTEN_TCP`, `BIND_UDP`, `RESULT`, `ACCEPT`, `TCP_DATA`, `TCP_CREDIT`, `TCP_EOF`,
+`UDP_DATAGRAM`, `UDP_SEND`, and `CLOSE` as defined in `crates/ocbm-proto/src/lib.rs`.
+
+TCP is an ordered byte stream. A receiver advertises a bounded receive window; a sender must stop
+reading its TCP socket when credit reaches zero. `TCP_EOF` is ordered after the last data bytes and
+represents a half-close; `CLOSE` releases the whole object. The adapter must retain USB output until
+written or tear down the affected socket and report the failure; it must never continue after
+dropping an arbitrary TCP segment. UDP frames carry the source/destination address and port and are
+atomic datagrams. Under pressure, a whole UDP datagram may be dropped and must be counted.
+
+The adapter only accepts listener addresses assigned to its AP interface and peers in the AP's
+connected subnet. `TUNNEL_MDNS_START` joins `224.0.0.251:5353` on the AP interface, `TUNNEL_MDNS_PACKET`
+relays received DNS datagrams to the app, and `TUNNEL_MDNS_SEND` transmits the app's DNS responses and
+announcements on that AP. Receiver listener ports are registered before they are advertised in
+their CarPlay protocol response. The AP SSID/address/channel are read from `MGMT_INFO`; the PSK is
+delivered only in the iAP2 StartSession payload and is never returned by `MGMT_INFO` or written to
+logs. Media payloads must not be written to logs.

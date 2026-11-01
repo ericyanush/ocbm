@@ -389,6 +389,11 @@ pub struct AvSession {
     /// e.g. `%en10` on the wired NCM link) is preserved: sending RTP to a `fe80::…` destination with
     /// `scope_id == 0` fails (`EINVAL` / no route to host). Only the port is overridden per stream.
     peer_addr: Option<std::net::SocketAddr>,
+    /// Explicit local address inherited from the control listener; None preserves dual-stack wildcard.
+    local_bind_addr: Option<std::net::SocketAddr>,
+    /// Optional adapter socket broker. Phone-facing ports are registered before SETUP replies.
+    socket_registrar: Option<Arc<dyn SocketRegistrar>>,
+    registered_sockets: Mutex<Vec<(bool, u16)>>,
     /// Session-liveness flag shared with every spawned stream thread. Cleared on TEARDOWN or when this
     /// `AvSession` is dropped (connection closed / abrupt drop); each thread polls it on its socket
     /// read-timeout and exits — so stream threads never outlive their session (no per-session leak).
@@ -424,6 +429,18 @@ pub struct AvSession {
     /// `(width, height, max_fps)` from the advertised `DeviceConfig`, via [`SessionDelegate::set_resolution`].
     /// `(0, 0, 0)` = unset (never threaded in — e.g. under `NoSession`/tests).
     resolution: (i64, i64, i64),
+}
+
+/// Registers receiver sockets on a remote phone-facing AP. Calls must be bounded and independent
+/// of the receiver's native CORE lock (the callback is made while SETUP is being processed).
+pub trait SocketRegistrar: Send + Sync {
+    fn register_tcp(&self, local_port: u16) -> std::io::Result<()>;
+    fn register_udp(&self, local_port: u16) -> std::io::Result<()>;
+    fn unregister_tcp(&self, local_port: u16);
+    fn unregister_udp(&self, local_port: u16);
+    fn send_udp(&self, _local_port: u16, _peer: std::net::SocketAddr, _payload: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("tunneled UDP send is unavailable"))
+    }
 }
 
 /// How often stream threads wake from a blocking socket read to check the session-liveness flag.
@@ -486,6 +503,9 @@ impl AvSession {
             keepalive_port: 0,
             event_listener: None,
             peer_addr: None,
+            local_bind_addr: None,
+            socket_registrar: None,
+            registered_sockets: Mutex::new(Vec::new()),
             alive: Arc::new(AtomicBool::new(true)),
             activity: Arc::new(AtomicU64::new(0)),
             av_streams: Mutex::new(HashMap::new()),
@@ -546,12 +566,60 @@ impl AvSession {
         crate::uplink::clear();
         crate::events::clear();
         clear_sinks();
+        if let Some(registrar) = &self.socket_registrar {
+            for (tcp, port) in crate::plock(&self.registered_sockets).drain(..) {
+                if tcp { registrar.unregister_tcp(port); } else { registrar.unregister_udp(port); }
+            }
+        }
     }
 
     /// Record the iPhone's control-connection peer address (WITH its IPv6 scope) so the type-100 mic
     /// uplink can target it on the correct interface. Pass the full `peer_addr()`, not `.ip()`.
     pub fn set_peer_addr(&mut self, addr: std::net::SocketAddr) {
         self.peer_addr = Some(addr);
+    }
+
+    /// Apply the control listener's local binding to every phone-facing session socket.
+    /// Preserve IPv6 scope IDs; session ports are always allocated by the OS.
+    pub fn set_local_bind_addr(&mut self, mut addr: std::net::SocketAddr) {
+        addr.set_port(0);
+        self.local_bind_addr = Some(addr);
+    }
+
+    pub fn set_socket_registrar(&mut self, registrar: Arc<dyn SocketRegistrar>) {
+        self.socket_registrar = Some(registrar);
+    }
+
+    fn session_bind_addr(&self) -> std::net::SocketAddr {
+        self.local_bind_addr.unwrap_or_else(|| "[::]:0".parse().unwrap())
+    }
+
+    fn bind_session_tcp(&self, channel: &str) -> std::io::Result<TcpListener> {
+        let listener = TcpListener::bind(self.session_bind_addr())?;
+        let addr = listener.local_addr()?;
+        if let Some(registrar) = &self.socket_registrar {
+            if let Err(e) = registrar.register_tcp(addr.port()) {
+                eprintln!("[native-diag] gen={} {channel} TCP tunnel registration failed port={}: {e}", self.generation, addr.port());
+                return Err(e);
+            }
+            crate::plock(&self.registered_sockets).push((true, addr.port()));
+        }
+        eprintln!("[native-diag] gen={} {channel} TCP listening on {}", self.generation, addr);
+        Ok(listener)
+    }
+
+    fn bind_session_udp(&self, channel: &str) -> std::io::Result<UdpSocket> {
+        let socket = UdpSocket::bind(self.session_bind_addr())?;
+        let addr = socket.local_addr()?;
+        if let Some(registrar) = &self.socket_registrar {
+            if let Err(e) = registrar.register_udp(addr.port()) {
+                eprintln!("[native-diag] gen={} {channel} UDP tunnel registration failed port={}: {e}", self.generation, addr.port());
+                return Err(e);
+            }
+            crate::plock(&self.registered_sockets).push((false, addr.port()));
+        }
+        eprintln!("[native-diag] gen={} {channel} UDP bound to {}", self.generation, addr);
+        Ok(socket)
     }
 
     /// Read back the recorded peer address (see [`Self::set_peer_addr`]). Added for the app-driven
@@ -598,21 +666,18 @@ impl AvSession {
             self.alive.store(false, Ordering::Release);
             self.alive = Arc::new(AtomicBool::new(true));
         }
-        // NB: every session socket below binds `[::]:0` (IPv6), NOT `0.0.0.0` (IPv4). Wired CarPlay
-        // runs over IPv6 link-local on the NCM link, so the iPhone connects to these ports at the
-        // receiver's `fe80::…` address; an IPv4-only socket silently refuses those connections and the
-        // iPhone tears the session down right after SETUP-phase1. `[::]` is dual-stack on macOS/Linux
-        // (also accepts IPv4-mapped peers), so this is correct for both wired-IPv6 and wireless-IPv4.
+        // Session sockets inherit an explicit control-listener address when supplied by the app.
+        // Otherwise retain the IPv6 wildcard default for dual-stack receivers.
         // Timing: bind a UDP socket and run the NTP-like responder. Bind failures are handled, NOT
         // `.expect()`-panicked (#139): the whole workspace builds with `panic="abort"`, so a panic on
         // this single thread would take DOWN THE ENTIRE carplayd — every other connection with it — over
         // a transient port-exhaustion. Instead fail just this SETUP (return an empty response; the iPhone
         // tears the one session down) and keep the daemon serving.
         if !reuse {
-            let timing = match UdpSocket::bind("[::]:0") {
+            let timing = match self.bind_session_udp("timing") {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[session] bind timing UDP failed: {e} — failing this SETUP");
+                    eprintln!("[native-diag] bind timing UDP failed: {e} — failing this SETUP");
                     return Err(SetupError);
                 }
             };
@@ -623,10 +688,10 @@ impl AvSession {
         // Event channel: open the TCP listener now, but ACCEPT it at RECORD (not here) — the C's
         // ordering. Holding the accept until RECORD is what cues the iPhone to proceed.
         if !reuse {
-            let events = match TcpListener::bind("[::]:0") {
+            let events = match self.bind_session_tcp("events") {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[session] bind event TCP failed: {e} — failing this SETUP");
+                    eprintln!("[native-diag] bind event TCP failed: {e} — failing this SETUP");
                     return Err(SetupError);
                 }
             };
@@ -654,7 +719,7 @@ impl AvSession {
         } else if keep_alive {
             // Non-fatal bind (#139): keepAlive is optional low-power signalling, so on a bind failure
             // just advertise no port rather than failing the SETUP or panicking the daemon.
-            match UdpSocket::bind("[::]:0") {
+            match self.bind_session_udp("keepalive") {
                 Ok(ka) => {
                     self.keepalive_port = ka.local_addr().map(|a| a.port()).unwrap_or(0);
                     // spawn_keepalive (not spawn_udp_drain) so beacons feed the idle watchdog (#1130).
@@ -665,7 +730,7 @@ impl AvSession {
                     );
                 }
                 Err(e) => eprintln!(
-                    "[session] bind keepAlive UDP failed: {e} — no keepAlivePort advertised"
+                    "[native-diag] bind keepAlive UDP failed: {e} — no keepAlivePort advertised"
                 ),
             }
         }
@@ -751,7 +816,7 @@ impl AvSession {
         d.insert("enabledFeatures".into(), Value::Array(feats));
 
         eprintln!(
-            "[session] gen={} SETUP phase1 → timingPort {} eventPort {} keepAlivePort {}",
+            "[native-diag] gen={} SETUP phase1 → timingPort {} eventPort {} keepAlivePort {}",
             self.generation, self.timing_port, self.event_port, self.keepalive_port
         );
         // Control plane is up. Cleared only by `reset()` (full TEARDOWN / Drop), matching the
@@ -884,18 +949,18 @@ impl AvSession {
                 }
                 match ty {
                     110 => {
-                        let listener = match TcpListener::bind("[::]:0") {
+                        let listener = match self.bind_session_tcp("screen") {
                             Ok(l) => l,
                             Err(e) => {
                                 eprintln!(
-                                    "[session] bind screen TCP failed: {e} — skipping stream 110"
+                                    "[native-diag] bind screen TCP failed: {e} — skipping stream 110"
                                 );
                                 continue;
                             }
                         };
                         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                         eprintln!(
-                            "[session] SETUP phase2 screen(110) scid={scid} → dataPort {port}"
+                            "[native-diag] SETUP phase2 screen(110) scid={scid} → dataPort {port}"
                         );
                         let flag = self.stream_flag(110);
                         spawn_screen(listener, shared, scid, 9001, flag, self.activity.clone());
@@ -909,15 +974,15 @@ impl AvSession {
                         // instrument-cluster map (getClusterLayer:). Identical transport to type 110 —
                         // forwarded (fwd-enc) to a SEPARATE sink :9005 → ocbmd CH_ALT_VIDEO → the host's
                         // dedicated alt decoder + floating window.
-                        let listener = match TcpListener::bind("[::]:0") {
+                        let listener = match self.bind_session_tcp("alt-screen") {
                             Ok(l) => l,
                             Err(e) => {
-                                eprintln!("[session] bind alt-screen TCP failed: {e} — skipping stream 111");
+                                eprintln!("[native-diag] bind alt-screen TCP failed: {e} — skipping stream 111");
                                 continue;
                             }
                         };
                         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-                        eprintln!("[session] SETUP phase2 ALT screen(111) scid={scid} → dataPort {port} (→ :9005)");
+                        eprintln!("[native-diag] SETUP phase2 ALT screen(111) scid={scid} → dataPort {port} (→ :9005)");
                         let flag = self.stream_flag(111);
                         spawn_screen(listener, shared, scid, 9005, flag, self.activity.clone());
                         let mut r = Dictionary::new();
@@ -932,7 +997,7 @@ impl AvSession {
                         // frames unless `events::nav_forward()` is set, so the second stream never enters
                         // the OCBM pipe and can't starve the main 4K stream. The host toggles nav_forward
                         // via CMD_NAV_START/CARD/APP (on) / CMD_NAV_STOP (off). Default off (audit M-e/H1).
-                        eprintln!("[session] SETUP phase2 ALT screen(111): default-OFF (box forward-gated until nav toggled on)");
+                        eprintln!("[native-diag] SETUP phase2 ALT screen(111): default-OFF (box forward-gated until nav toggled on)");
                     }
                     100..=102 => {
                         // Audio (UDP RTP). 102=MainHighAudio (AAC-LC media), 100/101=Main/AltAudio
@@ -957,16 +1022,16 @@ impl AvSession {
                             .unwrap_or("")
                             .to_string();
                         let is_media = audio_type == "media";
-                        let data = match UdpSocket::bind("[::]:0") {
+                        let data = match self.bind_session_udp("audio-data") {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("[session] bind audio data UDP failed: {e} — skipping stream {ty}");
+                                eprintln!("[native-diag] bind audio data UDP failed: {e} — skipping stream {ty}");
                                 continue;
                             }
                         };
                         let dport = data.local_addr().map(|a| a.port()).unwrap_or(0);
                         eprintln!(
-                            "[session] SETUP phase2 audio({ty}) scid={scid} fmt={fmt:#x} \
+                            "[native-diag] SETUP phase2 audio({ty}) scid={scid} fmt={fmt:#x} \
                              {sr}Hz {ch}ch {codec:?} audioType={audio_type:?} → dataPort {dport}",
                         );
                         // Bidirectional MainAudio (type 100): if the iPhone offers an uplink
@@ -997,7 +1062,15 @@ impl AvSession {
                                         // scope_id) with only the port swapped to the stream's uplink
                                         // port. Mirrors the C `SockAddrCopy(peerAddr)+SockAddrSetPort`.
                                         let dst = uplink_dst(peer, iphone_port as u16);
-                                        crate::uplink::configure(send_sock, dst, input_key, ty as u8, codec, sr, ch);
+                                        if let Some(registrar) = self.socket_registrar.clone() {
+                                            let local_port = dport;
+                                            crate::uplink::configure_with_sender(
+                                                send_sock, dst, input_key, ty as u8, codec, sr, ch,
+                                                Some(std::sync::Arc::new(move |peer, payload| registrar.send_udp(local_port, peer, payload))),
+                                            );
+                                        } else {
+                                            crate::uplink::configure(send_sock, dst, input_key, ty as u8, codec, sr, ch);
+                                        }
                                     }
                                     (None, _) => eprintln!(
                                         "[session] type-100 input requested but no peer addr — uplink skipped"
@@ -1047,7 +1120,7 @@ impl AvSession {
                         r.insert("dataPort".into(), Value::Integer((dport as i64).into()));
                         if ty == 102 {
                             // Non-fatal bind (#139): on failure just omit controlPort rather than panic.
-                            match UdpSocket::bind("[::]:0") {
+                            match self.bind_session_udp("audio-control") {
                                 Ok(ctrl) => {
                                     let cport = ctrl.local_addr().map(|a| a.port()).unwrap_or(0);
                                     r.insert(
@@ -1065,7 +1138,7 @@ impl AvSession {
                                     spawn_udp_drain(ctrl, ctrl_flag); // RTCP ctrl — bound but idle
                                 }
                                 Err(e) => eprintln!(
-                                    "[session] bind audio ctrl UDP failed: {e} — no controlPort"
+                                    "[native-diag] bind audio ctrl UDP failed: {e} — no controlPort"
                                 ),
                             }
                         }
@@ -1189,12 +1262,12 @@ impl AvSession {
                             // the framing rather than routing it yet — the encryption context for this stream
                             // derives from `DataStream-Salt` / `DataStream-{Output,Input}-Encryption-Key`
                             // (CarPlaySDK), which is the next piece to implement once we can see real bytes.
-                            match std::net::TcpListener::bind("[::]:0") {
+                            match self.bind_session_tcp("datastream") {
                                 Ok(l) => {
                                     let dport = l.local_addr().map(|a| a.port()).unwrap_or(0);
                                     r.insert("dataPort".into(), Value::Integer((dport as i64).into()));
                                     eprintln!(
-                                        "[session] DataStream(130) dedicated socket listening on {dport}"
+                                        "[native-diag] DataStream(130) dedicated socket listening on {dport}"
                                     );
                                     // Per-stream flag, not the session-wide `alive` (F13). Two things
                                     // this buys: a PARTIAL TEARDOWN naming type 130 now actually reaps
@@ -1256,6 +1329,7 @@ impl AvSession {
                                         loop {
                                             match l.accept() {
                                                 Ok((mut c, peer)) => {
+                                                    eprintln!("[native-diag] datastream accepted local={:?} peer={peer}", c.local_addr());
                                                     if accepted_one {
                                                         // Second connection on this listener — see
                                                         // the `accepted_one` note above. Re-deriving
@@ -1882,9 +1956,16 @@ impl SessionDelegate for AvSession {
             .as_ref()
             .map(|d| d.contains_key("streams"))
             .unwrap_or(false);
+        let stream_types: Vec<i64> = dict.as_ref().and_then(|d| d.get("streams"))
+            .and_then(Value::as_array).map(|streams| streams.iter()
+                .filter_map(|v| v.as_dictionary()?.get("type")?.as_signed_integer()).collect())
+            .unwrap_or_default();
+        eprintln!("[native-diag] gen={} SETUP phase={} body_bytes={} stream_types={:?} binding={} peer={:?}",
+            self.generation, if has_streams { 2 } else { 1 }, request_plist.len(), stream_types,
+            self.session_bind_addr(), self.peer_addr);
         let setup_device_id = dict.as_ref().and_then(|d| d.get("deviceID")).and_then(|v| v.as_string());
         if !selected_phone_matches_setup(self.expected_phone.as_deref(), self.identity_confirmed, has_streams, setup_device_id) {
-            eprintln!("[session] rejected SETUP identity for selected phone={:?} gen={}", self.expected_phone, self.generation);
+            eprintln!("[native-diag] rejected SETUP identity for selected phone={:?} gen={}", self.expected_phone, self.generation);
             return Err(SetupError);
         }
         if self.expected_phone.is_some() && !has_streams { self.identity_confirmed = true; }
@@ -1933,7 +2014,7 @@ impl SessionDelegate for AvSession {
             for _ in 0..50 {
                 match listener.accept() {
                     Ok((stream, peer)) => {
-                        eprintln!("[session] gen={} RECORD: event channel accepted from {peer}", self.generation);
+                        eprintln!("[native-diag] gen={} RECORD: event channel accepted from {peer} local={:?}", self.generation, stream.local_addr());
                         stream.set_nonblocking(false).ok();
                         // Wire the encrypted event channel (receiver→iPhone commands, e.g. touch
                         // hidSendReport) — the C's _ControlStart. Was a plain drain before.
@@ -1978,13 +2059,13 @@ impl SessionDelegate for AvSession {
                         thread::sleep(std::time::Duration::from_millis(100));
                     }
                     Err(e) => {
-                        eprintln!("[session] gen={} RECORD: event accept error: {e}", self.generation);
+                        eprintln!("[native-diag] gen={} RECORD: event accept error: {e}", self.generation);
                         break;
                     }
                 }
             }
             if !accepted {
-                eprintln!("[session] gen={} RECORD: event channel not connected within timeout", self.generation);
+                eprintln!("[native-diag] gen={} RECORD: event channel not connected within timeout", self.generation);
             }
             control_started = accepted;
         }
@@ -2116,8 +2197,13 @@ fn spawn_timing(sock: UdpSocket, alive: Arc<AtomicBool>) {
     thread::spawn(move || {
         sock.set_read_timeout(Some(SHUTDOWN_POLL)).ok();
         let mut buf = [0u8; 64];
+        let mut first = true;
         while alive.load(Ordering::Acquire) {
-            match sock.recv_from(&mut buf) {
+            let received = sock.recv_from(&mut buf);
+            if let Ok((n, peer)) = &received {
+                if first { eprintln!("[native-diag] timing first UDP local={:?} peer={peer} bytes={n}", sock.local_addr()); first = false; }
+            }
+            match received {
                 Ok((n, peer)) if n >= 32 && buf[1] == 210 => {
                     let t2 = ntp_now();
                     let mut r = [0u8; 32];
@@ -2335,7 +2421,7 @@ fn spawn_screen(
                     thread::sleep(SHUTDOWN_POLL);
                 }
                 Err(e) => {
-                    eprintln!("[screen] accept failed: {e}");
+                    eprintln!("[native-diag] screen accept failed: {e}");
                     return;
                 }
             }
@@ -2343,7 +2429,7 @@ fn spawn_screen(
         sock.set_nonblocking(false).ok();
         sock.set_read_timeout(Some(SHUTDOWN_POLL)).ok();
         eprintln!(
-            "[screen] iPhone connected from {peer}; forwarding video → 127.0.0.1:{sink_port}"
+            "[native-diag] screen accepted peer={peer} local={:?} sink_port={sink_port}", sock.local_addr()
         );
         // Lazy, self-healing sink (C8 hardening): connect on the first frame and reconnect after any
         // write failure, dropping frames while carlink is down — a momentary carlink blip must NOT
@@ -2945,8 +3031,9 @@ fn spawn_audio(
         // fwd-enc path does NO per-RTP-packet heap alloc (grown once, kept). Wired PCM 48k is the highest
         // packet-rate audio case, so this removes the one remaining audio-lane alloc there.
         let mut framed_buf: Vec<u8> = Vec::new();
+        let mut first_packet = true;
         loop {
-            let (n, _) = match sock.recv_from(&mut buf) {
+            let (n, peer) = match sock.recv_from(&mut buf) {
                 Ok(x) => x,
                 Err(ref e) if is_timeout(e) => {
                     if alive.load(Ordering::Acquire) {
@@ -2956,6 +3043,10 @@ fn spawn_audio(
                 }
                 Err(_) => break,
             };
+            if first_packet {
+                eprintln!("[native-diag] audio first UDP local={:?} peer={peer} bytes={n} stream_type={stream_type}", sock.local_addr());
+                first_packet = false;
+            }
             if n < MIN_AUDIO_PACKET {
                 continue;
             }
@@ -3105,9 +3196,13 @@ fn spawn_udp_drain(sock: UdpSocket, alive: Arc<AtomicBool>) {
     thread::spawn(move || {
         sock.set_read_timeout(Some(SHUTDOWN_POLL)).ok();
         let mut buf = [0u8; 256];
+        let mut first = true;
         loop {
             match sock.recv_from(&mut buf) {
-                Ok(_) => {}
+                Ok((n, peer)) => {
+                    if first { eprintln!("[native-diag] audio-control first UDP local={:?} peer={peer} bytes={n}", sock.local_addr()); first = false; }
+
+                }
                 Err(ref e) if is_timeout(e) => {
                     if !alive.load(Ordering::Acquire) {
                         break;
@@ -3127,9 +3222,13 @@ fn spawn_keepalive(sock: UdpSocket, alive: Arc<AtomicBool>, activity: Arc<Atomic
     thread::spawn(move || {
         sock.set_read_timeout(Some(SHUTDOWN_POLL)).ok();
         let mut buf = [0u8; 256];
+        let mut first = true;
         loop {
             match sock.recv_from(&mut buf) {
-                Ok(_) => activity.store(now_ms(), Ordering::Relaxed),
+                Ok((n, peer)) => {
+                    if first { eprintln!("[native-diag] keepalive first UDP local={:?} peer={peer} bytes={n}", sock.local_addr()); first = false; }
+                    activity.store(now_ms(), Ordering::Relaxed);
+                }
                 Err(ref e) if is_timeout(e) => {
                     if !alive.load(Ordering::Acquire) {
                         break;
@@ -3154,6 +3253,32 @@ fn ntp_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_socket_binding_uses_explicit_local_address() {
+        let mut session = AvSession::new();
+        assert_eq!(session.session_bind_addr(), "[::]:0".parse().unwrap());
+        session.set_local_bind_addr("127.0.0.1:5000".parse().unwrap());
+        assert_eq!(session.session_bind_addr(), "127.0.0.1:0".parse().unwrap());
+        let tcp = session.bind_session_tcp("test").unwrap();
+        let udp = session.bind_session_udp("test").unwrap();
+        assert_eq!(tcp.local_addr().unwrap().ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(udp.local_addr().unwrap().ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_ne!(tcp.local_addr().unwrap().port(), 0);
+        assert_ne!(udp.local_addr().unwrap().port(), 0);
+        // Releasing session state must not drop the binding policy on a subsequent SETUP.
+        session.reset();
+        assert_eq!(session.session_bind_addr(), "127.0.0.1:0".parse().unwrap());
+    }
+
+    #[test]
+    fn session_socket_binding_preserves_ipv6_scope() {
+        let mut session = AvSession::new();
+        let address = std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 5000, 0, 7);
+        session.set_local_bind_addr(address.into());
+        let expected = std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 0, 0, 7);
+        assert_eq!(session.session_bind_addr(), expected.into());
+    }
 
     #[test]
     fn native_setup_identity_includes_generation_and_escapes_user_name() {

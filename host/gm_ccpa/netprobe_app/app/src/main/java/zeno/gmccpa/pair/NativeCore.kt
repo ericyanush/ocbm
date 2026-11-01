@@ -35,12 +35,14 @@ object NativeCore {
      * @param infoPlist   the generated `/info` binary plist
      * @param peerFile    where controller-id → LTPK pairings persist
      * @param peerAddr    the phone's address:port — AvSession needs it to reach back for streams
+     * @param localBindAddress explicit local socket address; empty retains native wildcard binding
      * @param mfiRelay    the OCBM `CH_MFI` bridge (already device-proven)
      */
     fun start(pi: String, edSeed: ByteArray, infoPlist: ByteArray, peerFile: String,
-              peerAddr: String, mfiRelay: MfiRelay, expectedPhone: String = ""): Long {
+              peerAddr: String, mfiRelay: MfiRelay, expectedPhone: String = "", localBindAddress: String = "",
+              socketTunnelRelay: SocketTunnelRelay? = null, phonePeerAddress: String = ""): Long {
         if (!available) return 0
-        return nativeInit(pi, edSeed, infoPlist, peerFile, peerAddr, mfiRelay, expectedPhone)
+        return nativeInit(pi, edSeed, infoPlist, peerFile, peerAddr, mfiRelay, expectedPhone, localBindAddress, socketTunnelRelay, phonePeerAddress)
     }
 
     fun publicKeyHex(pi: String, edSeed: ByteArray): String {
@@ -164,9 +166,17 @@ object NativeCore {
         if (handle > 0L) nativeDestroy(handle)
     }
 
+    /** Called on the native log-drain thread; ProbeLog's sink includes this in exported bundles. */
+    @androidx.annotation.Keep
+    @JvmStatic
+    fun nativeDiagnosticLog(line: String) {
+        zeno.gmccpa.ProbeLog.sub("native").i(line)
+    }
+
     private external fun nativeInit(
         pi: String, edSeed: ByteArray, infoPlist: ByteArray, peerFile: String,
-        peerAddr: String, mfiRelay: MfiRelay, expectedPhone: String
+        peerAddr: String, mfiRelay: MfiRelay, expectedPhone: String, localBindAddress: String,
+        socketTunnelRelay: SocketTunnelRelay?, phonePeerAddress: String
     ): Long
     private external fun nativePublicKey(pi: String, edSeed: ByteArray): ByteArray?
     private external fun nativeFeed(handle: Long, input: ByteArray): ByteArray?
@@ -219,4 +229,18 @@ interface MfiRelay {
      */
     fun copyCertificateFast(): ByteArray = copyCertificate()
     fun createSignatureFast(digest: ByteArray): ByteArray = createSignature(digest)
+}
+
+/** Adapter AP socket registration used only when the selectable dongle-Wi-Fi tunnel is active. */
+interface SocketTunnelRelay {
+    fun registerTcp(localPort: Int): Boolean
+    fun registerUdp(localPort: Int): Boolean
+    fun unregisterTcp(localPort: Int)
+    fun unregisterUdp(localPort: Int)
+    fun sendUdp(localPort: Int, peerAddress: String, peerPort: Int, payload: ByteArray): Boolean
+    fun phoneAddressForProxySourcePort(sourcePort: Int): String?
+    /** Start forwarding mDNS on the adapter AP and route phone queries/responses to [onPacket]. */
+    fun startMdns(apAddress: String, onPacket: (ByteArray) -> Unit): Boolean
+    /** Send one bounded DNS packet to the adapter AP's mDNS multicast group. */
+    fun sendMdns(packet: ByteArray): Boolean
 }

@@ -13,7 +13,10 @@ use std::{
 };
 
 struct Bootstrap {
-    endpoint: Endpoint,
+    // The host may not know its receiver/AP address until after SUBSCRIBE has brought the
+    // adapter AP up. In that case the selected StartSession request supplies the endpoint later.
+    // Before then, 0x5702 falls back to the adapter's live hostapd config.
+    endpoint: Option<Endpoint>,
     event: Event,
     gate: Gate,
     identified_at: Option<Instant>,
@@ -84,15 +87,16 @@ pub fn begin(peer: &[u8; 6]) -> bool {
         CURRENT.with(|c| *c.borrow_mut() = None);
         return true;
     }
-    let Some(endpoint) = cfg
-        .native_receiver_endpoint
-        .filter(|e| e.validate().is_ok())
-    else {
-        crate::log(
-            "StartSession enabled without a valid native receiver endpoint; refusing bootstrap",
-        );
-        return false;
-    };
+    let endpoint = cfg.native_receiver_endpoint.filter(|e| {
+        let valid = e.validate().is_ok();
+        if !valid {
+            crate::log("configured native receiver endpoint is invalid; waiting for host StartSession request");
+        }
+        valid
+    });
+    if endpoint.is_none() {
+        crate::log("StartSession slot armed without a configured receiver endpoint; 0x5702 uses live AP config until the host request supplies one");
+    }
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -129,7 +133,7 @@ pub fn enabled() -> bool {
     CURRENT.with(|c| c.borrow().is_some())
 }
 pub fn endpoint() -> Option<Endpoint> {
-    CURRENT.with(|c| c.borrow().as_ref().map(|b| b.endpoint.clone()))
+    CURRENT.with(|c| c.borrow().as_ref().and_then(|b| b.endpoint.clone()))
 }
 pub fn finish() {
     CURRENT.with(|c| {
@@ -223,7 +227,10 @@ pub fn poll(
         }
         if !b.gate.eligible(&r, &b.event.peer_mac, &b.event.slot_id) { return false; }
         b.event.request_id = r.request_id.clone(); b.event.receiver_epoch = r.receiver_epoch.clone();
-        let e = r.endpoint.as_ref().unwrap();
+        let Some(e) = r.endpoint.as_ref() else {
+            publish(b, "failed", "StartSession request has no receiver endpoint");
+            return true;
+        };
         let msg = CarPlayStartSession { wireless: Some(WirelessAttributes { wifi_ssid: &e.ssid, passphrase: &e.passphrase,
             channel: e.channel, ip_addresses: &e.addresses, security_type: e.security }),
             ..CarPlayStartSession::new(e.port.into(), &e.device_id, &e.public_key, &e.source_version) };
@@ -243,7 +250,7 @@ pub fn poll(
             return !cancelled_before_write;
         }
         if !still_current() { publish(b, "cancelled", "host changed during write"); return false; }
-        b.gate.sent_request = Some(r.request_id.clone()); b.endpoint = e.clone();
+        b.gate.sent_request = Some(r.request_id.clone()); b.endpoint = Some(e.clone());
         crate::log(&format!("TX 0x4301 complete peer={} receiver={} iface={} addresses={:?} port={} public_key_prefix={}",
             b.event.peer_mac, e.device_id, e.interface, e.addresses, e.port, &e.public_key[..8]));
         publish(b, "sent", ""); false

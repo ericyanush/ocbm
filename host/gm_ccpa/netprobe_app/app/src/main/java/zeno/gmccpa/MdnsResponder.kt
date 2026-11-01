@@ -46,6 +46,7 @@ class MdnsResponder(
     private val running = AtomicBoolean(false)
     private var sock: MulticastSocket? = null
     private var thread: Thread? = null
+    @Volatile private var externalSend: ((ByteArray) -> Boolean)? = null
 
     /** Our own hostname. NOT the platform's `Android.local` — we must own the A record for it. */
     private val hostname = "$instance.local"
@@ -100,6 +101,24 @@ class MdnsResponder(
         return true
     }
 
+    /** Use a transport owned elsewhere (the OCBM AP tunnel) while keeping the exact DNS responder. */
+    fun startExternal(address: InetAddress, sendPacket: (ByteArray) -> Boolean): Boolean {
+        if (!running.compareAndSet(false, true)) return true
+        val ipv4 = address as? Inet4Address ?: run { running.set(false); return false }
+        advertised = ipv4
+        externalSend = sendPacket
+        log.i("responder up over external transport: $serviceFqdn -> $hostname:$port @ ${ipv4.hostAddress}")
+        announce()
+        return true
+    }
+
+    /** Feed one DNS packet received from the adapter AP. Only mDNS queries can elicit a response. */
+    fun ingestExternal(packet: ByteArray) {
+        if (!running.get() || packet.size > 9000) return
+        runCatching { handleQuery(packet, packet.size) }
+            .onFailure { log.w("external query handling: ${it.javaClass.simpleName}: ${it.message}") }
+    }
+
     fun stop() {
         if (!running.compareAndSet(true, false)) return
         // Retract before the socket closes. Without a goodbye our SRV/TXT/A linger in iOS's cache for
@@ -110,6 +129,7 @@ class MdnsResponder(
         try { thread?.join(1200) } catch (_: InterruptedException) {}
         try { sock?.close() } catch (_: Throwable) {}
         sock = null; thread = null
+        externalSend = null
         log.i("responder stopped")
     }
 
@@ -205,6 +225,7 @@ class MdnsResponder(
     }
 
     private fun send(pkt: ByteArray): Boolean = try {
+        externalSend?.let { return it(pkt) }
         sock?.send(DatagramPacket(pkt, pkt.size, InetAddress.getByName(GROUP), PORT))
         true
     } catch (t: Throwable) { log.w("send: ${t.javaClass.simpleName}: ${t.message}"); false }

@@ -5,6 +5,7 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.SystemClock
 import java.io.BufferedInputStream
 import java.io.OutputStream
 import java.net.InetAddress
@@ -24,6 +25,41 @@ import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+
+/** Local socket probes must never claim a phone slot or hijack the current session. */
+internal object ReceiverTcpDiagnostics {
+    private val ports = java.util.concurrent.ConcurrentHashMap<Int, Long>()
+
+    fun connect(address: InetAddress, port: Int, timeoutMs: Int = 3000): String {
+        val started = System.nanoTime()
+        ports.entries.removeAll { started - it.value > TimeUnit.SECONDS.toNanos(60) }
+        var sourcePort = -1
+        return try {
+            Socket().use { socket ->
+                socket.bind(InetSocketAddress(0))
+                sourcePort = socket.localPort
+                ports[sourcePort] = started
+                socket.connect(InetSocketAddress(address, port), timeoutMs)
+                "PASS TCP connected local=${socket.localAddress.hostAddress}:${socket.localPort} " +
+                    "remote=${address.hostAddress}:$port elapsed_ms=${(System.nanoTime() - started) / 1_000_000}"
+            }
+            // On success retain the marker until accept(), which may run after connect() returns.
+        } catch (error: Exception) {
+            ports.remove(sourcePort)
+            "FAIL remote=${address.hostAddress}:$port elapsed_ms=${(System.nanoTime() - started) / 1_000_000} " +
+                "error=${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    fun consume(socket: Socket): Boolean {
+        val started = ports[socket.port] ?: return false
+        if (System.nanoTime() - started > TimeUnit.SECONDS.toNanos(60)) return false
+        val address = socket.inetAddress
+        val local = address.isLoopbackAddress ||
+            runCatching { java.net.NetworkInterface.getByInetAddress(address) != null }.getOrDefault(false)
+        return local && ports.remove(socket.port, started)
+    }
+}
 
 /** Pure selection rule shared by tests and the discovery callback. */
 internal fun isAllowedCarPlayCandidate(
@@ -174,8 +210,15 @@ class CarPlayRx(
     /** Diagnostic switch: leave only the framework-managed NsdManager AirPlay advertisement active. */
     private val selfHostedMdnsEnabled: Boolean = true,
     private val startSessionOnly: Boolean = false,
+    /** Null listens on all addresses; a concrete address confines the control listener. */
+    val controlBindAddress: InetAddress? = null,
+    /** Optional OCBM socket broker for the dongle-Wi-Fi tunnel mode. */
+    private val socketTunnelRelay: zeno.gmccpa.pair.SocketTunnelRelay? = null,
+    /** When set, publish the AirPlay service through the adapter AP instead of Android NsdManager. */
+    private val externalMdnsAddress: String? = null,
 ) {
     val receiverEpoch: String = java.util.UUID.randomUUID().toString()
+    val controlPort: Int get() = port
     @Volatile private var startSessionPeer: String? = null
     @Volatile private var startSessionInterface: String? = null
     @Volatile private var startSessionDeadlineNs: Long = 0
@@ -199,10 +242,21 @@ class CarPlayRx(
     private fun startSessionInboundAllowed(c: Socket, selectedPeer: String?, claimed: Boolean = false): Boolean {
         if (selectedPeer == null || selectedPeer != startSessionPeer || (!claimed && liveConnections.get() > 0) ||
             System.nanoTime() > startSessionDeadlineNs) return false
-        val iface = runCatching { java.net.NetworkInterface.getByName(startSessionInterface) }.getOrNull() ?: return false
-        val local = c.localAddress?.address ?: return false
-        if (iface.inetAddresses.toList().none { it.address.contentEquals(local) }) return false
-        val remote = c.inetAddress.hostAddress?.substringBefore('%') ?: return false
+        val local = c.localAddress ?: return false
+        val proxyPeer = socketTunnelRelay?.phoneAddressForProxySourcePort(c.port)
+        val localOnExpectedInterface = if (startSessionInterface == "dongle-ap") {
+            // The adapter accepts the phone-facing socket on its AP, then proxies it to this
+            // loopback listener. The accepted AAOS socket therefore cannot have the adapter AP's
+            // address as its local endpoint; validate the tunnel's recorded AP-side peer instead.
+            local.isLoopbackAddress && !proxyPeer.isNullOrBlank()
+        } else {
+            val iface = runCatching { java.net.NetworkInterface.getByName(startSessionInterface) }.getOrNull()
+                ?: return false
+            iface.inetAddresses.toList().any { it.address.contentEquals(local.address) }
+        }
+        if (!localOnExpectedInterface) return false
+        val remote = (proxyPeer?.substringBeforeLast(':') ?: c.inetAddress.hostAddress)
+            ?.substringBefore('%') ?: return false
         // A direct callback may beat mDNS. Native SETUP verifies its selected Bluetooth identity
         // before allocating media sockets; already-known addresses of another phone fail early.
         return peerAddressesByMac.none { (mac, addresses) -> mac != selectedPeer && remote in addresses }
@@ -528,6 +582,7 @@ class CarPlayRx(
     @Volatile private var lastDetectedKey: String? = null
 
     companion object {
+        private const val NATIVE_FEED_SLOW_MS = 250L
         private const val BT_PHASE_IDLE = 0x00
         private const val BT_PHASE_WIFI_HANDOFF = 0x06
         private const val BT_PHASE_PAIR_REJECTED = 0x07
@@ -682,12 +737,12 @@ class CarPlayRx(
         if (stopped) { log.e("start() on a stopped receiver — construct a new CarPlayRx instead"); return }
         if (!running.compareAndSet(false, true)) { log.i("already running"); return }
         discoveryPaused.set(discoveryPausedInitially)
-        acquireMdnsMulticastLockIfRequired()
+        if (externalMdnsAddress == null) acquireMdnsMulticastLockIfRequired()
         // Every caller is already off the main thread, and the bind below must stay that way. Say so
         // if that ever stops being true rather than letting it surface as a NetworkOnMainThread.
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper())
             log.w("start() is running on the main thread — the :$port bind does not belong here")
-        nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
+        if (externalMdnsAddress == null) nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
         // ORDER IS LOAD-BEARING. `GET /ctrl-int/1/connect` does not make iOS dial us; it sets a
         // PENDING AUTOCONNECT which iOS resolves immediately against its ALREADY-POPULATED Wi-Fi
         // endpoint index. Observed on device: the lookup ran and logged
@@ -706,9 +761,14 @@ class CarPlayRx(
         // Binding before the dispatch makes the first health reading true, and makes a genuine bind
         // failure say so in its own line instead of surfacing as a mysterious health FAIL.
         val srv = try {
-            ServerSocket().apply { reuseAddress = true; bind(InetSocketAddress(port)) }
+            ServerSocket().apply {
+                try {
+                    reuseAddress = true
+                    bind(InetSocketAddress(controlBindAddress, port))
+                } catch (error: Throwable) { close(); throw error }
+            }
         } catch (t: Throwable) {
-            log.e("listen bind FAILED on :$port — ${t.javaClass.simpleName}: ${t.message}")
+            log.e("listen bind FAILED address=${controlBindAddress?.hostAddress ?: "wildcard"}:$port — ${t.javaClass.simpleName}: ${t.message}")
             SessionTrace.Board.failed(B_LISTENER, "bind :$port ${t.javaClass.simpleName}")
             null
         }
@@ -722,8 +782,12 @@ class CarPlayRx(
         // charges NsdManager's own registration latency against the margin that exists to cover
         // iOS's indexing. onServiceRegistered is the event that means the record is really live.
         advertise()
-        browseForPhone()
-        pool.execute { rediscoverLoop() }
+        // iAP2 StartSession already selected the Bluetooth peer and caused its dial-back. The
+        // mDNS browse/nudge loop is only for legacy startup and must not race the selected slot.
+        if (!startSessionOnly) {
+            browseForPhone()
+            pool.execute { rediscoverLoop() }
+        }
 
         log.i("CarPlay RX up on :$port deviceid=$deviceId features=$FEATURES")
         log.i("=> advertising _airplay._tcp AND browsing _carplay-ctrl._tcp (discovery is bidirectional)")
@@ -866,6 +930,48 @@ class CarPlayRx(
      */
     private fun advertise() {
         val listenPort = port
+        if (externalMdnsAddress != null) {
+            val relay = socketTunnelRelay
+            if (relay == null) {
+                log.e("external mDNS requested without a socket tunnel relay")
+                advertisement.register(pending = {}, submit = { attempt ->
+                    advertisement.complete(attempt, false) { SessionTrace.Board.failed(B_ADVERT_NSD, "missing mDNS tunnel relay") }
+                })
+                return
+            }
+            advertisement.register(pending = {
+                SessionTrace.Board.down(B_ADVERT_NSD, "starting tunneled adapter-AP mDNS")
+                SessionTrace.expect(X_ADVERT, ADVERT_WAIT_MS, "adapter-AP mDNS advertisement did not start")
+            }, submit = { attempt ->
+                try {
+                    val address = InetAddress.getByName(externalMdnsAddress)
+                    val responder = MdnsResponder(SELF_HOSTED_NAME, "_airplay._tcp", listenPort, txtRecord(), log)
+                    selfMdns = responder
+                    val started = relay.startMdns(externalMdnsAddress) { packet -> responder.ingestExternal(packet) } &&
+                        responder.startExternal(address) { packet -> relay.sendMdns(packet) }
+                    advertisement.complete(attempt, started) {
+                        if (started) {
+                            log.i("tunneled AirPlay advertisement active on adapter AP ${address.hostAddress}:$listenPort")
+                            SessionTrace.met(X_ADVERT)
+                            SessionTrace.Board.up(B_ADVERT_NSD, "adapter AP ${address.hostAddress}:$listenPort")
+                        } else {
+                            selfMdns = null
+                            log.e("adapter-AP mDNS setup failed")
+                            SessionTrace.cancel(X_ADVERT, "adapter-AP mDNS setup failed")
+                            SessionTrace.Board.failed(B_ADVERT_NSD, "adapter-AP mDNS setup failed")
+                        }
+                    }
+                } catch (t: Throwable) {
+                    selfMdns = null
+                    advertisement.complete(attempt, false) {
+                        log.e("adapter-AP mDNS start failed: ${t.javaClass.simpleName}: ${t.message}")
+                        SessionTrace.cancel(X_ADVERT, "adapter-AP mDNS start exception")
+                        SessionTrace.Board.failed(B_ADVERT_NSD, "adapter-AP mDNS start exception")
+                    }
+                }
+            })
+            return
+        }
         val info = NsdServiceInfo().apply {
             serviceName = ACCESSORY_NAME
             serviceType = "_airplay._tcp"
@@ -1538,6 +1644,11 @@ class CarPlayRx(
                     continue
                 }
                 acceptFailures = 0
+                if (ReceiverTcpDiagnostics.consume(c)) {
+                    log.i("local TCP diagnostic accepted local=${c.localAddress?.hostAddress}:${c.localPort} peer=${c.inetAddress?.hostAddress}:${c.port}")
+                    runCatching { c.close() }
+                    continue
+                }
                 log.i(">>> INBOUND CONTROL CONNECTION local=${c.localAddress?.hostAddress}:${c.localPort} peer=${c.inetAddress?.hostAddress}:${c.port}")
                 val selectedPeer = pinnedPhoneMac.get()
                 val selectedGeneration = handoffGeneration.get()
@@ -1695,13 +1806,17 @@ class CarPlayRx(
         // encrypted channel, but the native core must come back out to the relay for the two chip
         // ops, and those calls are the step. See [TracedRelay].
         val traced = TracedRelay(relay, addr, phoneMac ?: pinnedPhoneMac.get() ?: "unknown")
-        val h = NativeCore.start(pi, edSeed, info, peers, addr, traced, if (startSessionOnly) phoneMac.orEmpty() else "")
+        val proxySourcePort = (c.remoteSocketAddress as? java.net.InetSocketAddress)?.port ?: -1
+        val tunnelPhonePeer = socketTunnelRelay?.phoneAddressForProxySourcePort(proxySourcePort).orEmpty()
+        val h = NativeCore.start(pi, edSeed, info, peers, addr, traced, if (startSessionOnly) phoneMac.orEmpty() else "",
+            controlBindAddress?.let { c.localSocketAddress.toString().removePrefix("/") }.orEmpty(), socketTunnelRelay,
+            tunnelPhonePeer)
         if (h == NativeCore.BUSY) return h   // the caller closes; do NOT report a session up
         if (h != 0L) {
             traced.gen = h
             latestGen = h
             sessionPhoneMac = phoneMac
-            log.i("native receiver core started for $addr gen=$h (/info ${info.size}B)")
+            log.i("native receiver core started for $addr gen=$h (/info ${info.size}B) sessionBinding=${controlBindAddress?.hostAddress ?: "wildcard"}")
             SessionTrace.Board.up(B_CORE, "gen=$h peer=$addr")
             onControlConnectionAccepted?.let { cb -> fenced("onControlConnectionAccepted") { cb(phoneMac, h) } }
             // Stand the A/V consumers up NOW, not when the phone asks. Streams are SETUP within
@@ -1784,6 +1899,8 @@ class CarPlayRx(
         var wasEncrypted = false
         var rxBytes = 0L
         var txBytes = 0L
+        var nativeFeedCalls = 0L
+        var loggedFirstReadWait = false
         var closeReason = "receiver loop ended"
         val firstRequestLine = HttpStartLineProbe("request", handle, log::i)
         val firstResponseLine = HttpStartLineProbe("response", handle, log::i)
@@ -1808,6 +1925,10 @@ class CarPlayRx(
                 // CarPlay A/V is still flowing. SO_KEEPALIVE is enabled as an additional hint, but
                 // Android does not expose per-socket probe timing here; the A/V-idle cutoff is the
                 // bounded liveness mechanism and remains authoritative.
+                if (!loggedFirstReadWait && rxBytes == 0L) {
+                    loggedFirstReadWait = true
+                    log.i("control receiver waiting for first phone bytes (gen=$handle peer=$peer)")
+                }
                 val n = try {
                     ins.read(buf)
                 } catch (t: SocketTimeoutException) {
@@ -1830,14 +1951,30 @@ class CarPlayRx(
                     break
                 }
                 rxBytes += n
+                if (rxBytes == n.toLong()) {
+                    log.i("control receiver got first phone bytes (gen=$handle bytes=$n peer=$peer)")
+                }
                 firstRequestLine.observe(buf, n)
                 // null reply = the core signalled close (feed error, panic, or this generation was
                 // superseded by a hijacking reconnect). Either way, end this connection.
+                val feedCall = ++nativeFeedCalls
+                val feedStartedAt = SystemClock.elapsedRealtime()
+                val traceFeed = feedCall <= 12L
+                if (traceFeed) {
+                    log.i("nativeFeed begin (gen=$handle call=$feedCall bytes=$n encrypted=$wasEncrypted totalRx=$rxBytes)")
+                }
                 val reply = try {
                     NativeCore.feed(handle, buf.copyOf(n))
                 } catch (t: Throwable) {
                     closeReason = "native feed threw ${t.javaClass.simpleName}: ${t.message}"
                     throw t
+                }
+                val feedElapsed = SystemClock.elapsedRealtime() - feedStartedAt
+                if (traceFeed || feedElapsed >= NATIVE_FEED_SLOW_MS) {
+                    log.i(
+                        "nativeFeed complete (gen=$handle call=$feedCall elapsed=${feedElapsed}ms " +
+                            "reply=${reply?.size ?: "null"}B encryptedBefore=$wasEncrypted)",
+                    )
                 }
                 if (reply == null) {
                     closeReason = "native feed requested close"
@@ -2276,12 +2413,18 @@ class CarPlayRx(
                 val target = request.groupValues[2].substringBefore('?').take(MAX_LOG_TARGET_CHARS)
                 emit("control first request line (gen=$generation): ${request.groupValues[1]} $target")
             } else {
-                emit("control $direction first line not recognized (gen=$generation, ${lineLength}B)")
+                val preview = prefix.copyOfRange(0, lineLength.coerceAtMost(MAX_PREVIEW_BYTES))
+                    .toString(Charsets.US_ASCII)
+                    .map { if (it.code in 0x20..0x7e) it else '.' }
+                    .joinToString("")
+                    .substringBefore('?')
+                emit("control $direction first line not recognized (gen=$generation, ${lineLength}B, preview=\"$preview\")")
             }
         }
 
         private companion object {
             const val MAX_START_LINE_BYTES = 512
+            const val MAX_PREVIEW_BYTES = 64
             const val MAX_LOG_TARGET_CHARS = 160
             val REQUEST_LINE = Regex("^([A-Z]{3,12})\\s+(\\S+)\\s+HTTP/1\\.[01]$")
             val RESPONSE_LINE = Regex("^HTTP/1\\.[01]\\s+(\\d{3})(?:\\s+[^\\r\\n]*)?$")

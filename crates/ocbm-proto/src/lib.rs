@@ -32,6 +32,9 @@ pub const CH_MFI: u16 = 0x0001;
 pub const MFI_TAG_LEN: usize = 1;
 pub const CH_CONSOLE: u16 = 0x0002;
 pub const CH_IP: u16 = 0x0010;
+/// Bidirectional raw TCP/UDP socket broker for the dongle-Wi-Fi transport. This is deliberately
+/// separate from CH_IP: CH_IP is host-initiated outbound networking and has no accept/credit model.
+pub const CH_TUNNEL: u16 = 0x0013;
 pub const CH_FILE: u16 = 0x0011; // host->box file push (reliable binary deploy), see FILE_* sub-frames
 pub const CH_ETH: u16 = 0x0012; // raw L2 ethernet frames bridged box<->host (each payload = one frame)
 pub const CH_VIDEO: u16 = 0x0020; // box->host A/V: MAIN screen video. Forward-encrypted (ChaCha20-Poly1305) with seq+SEAM_MAGIC seam framing; the host decrypts + decodes (OCBM_FWD_ENC model). Box seam :9001
@@ -364,6 +367,8 @@ pub const CAP_FILE: u32 = 0x0000_0010;
 pub const CAP_ETH: u32 = 0x0000_0020; // box can bridge a raw-ethernet netdev (ncm0) over CH_ETH
 pub const CAP_MULTI_IAP2: u32 = 0x0000_0040; // box reports independently tracked per-phone iAP2 slots
 pub const CAP_CARPLAY_START_SESSION: u32 = 0x0000_0080;
+/// Adapter can host the phone-facing TCP/UDP sockets and relay their payloads to the AAOS host.
+pub const CAP_SOCKET_TUNNEL: u32 = 0x0000_0100;
 pub const CT_CARPLAY_START_SESSION: u8 = 0x20; // host -> box: versioned native receiver request JSON
 pub const CT_CARPLAY_START_SESSION_EVENT: u8 = 0x21; // box -> host: per-slot bootstrap event JSON
 
@@ -377,6 +382,26 @@ pub const IP_OPEN: u8 = 0x01; // TCP: data = target "ip:port"; box connect()s an
 pub const IP_DATA: u8 = 0x02; // data = stream bytes (TCP) or one datagram (UDP)
 pub const IP_CLOSE: u8 = 0x03; // no data
 pub const IP_OPEN_UDP: u8 = 0x04; // UDP: data = target "ip:port"; box binds + connect()s a UdpSocket
+
+// OCBM_CH_TUNNEL socket-broker frames. Payload starts [op u8][epoch u32 LE][object u32 LE].
+// `object` names a listener/datagram endpoint or an accepted TCP stream. `epoch` is minted by the
+// host for each USB session; frames from an older session are ignored even if IDs are reused.
+// TCP_DATA is reliable and credit-limited; UDP_DATAGRAM is atomic and carries peer address metadata.
+pub const TUNNEL_LISTEN_TCP: u8 = 0x01; // host->box [family u8][local AP address][prefix u8][port u16 LE][adapter->host credit u32 LE]
+pub const TUNNEL_BIND_UDP: u8 = 0x02; // same bind tuple; final credit is ignored
+pub const TUNNEL_CLOSE: u8 = 0x03; // either direction [reason u8]
+pub const TUNNEL_ACCEPT: u8 = 0x04; // box->host [listener_id u32 LE][host->adapter credit u32 LE][peer family u8][addr][port u16 BE], frame object is stream_id
+pub const TUNNEL_TCP_DATA: u8 = 0x05; // either direction [stream_id u32 LE][bytes]; uses byte credits
+pub const TUNNEL_TCP_CREDIT: u8 = 0x06; // host->box [stream_id u32 LE][additional_bytes u32 LE]
+pub const TUNNEL_TCP_EOF: u8 = 0x07; // either direction [stream_id u32 LE], ordered after prior data
+pub const TUNNEL_UDP_DATAGRAM: u8 = 0x08; // box->host [peer family u8][addr][port u16 BE][bytes]
+pub const TUNNEL_UDP_SEND: u8 = 0x09; // host->box [peer family u8][addr][port u16 BE][bytes]
+pub const TUNNEL_RESULT: u8 = 0x0A; // box->host [status u8][bound_port u16 LE][message bytes]
+pub const TUNNEL_START: u8 = 0x0B; // host->box [epoch u32 LE] resets all prior broker state
+pub const TUNNEL_STOP: u8 = 0x0C; // host->box [epoch u32 LE] closes all broker-owned sockets
+pub const TUNNEL_MDNS_START: u8 = 0x0D; // host->box [family u8][AP address]; joins mDNS on AP interface; RESULT id=0
+pub const TUNNEL_MDNS_PACKET: u8 = 0x0E; // box->host [peer tuple][DNS packet], frame object=0
+pub const TUNNEL_MDNS_SEND: u8 = 0x0F; // host->box [DNS packet], multicast to 224.0.0.251:5353
 
 // OCBM_CH_FILE sub-frame types. Host pushes one file at a time to the box so binary
 // deploys ride the reliable accessory pipe instead of corruption-prone base64-over-UART.
