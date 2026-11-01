@@ -6579,8 +6579,10 @@ mod loop_timing_tests {
             "handle_other", "reassembly_push", "usb_dispatch", "maintenance", "usb_drain",
             "poll_wait", "broker"] {
             timing.record(name, Instant::now());
-            // Representative large counters force multiple export-safe lines.
-            timing.stages.get_mut(name).unwrap().1 = 123_456_789;
+            // Exercise the maximum counter widths as well as the normal stage names.
+            let entry = timing.stages.get_mut(name).unwrap();
+            entry.1 = u128::MAX;
+            entry.2 = u128::MAX;
         }
         timing.since -= Duration::from_secs(6);
         let lines = timing.report().unwrap();
