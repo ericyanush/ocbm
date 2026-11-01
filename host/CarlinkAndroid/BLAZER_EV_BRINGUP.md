@@ -1,0 +1,60 @@
+# Blazer EV bring-up: experiments and findings
+
+This records testing on the GM Blazer EV running Android 14 through 2026-10-31. The Silverado's split USB helper and direct vehicle-hotspot connection remain useful comparison paths. Results below describe the tested vehicle, not all Android 14 or AAOS implementations.
+
+## Installing and reaching the adapter
+
+- Play distribution installed the main app. Attempts to use the Files UI to install the bundled helper did not produce a working helper installation. A third-party file explorer also hid APK files. DocumentsUI file picking, file browsing, and launching the package installer are separate operations; opening a picker did not establish that installation was available.
+- Added optional **Main app direct USB**, retaining **Split USB helper** as the default. Direct mode requests USB permission and opens the bulk interface in the main app UID. This allows testing without the helper. The split helper remains the established truck path.
+- Both standard OCBM and NCM identities produced a vehicle “USB device not supported” popup. The popup alone does not prove the interface is inaccessible: another device reportedly shows it too. Use the USB diagnostics device list, grant and endpoint information to distinguish discovery from permission/open failures.
+- Testing `1314:1520` did not resolve discovery. An additional VID change also failed. Testing `0424:4917` did expose the adapter in Android's device list with bulk endpoints `0x01` and `0x81`, and selecting that identity in the main app enabled connection.
+- `0424:4917` is an experimental compatibility identity, not an assigned project identity or proof of why GM accepted it. Select it explicitly in direct USB settings. The app selection does not rewrite gadget descriptors: configure the adapter separately, including any boot/re-enumeration scripts that restore IDs. Moving the adapter between Mac and vehicle power cycles it, so temporary sysfs changes alone are insufficient.
+- On the Mac, confirm descriptors and use `ocbm-host hello VID PID` before moving the adapter. `box_deploy.sh --vid HEX --pid HEX` selects the current accessory identity for deployment/recovery; SSH uses `root@192.168.50.2` by default. Public-key authentication required fixing ownership of root's home directory. The adapter has no remote scp executable, so deployment uses the script's supported transfer path.
+
+## Vehicle network experiments
+
+- Added interface and USB diagnostics, receiver self-tests, an outbound TCP probe, a configurable inbound HTTP listener and an optional local-only hotspot test.
+- The vehicle hotspot was broadcasting even when automatic hotspot-bridge selection failed. Added receiver control-port configuration and an explicit bridge-only binding option. A reboot can change the bridge IP; resolve it afresh and use the IP from the same attempt.
+- Outbound TCP worked both on the app-created hotspot and on the standard vehicle hotspot.
+- Inbound tests to arbitrary ports timed out, including tests against a separate file-server app. The app-created hotspot did not remove this behavior. An advertised GM secure ADB service on port 5555 was reachable, but refused ordinary ADB use.
+- Ports 5000 and 5001 were reachable in listener tests. A scan of 4800–5200 found responses only on those two ports. Unbound responsive ports failed quickly; other tested ports timed out. This is consistent with inbound filtering or policy, but no privileged firewall inspection established the precise cause. Do not generalize that all other ports or UDP are blocked.
+- Explicit bridge binding and a configurable control port allowed progress to “phone connected / starting CarPlay.” They did not establish a working direct session: CarPlay allocates additional TCP/UDP session sockets dynamically. The native receiver now inherits an explicit binding for these sockets as well.
+- Requesting `NEARBY_WIFI_DEVICES` and successfully creating a local hotspot did not solve inbound reachability. There is no evidence that another ordinary app permission unlocks the filtered ports. IPv6 `%en0` is the Mac's local scope identifier for a link-local address, not a hostname suffix to send to another host.
+
+## Dongle Wi-Fi through USB
+
+The alternative network mode keeps the native receiver in AAOS. The adapter owns phone-facing TCP/UDP sockets on its AP and transports their bytes/datagrams over OCBM `CH_TUNNEL`; Android maps them to receiver sockets on loopback. The adapter does not decrypt or render CarPlay media. iAP2 StartSession provides the receiver endpoint; mDNS is optional compatibility support rather than the prerequisite for discovering this endpoint.
+
+The path includes capability negotiation, per-stream TCP byte credits, bounded queues, UDP peer addressing and socket registration from the native receiver through JNI. Control-peer mapping preserves the actual phone identity behind the loopback proxy. Microphone UDP is routed through the same broker.
+
+Early attempts still handed the phone the vehicle hotspot. The supervisor now distinguishes bridge mode from dongle-AP mode when applying credentials, and StartSession can wait for a live adapter AP endpoint instead of requiring a vehicle endpoint at SUBSCRIBE. In tunnel mode, SSID/address/port must consistently describe the adapter AP. Updating only Android cannot correct an old supervisor that rewrites the AP configuration.
+
+Several attempts progressed through Wi-Fi association but stalled before streaming. Native socket registration, explicit local binding and receiver diagnostics were added. Native-crash investigation also led to bounded next-launch collection of Android process-exit records and binary tombstone/ANR artifacts in exported diagnostics, along with native/session and decoder lifecycle diagnostics.
+
+Streaming has now been observed through the dongle AP and USB tunnel. Startup remained slow, and video initially rendered around 9–11 fps. The first-session log showed the screen TCP stream closing after the Android per-stream 32-packet queue filled. A packet-count limit did not match the byte-credit protocol; this is now a 256 KiB byte-bounded queue, with stream throughput and queue high-water logging. The user reported improved but still slow interactive video after that update.
+
+The next code review found that the adapter broker's mpsc events did not wake `ocbmd`'s poll loop, allowing up to 500 ms of idle scheduling delay repeatedly during setup/media. A nonblocking socketpair now wakes poll after event publication. Batches over 64 events force another immediate pass so clearing notifications cannot strand work. A host regression test covers notification readiness, draining and subsequent publications. Vehicle performance after this wakeup fix is not yet validated.
+
+## Display and remaining work
+
+The tested display reports a 2914×1134 panel with top/right cutouts of 167/285 px. The app advertises the even-aligned safe rectangle `(0,168,2628,966)` and allows background drawing outside it. The user observed clipping near the upper-right physical cutout. An earlier decoder format also reported a 2400×960 visible crop while the configured panel was 2914×1134. These are leads, not a demonstrated cropping root cause. Verify the actual negotiated view-area features and decoder crop from the same active session before changing surface scaling or touch coordinates.
+
+The exported `connected` bundle ended around screen-stream establishment and did not contain a sustained playback interval with the new tunnel metrics. The user did observe and interact with rendered video in the foreground; the captured lifecycle transitions do not disprove that observation. Export timing/coverage must be considered when drawing conclusions from missing frame metrics.
+
+For the next comparison, update both `ocbmd` and the main APK, then collect at least 30 seconds of animated content. Inspect `[tunnel-perf]` event age on the adapter, `[CP_TUNNEL]` throughput/queue/socket-write/credit-send timings in Android, and `[video] perf` decoder waits and output counts. Decoder output-release counts do not measure actual panel presentation. See [the performance investigation plan](../../docs/carplay/TUNNEL_PERFORMANCE_INVESTIGATION.md) for the remaining instrumentation and test sequence.
+
+## Components to update
+
+| Change | Deployment |
+| --- | --- |
+| Direct USB, diagnostic tools, network mode, receiver settings, queue and decoder timing | Main AAOS APK, including rebuilt JNI libraries when native receiver code changes |
+| Socket tunnel protocol and poll wakeup | Rebuild and deploy adapter `ocbmd` |
+| Deferred AP endpoint / iAP2 handoff | Rebuild and deploy adapter `btd` |
+| Correct dongle AP credentials | Deploy `tools/session_supervisor.sh` to the adapter's matching supervisor path |
+| USB identity test | Apply persistent gadget configuration separately; select the matching app identity and deployment VID/PID |
+
+The USB helper has no source changes in this bring-up batch. Keep each vehicle's USB ownership and phone-network mode explicit rather than assuming the Blazer's choices apply to the truck.
+
+## Local validation of this batch
+
+The adapter wakeup regression test passed, as did the Android sideload-debug Kotlin compile and focused unit tests for the diagnostic HTTP server, outbound probe, receiver control-port storage, receiver TCP diagnostics and hotspot endpoint selection. Shell syntax checks passed for the deployment and supervisor scripts. Android checks excluded `buildCarPlayJni`; they do not substitute for rebuilding both Android native-library ABIs and the ARM adapter binaries, or for an on-vehicle test of the latest wakeup change.

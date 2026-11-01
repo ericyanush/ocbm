@@ -210,10 +210,14 @@ the original Carlink helper; the main app and helper therefore do not need match
 Both APKs must still be installed for the same AAOS user. As with any exported unprotected service,
 another app that knows its component can attempt to bind.
 
-The app must not call `UsbManager.requestPermission()` or open the USB device under its own UID. If
-the helper is absent/unbindable, the adapter is not enumerated, or its silent grant is missing, the
-UI/logs report the helper failure instead of falling back to a permission prompt. After an adapter
-reboot/re-enumeration, the fixed handler grants the helper again and the app can reconnect.
+The default `Split USB helper` mode does not call `UsbManager.requestPermission()` or open the USB
+device under the main app UID. This remains the recommended mode on GM trucks where the fixed
+handler grants the helper UID. The Control tab also offers an opt-in `Main app direct USB` mode for
+head units where sideloading the helper is blocked. Direct mode calls `UsbManager.requestPermission()`
+as the main app UID, then opens and claims the same OCBM bulk interface in-process. It may fail on
+GM units whose USB policy only grants the fixed-handler UID. Select the mode and press **Apply USB
+path and reconnect**; the choice is saved per head unit and helper mode remains the default for
+existing installs. The direct mode does not change the adapter firmware or OCBM framing.
 
 Build/install for a test unit:
 
@@ -1536,3 +1540,7 @@ pinned throughout recovery so another paired phone cannot win by resolving first
   Re-addable later via `CMD_SIRI_DOWN`/`UP`.
 - **App-driven SETUP deferred** (`appDrivenSetup: false`). The box's local response is the designed
   sticky fallback. This also defers the `cfg_crc` drift check that rides `RS_OPEN`.
+
+## Blazer EV bring-up
+
+See [Blazer EV experiments and findings](BLAZER_EV_BRINGUP.md) for the Android 14 USB identity tests, network filtering observations, dongle Wi-Fi tunnel, deployment requirements and remaining performance/display investigations.
