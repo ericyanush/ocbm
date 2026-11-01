@@ -58,3 +58,9 @@ The USB helper has no source changes in this bring-up batch. Keep each vehicle's
 ## Local validation of this batch
 
 The adapter wakeup regression test passed, as did the Android sideload-debug Kotlin compile and focused unit tests for the diagnostic HTTP server, outbound probe, receiver control-port storage, receiver TCP diagnostics and hotspot endpoint selection. Shell syntax checks passed for the deployment and supervisor scripts. Android checks excluded `buildCarPlayJni`; they do not substitute for rebuilding both Android native-library ABIs and the ARM adapter binaries, or for an on-vehicle test of the latest wakeup change.
+
+## Host-owned receiver service audit
+
+When SUBSCRIBE explicitly enables `wirelessStartSession: true`, `ocbmd` now closes legacy on-box HID/microphone/RTSP connections, suppresses their forwarding channels and skips eager microphone/RTSP connection attempts. Those attempts each allowed a 500 ms connect timeout on the USB dispatch thread. Measured event age approached one second despite wake notifications; the attempted connections are a plausible contributor, but the capture did not time each connection individually.
+
+The supervisor uses the same setting to disable wired receiver arming/escalation, wired hot-handover/radio-yield logic and wireless Android Auto startup. The Bluetooth driver's existing native-StartSession gate already suppresses `carplayd` startup. Bluetooth attachment, pairing/iAP2 slots, MFi access, the requested SoftAP/DHCP, OCBM management/diagnostics and socket brokerage remain required. Legacy modes without this explicit setting retain their existing behavior. Deploy both `ocbmd` and the supervisor script for these gates; no main-app update or btd rebuild is required for this service audit.

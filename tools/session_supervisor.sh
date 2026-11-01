@@ -365,6 +365,10 @@ arm_aa() {
 # `_`-prefixed local, per this script's convention: bare names clobber the main loop's variables.
 arm_aa_wireless() {
   _aaw_v="${1:-}"
+  if host_receiver_enabled; then
+    [ -n "$_aaw_v" ] && echo "[sup] host receiver mode -> wireless Android Auto disabled"
+    return 0
+  fi
   if ! wifi_ap_enabled; then
     [ -n "$_aaw_v" ] && echo "[sup] wifi_ap:false -> wireless Android Auto pump NOT started (the box has no SoftAP to listen on)"
     return 0
@@ -410,6 +414,7 @@ aa_bridge_wireless_down() {
 }
 
 arm() {
+  host_receiver_enabled && return 1
   if aa_owns_session; then
     echo "[sup] ARM suppressed — a live Android Auto session owns the phone port (dual-mode, first-come-wins)"
     return 1
@@ -715,6 +720,12 @@ WIRELESS_CFG=${CARPLAY_CFG_FILE:-/tmp/carplay_cfg.yaml}
 # Default TRUE: only an explicit `wireless: false` in the host YAML disables it (wired-only). A missing
 # file / missing key / `wireless: true` all mean enabled. Kept a raw grep so ocbmd + this shell need no
 # YAML parser (carplayd's receiver ignores the key; the supervisor is its sole consumer).
+# The native AAOS receiver owns media/HID/session sockets. The adapter retains BT/iAP2,
+# MFi and (when requested) AP + socket brokerage, but never starts another projection stack.
+host_receiver_enabled() {
+  grep -qiE '^[[:space:]]*wirelessStartSession:[[:space:]]*true([[:space:]#]|$)' "$WIRELESS_CFG" 2>/dev/null
+}
+
 wireless_enabled() { ! grep -qiE '^[[:space:]]*wireless:[[:space:]]*false' "$WIRELESS_CFG" 2>/dev/null; }
 # Android Auto enable lever (app-driven, docs/carplay/04_CAPABILITIES_AND_CONFIG.md). Default ON so a plugged Android phone projects out
 # of the box; the app opts out with `android_auto: false` in the pushed carplay_cfg.yaml (docs/androidauto/02_ARBITRATION.md).
@@ -722,7 +733,7 @@ wireless_enabled() { ! grep -qiE '^[[:space:]]*wireless:[[:space:]]*false' "$WIR
 # (box_common::cfg::aa_enabled — the Rust-side definition this must stay in step with) and stands
 # down on it at every claim point AND mid-session, so turning the toggle off ends a live AA session
 # rather than waiting for the phone to be unplugged (docs/androidauto/02_ARBITRATION.md F3).
-aa_enabled() { ! grep -qiE '^[[:space:]]*android_auto:[[:space:]]*false' "$WIRELESS_CFG" 2>/dev/null; }
+aa_enabled() { ! host_receiver_enabled && ! grep -qiE '^[[:space:]]*android_auto:[[:space:]]*false' "$WIRELESS_CFG" 2>/dev/null; }
 
 # Is a wired CarPlay session LIVE right now? Blocks arm_aa, because Android Auto must never be armed
 # on top of a running CarPlay session — aa-bridge would claim /tmp/projection_owner out from under it,
@@ -903,7 +914,7 @@ wireless_up() {
   # This is what actually delivers "wired => radios off". A2's teardown was already working — the
   # captured log shows it going quiet after two firings, which only happens when `wireless_stack_up`
   # reads false — and then a bring-up put hostapd, wlan0 and hci0 straight back.
-  if ! hot_handover_enabled && phone_on_bus && ! wireless_owns_session; then
+  if ! host_receiver_enabled && ! hot_handover_enabled && phone_on_bus && ! wireless_owns_session; then
     echo "[sup] wireless_up SUPPRESSED — a WIRED session owns the box (Hot-Handover off)"
     return
   fi
@@ -1302,7 +1313,7 @@ while :; do
       # wireless_owns_session (the flag that can lie), so this fires ONLY for a real cable and never during a
       # healthy wireless-only session. preempt_wireless_for_wired() returns only once the flag is clear, so
       # the wired arm path below then runs (wireless_owns_session is now false).
-      if hot_handover_enabled && wireless_owns_session && wired_iphone_on_usb; then
+      if ! host_receiver_enabled && hot_handover_enabled && wireless_owns_session && wired_iphone_on_usb; then
         preempt_wireless_for_wired
       fi
       # (A2) STANDARD-MODE RADIO GATING — the mirror of (A), owner directive 2026-08-11.
@@ -1328,7 +1339,7 @@ while :; do
       # of the wired session. `phone_on_bus` was hardened in July for this same class of bug and
       # covers both modes; its `wireless_owns_session` clause is unreachable under the negation below.
       _a2_want=0
-      if ! hot_handover_enabled && phone_on_bus && ! wireless_owns_session; then
+      if ! host_receiver_enabled && ! hot_handover_enabled && phone_on_bus && ! wireless_owns_session; then
         _a2_want=1
       fi
       if [ "$_a2_want" != "${_a2_state:-0}" ]; then
@@ -1358,7 +1369,10 @@ while :; do
       # until the next app reconnect. Internally silent + pgrep-guarded, so a tick costs one pgrep.
       wireless_reconcile
       wireless_running && arm_aa_wireless
-      if aa_owns_session; then
+      if host_receiver_enabled; then
+        # btd owns handoff slots; no wired probing, receiver arming or escalation is needed.
+        :
+      elif aa_owns_session; then
         # Android Auto owns ci_hdrc.0 right now (aa-bridge holds a live AOAP link + the wired-aa owner
         # flag). Hands off entirely: no projection_up, no arm(), no escalation — aa-bridge self-manages
         # its session and the step-1 guards already suppress kill_session/escalate. (docs/androidauto/02_ARBITRATION.md.)

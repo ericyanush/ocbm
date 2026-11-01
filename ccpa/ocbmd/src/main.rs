@@ -1322,6 +1322,14 @@ fn json_escape(s: &str) -> String {
 /// Land the host's ephemeral YAML config for carplayd to read. Written atomically (`.tmp` + rename) so
 /// carplayd never reads a half-written file. An empty config removes the file (fall back to the box
 /// default) rather than leaving a zero-byte one.
+/// This session delegates the receiver to the host; the adapter supplies radios/MFi/sockets.
+fn host_receiver_config(cfg: &[u8]) -> bool {
+    std::str::from_utf8(cfg).unwrap_or("").lines().any(|line| {
+        let Some((key, value)) = line.trim().split_once(':') else { return false; };
+        key == "wirelessStartSession" && value.split('#').next().unwrap_or("").trim().eq_ignore_ascii_case("true")
+    })
+}
+
 fn write_cfg_file(bytes: &[u8]) {
     if bytes.is_empty() {
         clear_cfg_file();
@@ -3215,6 +3223,7 @@ impl Daemon {
     /// data-triggered connect would therefore deadlock: no connection → gate never delivered → no capture
     /// → no data → no connection. A refused connect (carplayd idle / no session) is cheap on localhost.
     fn ensure_mic_seam(&mut self) {
+        if host_receiver_config(&self.cfg) { return; }
         if self.mic_sock.is_some() {
             return;
         }
@@ -3364,6 +3373,7 @@ impl Daemon {
     /// therefore permanently select the plain local session. A refused connect (carplayd restarting)
     /// is cheap on localhost; the ≤500 ms subscribed poll cadence throttles the retry.
     fn ensure_rtsp_seam(&mut self) {
+        if host_receiver_config(&self.cfg) { return; }
         if self.rtsp_sock.is_some() {
             return;
         }
@@ -3943,6 +3953,12 @@ impl Daemon {
                     self.cfg = pl[1..].to_vec();
                     // Land the ephemeral YAML for carplayd to read per connection (task #5 / docs/carplay/04_CAPABILITIES_AND_CONFIG.md).
                     write_cfg_file(&self.cfg);
+                    if host_receiver_config(&self.cfg) {
+                        self.mic_sock = None;
+                        self.rtsp_sock = None;
+                        self.input_sock = None;
+                        eprintln!("[ocbmd] host receiver mode: legacy mic/RTSP services disabled; radios/MFi/socket tunnel retained");
+                    }
                     // A fresh SUBSCRIBE's YAML is authoritative over any prior CT_RADIO inhibit.
                     //
                     // This clear is UNCONDITIONAL on purpose, and an attempt to make it conditional
@@ -4128,9 +4144,9 @@ impl Daemon {
                     eth::send_frame(fd, pl); // send frame onto ncm0 (host -> iPhone)
                 }
             }
-            p::CH_INPUT => self.forward_input(pl), // HID input host -> carplayd -> iPhone (task #20)
-            p::CH_MIC => self.forward_mic(pl), // mic PCM host -> carplayd -> iPhone (type-100 uplink)
-            p::CH_RTSP => self.forward_rtsp(pl), // SETUP-relay bytes host -> carplayd (RS_RESP/RS_ERR)
+            p::CH_INPUT if !host_receiver_config(&self.cfg) => self.forward_input(pl), // HID input host -> carplayd -> iPhone (task #20)
+            p::CH_MIC if !host_receiver_config(&self.cfg) => self.forward_mic(pl), // mic PCM host -> carplayd -> iPhone (type-100 uplink)
+            p::CH_RTSP if !host_receiver_config(&self.cfg) => self.forward_rtsp(pl), // SETUP-relay bytes host -> carplayd (RS_RESP/RS_ERR)
             p::CH_MGMT => self.handle_mgmt(pl),  // box management (the app's "CCPA" tab)
             p::CH_TUNNEL => {
                 if let Some(tunnel) = &self.tunnel {
@@ -6456,5 +6472,17 @@ mod tests {
         assert!(!proc_name_matches("ocbmd", "ocbmd", "carplayd"));
         assert!(!proc_name_matches("run_ocbmd.sh", "run_ocbmd.sh", "ocbmd"));
         assert!(!proc_name_matches("", "", "ocbmd"));
+    }
+}
+
+#[cfg(test)]
+mod host_receiver_mode_tests {
+    use super::host_receiver_config;
+    #[test]
+    fn only_explicit_start_session_disables_adapter_receiver() {
+        assert!(host_receiver_config(b"accessoryConfig:\n  wirelessStartSession: true # host owns receiver\n"));
+        assert!(!host_receiver_config(b"wirelessStartSession: false\nwifi_ap: true\n"));
+        assert!(!host_receiver_config(b"# wirelessStartSession: true\n"));
+        assert!(!host_receiver_config(b""));
     }
 }
