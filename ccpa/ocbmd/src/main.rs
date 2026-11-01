@@ -60,13 +60,17 @@ impl LoopTiming {
         let entry = self.stages.entry(stage).or_default();
         entry.0 += 1; entry.1 += us; entry.2 = entry.2.max(us);
     }
-    fn report(&mut self) -> Option<String> {
+    fn report(&mut self) -> Option<Vec<String>> {
         if self.since.elapsed() < Duration::from_secs(5) { return None; }
-        let mut line = format!("[loop-perf] interval_ms={}", self.since.elapsed().as_millis());
+        let prefix = format!("[loop-perf] interval_ms={}", self.since.elapsed().as_millis());
+        let mut line = prefix.clone();
+        let mut lines = Vec::new();
         for (stage, (count, total, max)) in &self.stages {
-            line.push_str(&format!(" {stage}=count:{count},total_us:{total},max_us:{max}"));
+            let entry = format!(" {stage}=count:{count},total_us:{total},max_us:{max}");
+            if line.len() + entry.len() > 800 { lines.push(line); line = prefix.clone(); }
+            line.push_str(&entry);
         }
-        self.stages.clear(); self.since = Instant::now(); Some(line)
+        self.stages.clear(); self.since = Instant::now(); lines.push(line); Some(lines)
     }
 }
 
@@ -4669,7 +4673,10 @@ fn main() {
                     // wedge the guard above exists to prevent, on the one fd that matters most.
                     // Treat Ok(0) (EOF) and any non-WouldBlock error as transport death, taking the
                     // same exit-for-respawn path.
-                    match d.acc.read(&mut rbuf) {
+                    let read_started = Instant::now();
+                    let read_result = d.acc.read(&mut rbuf);
+                    loop_timing.record("accessory_read", read_started);
+                    match read_result {
                         Ok(0) => {
                             eprintln!(
                                 "[ocbmd] accessory EOF on read — USB transport gone; exiting for respawn"
@@ -4678,7 +4685,9 @@ fn main() {
                             std::process::exit(1);
                         }
                         Ok(n) => {
+                            let reassembly_started = Instant::now();
                             reasm.push(&rbuf[..n]);
+                            loop_timing.record("reassembly_push", reassembly_started);
                             while let Some((ch, flags, len)) = reasm.next(&mut plbuf) {
                                 if ch == p::CH_CTRL && plbuf.first() == Some(&p::CT_HELLO) {
                                     // This is intentionally recorded at the runtime framing boundary,
@@ -4687,7 +4696,15 @@ fn main() {
                                     #[cfg(not(test))]
                                     write_flag_atomic(USB_HELLO_SEEN_FLAG, true);
                                 }
+                                let handle_started = Instant::now();
                                 d.handle(ch, flags, &plbuf[..len]); // no per-frame copy
+                                loop_timing.record(match ch {
+                                    p::CH_CTRL => "handle_ctrl", p::CH_TUNNEL => "handle_tunnel",
+                                    p::CH_MFI => "handle_mfi", p::CH_INPUT => "handle_input",
+                                    p::CH_MIC => "handle_mic", p::CH_RTSP => "handle_rtsp",
+                                    p::CH_FILE => "handle_file", p::CH_IP => "handle_ip",
+                                    _ => "handle_other",
+                                }, handle_started);
                             }
                         }
                         // Spurious wake, or a signal-interrupted read. ocbmd installs no signal
@@ -4911,7 +4928,9 @@ fn main() {
         loop_timing.record("usb_drain", drain_started);
         loop_timing.record("whole_loop", loop_started);
         if d.log.enabled {
-            if let Some(line) = loop_timing.report() { d.log_internal(&line); }
+            if let Some(lines) = loop_timing.report() {
+                for line in lines { d.log_internal(&line); }
+            }
         }
 
         // Liveness LAST, so the stamp means "a whole dispatch pass completed", not "poll() returned".
@@ -6546,5 +6565,31 @@ mod host_receiver_mode_tests {
         assert!(!host_receiver_config(b"wirelessStartSession: false\nwifi_ap: true\n"));
         assert!(!host_receiver_config(b"# wirelessStartSession: true\n"));
         assert!(!host_receiver_config(b""));
+    }
+}
+
+#[cfg(test)]
+mod loop_timing_tests {
+    use super::*;
+    #[test]
+    fn timing_reports_preserve_all_stages_without_log_line_truncation() {
+        let mut timing = LoopTiming::new();
+        for name in ["accessory_read", "handle_ctrl", "handle_tunnel", "handle_mfi",
+            "handle_input", "handle_mic", "handle_rtsp", "handle_file", "handle_ip",
+            "handle_other", "reassembly_push", "usb_dispatch", "maintenance", "usb_drain",
+            "poll_wait", "broker"] {
+            timing.record(name, Instant::now());
+            // Representative large counters force multiple export-safe lines.
+            timing.stages.get_mut(name).unwrap().1 = 123_456_789;
+        }
+        timing.since -= Duration::from_secs(6);
+        let lines = timing.report().unwrap();
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.len() <= 800));
+        let joined = lines.join(" ");
+        assert!(joined.contains("accessory_read=count:1"));
+        assert!(joined.contains("handle_tunnel=count:1"));
+        assert!(joined.contains("usb_drain=count:1"));
+        assert!(timing.stages.is_empty());
     }
 }
