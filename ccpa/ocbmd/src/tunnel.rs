@@ -28,10 +28,11 @@ pub struct TunnelBroker {
     events: Receiver<Event>,
     wake: UnixStream,
     timing: Mutex<EventTiming>,
+    diagnostics: Receiver<String>,
 }
 
 struct Event { payload: Vec<u8>, queued: Instant }
-struct EventSender { tx: SyncSender<Event>, wake: UnixStream }
+struct EventSender { tx: SyncSender<Event>, wake: UnixStream, diagnostics: SyncSender<String> }
 struct EventTiming { since: Instant, count: u64, bytes: usize, max_age_us: u128 }
 
 impl TunnelBroker {
@@ -41,12 +42,14 @@ impl TunnelBroker {
         let (wake_rx, wake_tx) = UnixStream::pair().expect("tunnel wake socketpair");
         wake_rx.set_nonblocking(true).expect("tunnel wake reader nonblocking");
         wake_tx.set_nonblocking(true).expect("tunnel wake writer nonblocking");
-        let event_tx = EventSender { tx: event_tx, wake: wake_tx };
+        let (diag_tx, diagnostics) = mpsc::sync_channel(64);
+        start_wifi_metrics(diag_tx.clone());
+        let event_tx = EventSender { tx: event_tx, wake: wake_tx, diagnostics: diag_tx };
         thread::Builder::new()
             .name("ocbm-socket-tunnel".into())
             .spawn(move || run(cmd_rx, event_tx))
             .expect("spawn OCBM socket tunnel worker");
-        Self { commands: cmd_tx, events: event_rx, wake: wake_rx, timing: Mutex::new(EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 }) }
+        Self { commands: cmd_tx, events: event_rx, wake: wake_rx, diagnostics, timing: Mutex::new(EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 }) }
     }
 
     /// USB dispatch path: copy at most one bounded OCBM payload and never wait for network I/O.
@@ -57,6 +60,7 @@ impl TunnelBroker {
 
     /// Drain summaries through the daemon's normal CH_LOG encoder, independently of stderr.
     pub fn take_metrics(&self) -> Option<String> {
+        if let Ok(line) = self.diagnostics.try_recv() { return Some(line); }
         let mut t = self.timing.lock().unwrap();
         if t.since.elapsed() < Duration::from_secs(5) { return None; }
         let line = format!("[tunnel-perf] implementation=tunnel-wake-v3 events={} bytes={} interval_ms={} max_event_age_us={}", t.count, t.bytes, t.since.elapsed().as_millis(), t.max_age_us);
@@ -114,7 +118,29 @@ impl Prefix {
 enum Object {
     Listener { socket: TcpListener, prefix: Prefix, credit: u32 },
     Tcp { socket: TcpStream, credit: u32, rx_credit: u32, pending_credit: u32, pending: Option<Vec<u8>>, writeq: VecDeque<Vec<u8>>, write_offset: usize, write_eof: bool, read_eof: bool, remote_eof: bool },
-    Udp { socket: UdpSocket, prefix: Prefix },
+    Udp { socket: UdpSocket, prefix: Prefix, timing: UdpTiming },
+}
+
+#[derive(Default)]
+struct UdpTiming {
+    packets: u64, bytes: u64, drops: u64, rejected: u64,
+    last: Option<Instant>, max_gap_us: u128, report: Option<Instant>,
+}
+impl UdpTiming {
+    fn received(&mut self, bytes: usize) {
+        let now = Instant::now();
+        if let Some(last) = self.last { self.max_gap_us = self.max_gap_us.max(now.duration_since(last).as_micros()); }
+        self.last = Some(now); self.packets += 1; self.bytes += bytes as u64;
+    }
+    fn report(&mut self, id: u32, port: u16) -> Option<String> {
+        let now = Instant::now();
+        let start = self.report.get_or_insert(now);
+        if now.duration_since(*start) < Duration::from_secs(5) { return None; }
+        let idle_ms = self.last.map(|last| now.duration_since(last).as_millis()).unwrap_or(0);
+        let line = format!("[udp-perf] id={id} port={port} packets={} bytes={} event_drops={} rejected={} max_gap_us={} idle_ms={idle_ms} interval_ms={}", self.packets, self.bytes, self.drops, self.rejected, self.max_gap_us, now.duration_since(*start).as_millis());
+        self.packets=0; self.bytes=0; self.drops=0; self.rejected=0; self.max_gap_us=0; self.report=Some(now);
+        Some(line)
+    }
 }
 
 struct Mdns { socket: UdpSocket, prefix: Prefix }
@@ -251,19 +277,25 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
                     }
                     if *read_eof && *remote_eof && writeq.is_empty() && !*write_eof { remove = true; }
                 }
-                Some(Object::Udp { socket, prefix }) => loop {
+                Some(Object::Udp { socket, prefix, timing }) => {
+                    if let Some(line) = timing.report(id, socket.local_addr().map(|a| a.port()).unwrap_or(0)) { let _ = events.diagnostics.try_send(line); }
+                    loop {
                     match socket.recv_from(&mut rx[..UDP_MAX]) {
                         Ok((n, peer)) if prefix.contains(peer.ip()) => {
+                            timing.received(n);
                             let mut event = header(p::TUNNEL_UDP_DATAGRAM, epoch, id);
                             encode_peer(&mut event, peer);
                             event.extend_from_slice(&rx[..n]);
-                            if try_event(&events, event).is_err() { /* atomic datagram drop */ }
+                            if try_event(&events, event).is_err() { timing.drops += 1; }
                         }
-                        Ok(_) => {}
+                        Ok(_) => { timing.rejected += 1; }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => { remove = true; break; }
+                        Err(e) => {
+                            let _ = events.diagnostics.try_send(format!("[udp-perf] id={id} receive_error={e}"));
+                            remove = true; break;
+                        }
                     }
-                },
+                }},
                 None => {}
             }
             if remove {
@@ -303,7 +335,7 @@ fn command(frame: &[u8], epoch: &mut u32, objects: &mut HashMap<u32, Object>, ne
             let bound = if op == p::TUNNEL_LISTEN_TCP {
                 TcpListener::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); Object::Listener { socket: s, prefix, credit } })
             } else {
-                UdpSocket::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); Object::Udp { socket: s, prefix } })
+                UdpSocket::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); Object::Udp { socket: s, prefix, timing: UdpTiming::default() } })
             };
             match bound {
                 Ok(object) => {
@@ -333,7 +365,7 @@ fn command(frame: &[u8], epoch: &mut u32, objects: &mut HashMap<u32, Object>, ne
         // forwarding the adapter peer's read half until it independently closes.
         p::TUNNEL_TCP_EOF => if let Some(Object::Tcp { write_eof, remote_eof, .. }) = objects.get_mut(&id) { *write_eof = true; *remote_eof = true; },
         p::TUNNEL_UDP_SEND => {
-            if let Some(Object::Udp { socket, prefix }) = objects.get(&id) {
+            if let Some(Object::Udp { socket, prefix, .. }) = objects.get(&id) {
                 if let Some((peer, body)) = parse_peer(&frame[9..]) {
                     if body.len() <= UDP_MAX && prefix.contains(peer.ip()) { let _ = socket.send_to(body, peer); }
                 }
@@ -452,10 +484,10 @@ mod wake_tests {
         let (reader, writer) = UnixStream::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
         writer.set_nonblocking(true).unwrap();
-        let sender = EventSender { tx, wake: writer };
+        let sender = EventSender { tx, wake: writer, diagnostics: mpsc::sync_channel(1).0 };
         let broker = TunnelBroker {
             commands: mpsc::sync_channel(1).0,
-            events: rx, wake: reader,
+            events: rx, wake: reader, diagnostics: mpsc::sync_channel(1).1,
             timing: Mutex::new(EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 }),
         };
         let mut fd = libc::pollfd { fd: broker.wake_fd(), events: libc::POLLIN, revents: 0 };
@@ -470,4 +502,42 @@ mod wake_tests {
         try_event(&sender, vec![255]).unwrap();
         assert_eq!(unsafe { libc::poll(&mut fd, 1, 100) }, 1);
     }
+}
+
+fn start_wifi_metrics(diagnostics: SyncSender<String>) {
+    let _ = thread::Builder::new().name("ocbm-wifi-metrics".into()).spawn(move || loop {
+        for interface in ["wlan0", "sta0"] {
+            if !std::path::Path::new(&format!("/sys/class/net/{interface}")).exists() { continue; }
+            let counters = ["rx_packets", "rx_dropped", "rx_errors", "tx_packets", "tx_dropped", "tx_errors"]
+                .iter().map(|key| format!("{key}={}", std::fs::read_to_string(format!("/sys/class/net/{interface}/statistics/{key}")).unwrap_or_else(|_| "unavailable".into()).trim())).collect::<Vec<_>>().join(" ");
+            if matches!(diagnostics.try_send(format!("[wifi-perf] iface={interface} {counters}")), Err(TrySendError::Disconnected(_))) { return; }
+            let child = std::process::Command::new("iw").args(["dev", interface, "station", "dump"])
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn();
+            match child {
+                Ok(mut child) => {
+                    let mut output = child.stdout.take().unwrap();
+                    unsafe { let fd = output.as_raw_fd(); let flags = libc::fcntl(fd, libc::F_GETFL); libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK); }
+                    let began = Instant::now(); let mut result = Vec::new(); let mut buf = [0u8; 512]; let mut finished = false;
+                    while began.elapsed() < Duration::from_secs(2) && result.len() < 8192 {
+                        match output.read(&mut buf) {
+                            Ok(0) => { finished = true; break; },
+                            Ok(n) => result.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(10)),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+                            Err(_) => break,
+                        }
+                    }
+                    if !finished { let _ = child.kill(); }
+                    let text = String::from_utf8_lossy(&result);
+                    let fields = text.lines().filter(|l| ["Station ", "signal:", "signal avg:", "tx retries:", "tx failed:", "rx drop misc:", "tx bitrate:", "rx bitrate:", "inactive time:"].iter().any(|key| l.trim().starts_with(key))).map(str::trim).collect::<Vec<_>>().join("; ");
+                    let fields = if fields.is_empty() { "unavailable" } else { &fields };
+                    for (part, chunk) in fields.as_bytes().chunks(600).enumerate() {
+                        let _ = diagnostics.try_send(format!("[wifi-perf] iface={interface} part={part} station={} query_ms={} complete={finished}", String::from_utf8_lossy(chunk), began.elapsed().as_millis()));
+                    }
+                },
+                Err(_) => { let _ = diagnostics.try_send(format!("[wifi-perf] iface={interface} station=unavailable iw_not_found=true")); },
+            }
+        }
+        thread::sleep(Duration::from_secs(10));
+    });
 }
