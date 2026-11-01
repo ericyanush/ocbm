@@ -55,6 +55,15 @@ impl TunnelBroker {
         self.commands.try_send(payload.to_vec()).is_ok()
     }
 
+    /// Drain summaries through the daemon's normal CH_LOG encoder, independently of stderr.
+    pub fn take_metrics(&self) -> Option<String> {
+        let mut t = self.timing.lock().unwrap();
+        if t.since.elapsed() < Duration::from_secs(5) { return None; }
+        let line = format!("[tunnel-perf] implementation=tunnel-wake-v2 events={} bytes={} interval_ms={} max_event_age_us={}", t.count, t.bytes, t.since.elapsed().as_millis(), t.max_age_us);
+        *t = EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 };
+        Some(line)
+    }
+
     pub fn wake_fd(&self) -> RawFd { self.wake.as_raw_fd() }
 
     // Clear notifications BEFORE consuming events. Publications racing this drain either appear
@@ -79,10 +88,6 @@ impl TunnelBroker {
         timing.count += 1;
         timing.bytes += event.payload.len();
         timing.max_age_us = timing.max_age_us.max(event.queued.elapsed().as_micros());
-        if timing.since.elapsed() >= Duration::from_secs(5) {
-            eprintln!("[tunnel-perf] events={} bytes={} interval_ms={} max_event_age_us={}", timing.count, timing.bytes, timing.since.elapsed().as_millis(), timing.max_age_us);
-            *timing = EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 };
-        }
         Some(event.payload)
     }
 }
@@ -177,6 +182,8 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
                         if !prefix.contains(peer.ip()) || objects.len() >= MAX_OBJECTS {
                             drop(stream);
                         } else {
+                            // Small control/HID writes must not wait for Nagle batching.
+                            if stream.set_nodelay(true).is_err() { continue; }
                             let _ = stream.set_nonblocking(true);
                             let stream_id = allocate_id(&mut next_stream, &objects);
                             let mut payload = header(p::TUNNEL_ACCEPT, epoch, stream_id);

@@ -4096,6 +4096,9 @@ impl Daemon {
                     self.log_reset(); // both directions start from the off state
                     self.log.cap = cap_kb as u64 * 1024; // 0 => LogTail::cap_bytes' default
                     self.log.enabled = enable;
+                    if enable {
+                        self.log_internal("[tunnel-perf] implementation=tunnel-wake-v2 poll_wakeup=socketpair tcp_nodelay=true metrics=CH_LOG");
+                    }
                     // Fire on the very next tick rather than up to LOG_TICK later, the same
                     // `last_*_check = None` trick the phone/box-health mirrors use on SUBSCRIBE.
                     self.log.last_check = None;
@@ -4432,6 +4435,11 @@ fn main() {
             tunnel.clear_wake();
             (0..64).filter_map(|_| tunnel.event()).collect()
         }).unwrap_or_default();
+        if d.log.enabled {
+            if let Some(metrics) = d.tunnel.as_ref().and_then(|t| t.take_metrics()) {
+                d.log_internal(&metrics);
+            }
+        }
         let tunnel_batch_full = tunnel_events.len() == 64;
         for payload in tunnel_events { d.send(p::CH_TUNNEL, p::F_SOM | p::F_EOM, &payload); }
         // rebuild the pollfd set each pass: accessory (+POLLOUT if backlog) + PTY + live conns
