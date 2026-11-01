@@ -48,6 +48,28 @@ enum Kind {
     AvConn(usize), // an accepted A/V seam connection (index into av_conns)
 }
 
+/// Bounded aggregate timing; all output uses the existing CH_LOG diagnostic encoder.
+struct LoopTiming {
+    since: Instant,
+    stages: std::collections::BTreeMap<&'static str, (u64, u128, u128)>,
+}
+impl LoopTiming {
+    fn new() -> Self { Self { since: Instant::now(), stages: Default::default() } }
+    fn record(&mut self, stage: &'static str, began: Instant) {
+        let us = began.elapsed().as_micros();
+        let entry = self.stages.entry(stage).or_default();
+        entry.0 += 1; entry.1 += us; entry.2 = entry.2.max(us);
+    }
+    fn report(&mut self) -> Option<String> {
+        if self.since.elapsed() < Duration::from_secs(5) { return None; }
+        let mut line = format!("[loop-perf] interval_ms={}", self.since.elapsed().as_millis());
+        for (stage, (count, total, max)) in &self.stages {
+            line.push_str(&format!(" {stage}=count:{count},total_us:{total},max_us:{max}"));
+        }
+        self.stages.clear(); self.since = Instant::now(); Some(line)
+    }
+}
+
 /// Raw L2 ethernet bridge for CH_ETH: an AF_PACKET socket on `ncm0` carries the iPhone's
 /// wired-CarPlay link-local IPv6 (mDNS/NDP/RTSP/AirPlay) frames verbatim over OCBM to the host,
 /// where they land on a virtual ethernet interface the receiver binds `fe80::` on. Raw AF_PACKET
@@ -1944,7 +1966,10 @@ impl Daemon {
     /// Takes `now` from the caller: `Instant::now()` is a real syscall on this kernel-3.14 box (no
     /// vDSO for clock_gettime on armv7 there), and this runs on EVERY poll wake — thousands/sec
     /// during A/V. One timestamp per dispatch pass, shared with phone_tick/pairing_code_tick.
-    fn presence_tick(&mut self, now: Instant) {
+    #[cfg(test)]
+    fn presence_tick(&mut self, now: Instant) { self.presence_tick_profiled(now, None); }
+
+    fn presence_tick_profiled(&mut self, now: Instant, mut timing: Option<&mut LoopTiming>) {
         // Restore the flag once the dip has been visible for a full supervisor poll.
         if let Some(d) = self.rearm_deadline {
             if now >= d {
@@ -1971,18 +1996,25 @@ impl Daemon {
                 }
             }
         }
-        self.phone_tick(now);
-        self.pairing_code_tick(now);
+        macro_rules! tick {
+            ($name:literal, $call:expr) => {{
+                let began = Instant::now();
+                $call;
+                if let Some(t) = timing.as_deref_mut() { t.record($name, began); }
+            }};
+        }
+        tick!("phone_tick", self.phone_tick(now));
+        tick!("pairing_code_tick", self.pairing_code_tick(now));
         // This must be queued before BTP_WIFI_HANDOFF, which permits host-side discovery/nudging.
-        self.active_bt_peer_tick(now);
-        self.iap2_slot_tick(now);
-        self.start_session_tick();
-        self.bt_phase_tick(now);
-        self.proj_mode_tick(now);
-        self.phone_ident_tick(now);
-        self.box_health_tick(now);
-        self.log_tick(now);
-        self.health_tick(now);
+        tick!("active_bt_peer_tick", self.active_bt_peer_tick(now));
+        tick!("iap2_slot_tick", self.iap2_slot_tick(now));
+        tick!("start_session_tick", self.start_session_tick());
+        tick!("bt_phase_tick", self.bt_phase_tick(now));
+        tick!("proj_mode_tick", self.proj_mode_tick(now));
+        tick!("phone_ident_tick", self.phone_ident_tick(now));
+        tick!("box_health_tick", self.box_health_tick(now));
+        tick!("log_tick", self.log_tick(now));
+        tick!("health_tick", self.health_tick(now));
     }
 
     /// One line describing every queue depth, every drop counter and the last `CT_BOX_HEALTH`
@@ -4446,7 +4478,10 @@ fn main() {
     // a fresh Vec each pass re-allocates both every wake. clear() keeps the capacity.
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let mut kinds: Vec<Kind> = Vec::new();
+    let mut loop_timing = LoopTiming::new();
     loop {
+        let loop_started = Instant::now();
+        let broker_started = Instant::now();
         let tunnel_events: Vec<Vec<u8>> = d.tunnel.as_ref().map(|tunnel| {
             tunnel.clear_wake();
             (0..64).filter_map(|_| tunnel.event()).collect()
@@ -4458,6 +4493,8 @@ fn main() {
         }
         let tunnel_batch_full = tunnel_events.len() == 64;
         for payload in tunnel_events { d.send(p::CH_TUNNEL, p::F_SOM | p::F_EOM, &payload); }
+        loop_timing.record("broker", broker_started);
+        let prepare_started = Instant::now();
         // rebuild the pollfd set each pass: accessory (+POLLOUT if backlog) + PTY + live conns
         let want_out = !d.out_hi.is_empty()
             || !d.out_video.is_empty()
@@ -4561,7 +4598,10 @@ fn main() {
         } else {
             LOG_IDLE_POLL_MS
         };
+        loop_timing.record("prepare_poll", prepare_started);
+        let poll_started = Instant::now();
         let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        loop_timing.record("poll_wait", poll_started);
         if r < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -4571,6 +4611,7 @@ fn main() {
             std::thread::sleep(Duration::from_millis(100)); // avoid a tight 100% CPU spin on a hard error
             continue;
         }
+        let dispatch_started = Instant::now();
         let mut av_close: Vec<usize> = Vec::new();
         // Newly-accepted A/V producers are DEFERRED to after the dispatch loop: mutating `av_conns`
         // mid-pass would shift the indices the pre-built `Kind::AvConn(idx)` entries hold, misrouting one
@@ -4616,6 +4657,7 @@ fn main() {
                 }
                 continue; // POLLOUT-only wake is handled by the drain() below; dead fds handled above
             }
+            let fd_started = Instant::now();
             match kinds[i] {
                         Kind::TunnelWake => {},
                 Kind::Acc => {
@@ -4815,7 +4857,14 @@ fn main() {
                     }
                 }
             }
+            loop_timing.record(match kinds[i] {
+                Kind::Acc => "usb_dispatch", Kind::Pty => "console", Kind::Conn(_) => "ip_socket",
+                Kind::Eth => "ethernet", Kind::Mic => "mic_socket", Kind::Rtsp => "rtsp_socket",
+                Kind::AvListen(_) => "av_accept", Kind::AvConn(_) => "av_read", Kind::TunnelWake => "tunnel_wake",
+            }, fd_started);
         }
+        loop_timing.record("dispatch", dispatch_started);
+        let cleanup_started = Instant::now();
         // drop closed A/V connections (reverse index order keeps the rest valid)
         av_close.sort_unstable();
         av_close.dedup();
@@ -4837,20 +4886,33 @@ fn main() {
         d.hello_cleared_conns = false;
         // Watchdog AFTER the dispatch loop: any heartbeat that arrived in this wake has now refreshed
         // `last_hb`, so we never spuriously tear down a live session on a beat that already landed.
-        d.presence_tick(Instant::now());
+        loop_timing.record("cleanup", cleanup_started);
+        let maintenance_started = Instant::now();
+        d.presence_tick_profiled(Instant::now(), Some(&mut loop_timing));
+        loop_timing.record("maintenance", maintenance_started);
         // Keep the mic back-channel to carplayd connected while a session is live, so the `uplink on`
         // gate can reach the host the instant iOS opens a type-100 `input` SETUP (before any mic PCM
         // exists). Cheap refused-connect while carplayd is down; the ≤500 ms subscribed poll cadence
         // throttles the retry. See ensure_mic_seam for the deadlock this avoids.
         if d.subscribed {
+            let began = Instant::now();
             d.ensure_mic_seam();
+            loop_timing.record("ensure_mic", began);
             // SETUP-relay seam, same eager discipline — and doubly so: carplayd's per-connection
             // delegate selection reads relay::seam_up() at the moment a phone connects, and its
             // RS_OPEN fires at pair-verify. Both happen before any host→box relay byte exists, so a
             // lazy (data-triggered) connect would permanently select the plain local session.
+            let began = Instant::now();
             d.ensure_rtsp_seam();
+            loop_timing.record("ensure_rtsp", began);
         }
+        let drain_started = Instant::now();
         d.drain(); // non-blocking flush (hi priority first)
+        loop_timing.record("usb_drain", drain_started);
+        loop_timing.record("whole_loop", loop_started);
+        if d.log.enabled {
+            if let Some(line) = loop_timing.report() { d.log_internal(&line); }
+        }
 
         // Liveness LAST, so the stamp means "a whole dispatch pass completed", not "poll() returned".
         // The `continue` paths above (EINTR, hard poll error) deliberately skip it: a loop that only
