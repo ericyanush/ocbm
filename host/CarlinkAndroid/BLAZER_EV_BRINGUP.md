@@ -121,3 +121,38 @@ APK/helper/btd update. Validate startup, sustained animated video with audio, an
 reconnect; compare UDP gaps/drops and tunnel event age with the previous capture.
 This removes polling delay and unbounded drain loops but does not establish that
 these were the cause of the previously observed multi-second receive gaps.
+
+### Receive-boundary and video presentation measurements
+
+All new metrics use the existing exported diagnostic log: adapter lines go through
+`TunnelBroker::take_metrics` and CH_LOG; native lines are explicitly allowlisted by
+JNI; Kotlin lines use ProbeLog. No payloads, keys, or raw media are logged.
+
+* `[udp-perf]` bind lines report Linux timestamp/overflow option support. Interval
+  lines include `kernel_samples`, `kernel_max_gap_us`, `kernel_max_age_us`,
+  `socket_drops` (interval delta), `socket_drops_total` (kernel cumulative value),
+  and truncated data/control counts. Missing overflow control messages mean no new
+  counter observation, not proof of no loss. Timestamps are Linux CLOCK_REALTIME;
+  wall-clock changes can distort ages/gaps. They measure Linux arrival, not radio
+  reception inside firmware. Non-Linux host tests explicitly report unsupported.
+* `[broker-perf]` separates command/preparation/socket-service processing from
+  intentional poll waits. `max_active_us` includes descheduling during active work;
+  `max_timeout_late_us` measures timeout overshoot, not readiness wakeup latency.
+* `[tcp-perf]` identifies each adapter socket by ID and local port, reporting byte
+  counts, receive gaps, sampled kernel unread bytes and credit-exhaustion duration.
+  Android TCP tunnel summaries add `maxArrivalGapUs` and `maxQueueAgeUs` for the
+  bounded inbound queue before its loopback write.
+* `[screen-perf]` reports complete native video-frame gaps, header/body read time,
+  largest frame size and processing time (including forwarding). `[audio-perf]`
+  now passes the JNI export filter too.
+* Kotlin `video-timing` correlates up to 256 in-flight frames by decoder PTS and
+  records seam arrival, decoder output release, and MediaCodec frame-render callback
+  timestamps. It includes arrival/render gaps, decode/presentation/end-to-end maxima,
+  callback delivery lag, and unmatched/evicted counts. These are codec-reported
+  rendering times, not a measurement of physical panel scanout. Static screens can
+  naturally have long gaps; decoder output counts alone are not display cadence.
+
+Summaries are aggregated around five seconds; stream summaries with blocking reads
+can appear on the next packet after a stall. Compare intervals and local durations,
+not absolute timestamps between phone/adapter/AAOS clocks. Deploy rebuilt `ocbmd`
+and the main APK with rebuilt x86_64 and arm64 JNI libraries. No helper/btd update.

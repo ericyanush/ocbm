@@ -2487,10 +2487,22 @@ fn spawn_screen(
         // forever, and each one races any concurrent set_var.
         let screen_dump = std::env::var("CARPLAY_SCREEN_DUMP").is_ok();
         let mut key_sent = false; // fwd-enc: whether the current seam connection has been handed the key
+        let mut perf_since = Instant::now();
+        let mut perf_last_frame: Option<Instant> = None;
+        let mut perf_processing: Option<Instant> = None;
+        let (mut perf_frames, mut perf_bytes, mut perf_max_body) = (0u64, 0u64, 0usize);
+        let (mut perf_gap_us, mut perf_header_us, mut perf_body_us, mut perf_process_us) = (0u128, 0u128, 0u128, 0u128);
         loop {
+            if let Some(start) = perf_processing.take() { perf_process_us = perf_process_us.max(start.elapsed().as_micros()); }
+            if perf_since.elapsed() >= Duration::from_secs(5) {
+                eprintln!("[screen-perf] port={sink_port} frames={perf_frames} bytes={perf_bytes} max_body_bytes={perf_max_body} max_frame_gap_us={perf_gap_us} max_header_read_us={perf_header_us} max_body_read_us={perf_body_us} max_process_us={perf_process_us} interval_ms={}", perf_since.elapsed().as_millis());
+                perf_since=Instant::now(); perf_frames=0; perf_bytes=0; perf_max_body=0; perf_gap_us=0; perf_header_us=0; perf_body_us=0; perf_process_us=0;
+            }
+            let header_start = Instant::now();
             if !read_full(&mut sock, &mut hdr, &alive) {
                 break;
             }
+            perf_header_us = perf_header_us.max(header_start.elapsed().as_micros());
             activity.store(now_ms(), Ordering::Relaxed); // A/V progress → feeds the idle watchdog
             let body_size = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
             let opcode = hdr[4];
@@ -2512,9 +2524,15 @@ fn spawn_screen(
                 body_buf.resize(body_size, 0);
             }
             let body = &mut body_buf[..body_size];
+            let body_start = Instant::now();
             if !read_full(&mut sock, body, &alive) {
                 break;
             }
+            let arrived = Instant::now();
+            perf_body_us = perf_body_us.max(body_start.elapsed().as_micros());
+            if let Some(last) = perf_last_frame { perf_gap_us = perf_gap_us.max(arrived.duration_since(last).as_micros()); }
+            perf_last_frame=Some(arrived); perf_processing=Some(arrived);
+            perf_frames += 1; perf_bytes += body_size as u64; perf_max_body=perf_max_body.max(body_size);
             // Diagnostics: dump the first frame's key material + bytes for offline decrypt analysis.
             if frames == 0 && counter == 0 {
                 if let Ok(p) = std::env::var("CARPLAY_SCREEN_CAPTURE") {

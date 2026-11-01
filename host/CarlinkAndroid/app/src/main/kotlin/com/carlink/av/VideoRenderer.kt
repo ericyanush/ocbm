@@ -2,6 +2,8 @@ package com.carlink.av
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.Surface
 import com.carlink.logging.ProbeLog
@@ -74,6 +76,10 @@ class VideoRenderer(
     private var perfFeedUs = 0L
     private var perfInputCount = 0L
     private var perfLastFrames = 0L
+    private val videoTiming = VideoTiming()
+    private var renderCallbacks: HandlerThread? = null
+    private var lastInputPts = 0L
+    private var lastSeamArrivalNs = 0L
 
 
     private companion object {
@@ -159,6 +165,8 @@ class VideoRenderer(
         try {
             while (running.get()) {
                 val msg = readSeamMessage(ins, hdr, log) ?: break
+                lastSeamArrivalNs = System.nanoTime()
+                videoTiming.arrived(lastSeamArrivalNs, msg.size)
                 bytesIn.addAndGet((msg.size + 4).toLong())
                 // A 0-length message is NOT a desync: forward_screen is called unconditionally with
                 // whatever the conversion produced, and an empty VideoConfig is exactly what this head
@@ -243,6 +251,8 @@ class VideoRenderer(
     private fun releaseCodec() {
         val c = codec ?: return
         codec = null
+        renderCallbacks?.quitSafely()
+        renderCallbacks = null
         configured = false
         phase = "codec-stop"
         runCatching { c.stop() }.onFailure {
@@ -286,6 +296,21 @@ class VideoRenderer(
             log.i("MediaCodec start begin decoder=${mc.name}")
             mc.start()
             codec = mc
+            // Separate callback looper: UI congestion must not masquerade as slow presentation.
+            runCatching {
+                val callbacks = HandlerThread("carplay-render-metrics").apply { start() }
+                renderCallbacks = callbacks
+                videoTiming.reset()
+                mc.setOnFrameRenderedListener({ owner, ptsUs, renderedNs ->
+                    if (codec === owner && running.get()) {
+                        videoTiming.rendered(ptsUs, renderedNs)
+                        videoTiming.report()?.let(log::i)
+                    }
+                }, Handler(callbacks.looper))
+            }.onFailure {
+                renderCallbacks?.quitSafely(); renderCallbacks = null
+                log.w("frame presentation metrics unavailable: ${it.javaClass.simpleName}: ${it.message}")
+            }
             decoderName = mc.name
             configuredCsd = csd
             configured = true
@@ -335,7 +360,11 @@ class VideoRenderer(
                 return
             }
             ib.put(auBytes)
-            c.queueInputBuffer(idx, 0, auBytes.size, SystemClock.uptimeMillis() * 1000, 0)
+            // Keep uptime-based PTS, making same-millisecond inputs distinguishable.
+            val ptsUs = maxOf(SystemClock.uptimeMillis() * 1000, lastInputPts + 1)
+            lastInputPts = ptsUs
+            videoTiming.queued(ptsUs, lastSeamArrivalNs)
+            c.queueInputBuffer(idx, 0, auBytes.size, ptsUs, 0)
             drain(c)
         } catch (e: IllegalStateException) {
             // Recover from a codec that threw mid-stream (CodecException is an ISE). Deliberately
@@ -355,6 +384,7 @@ class VideoRenderer(
                 log.i("perf intervalMs=${(now - perfStartedNs) / 1_000_000} inputs=$perfInputCount " +
                     "outputs=${frames - perfLastFrames} inputWaitUs=$perfInputWaitUs " +
                     "maxInputWaitUs=$perfMaxInputWaitUs feedUs=$perfFeedUs bytes=${bytesIn.get()}")
+                videoTiming.report()?.let(log::i)
                 perfStartedNs = now
                 perfLastFrames = frames
                 perfInputCount = 0L
@@ -379,6 +409,7 @@ class VideoRenderer(
                 outIdx >= 0 -> {
                     // render only a real frame; render=true hands it to the Surface with no CPU copy
                     val real = info.size != 0
+                    if (real) videoTiming.released(info.presentationTimeUs)
                     c.releaseOutputBuffer(outIdx, real)
                     val n = if (real) framesRendered.incrementAndGet() else 0L
                     if (n == 1L) log.i("FIRST FRAME RENDERED")

@@ -122,7 +122,7 @@ fn redirect_stdio_to_logcat() {
 
 // Only protocol summaries are exported. Never forward arbitrary native payload/key dumps.
 fn export_protocol_log(line: &str) {
-    if !(line.starts_with("[native-diag]") || line.starts_with("[receiver]")) { return; }
+    if !(line.starts_with("[native-diag]") || line.starts_with("[receiver]") || line.starts_with("[audio-perf]") || line.starts_with("[screen-perf]")) { return; }
     let (Some(vm), Some(class)) = (JVM.get(), LOG_CLASS.get()) else { return; };
     let Ok(mut env) = vm.attach_current_thread() else { return; };
     let _ = env.with_local_frame(8, |env| -> jni::errors::Result<()> {

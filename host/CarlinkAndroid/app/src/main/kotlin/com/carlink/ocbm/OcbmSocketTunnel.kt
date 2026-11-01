@@ -81,6 +81,8 @@ class OcbmSocketTunnel(
         val uplinkSendUs: AtomicLong = AtomicLong(),
         val maxUplinkSendUs: AtomicLong = AtomicLong(),
         val creditWaitUs: AtomicLong = AtomicLong(),
+        val lastArrivalNs: AtomicLong = AtomicLong(),
+        val maxArrivalGapUs: AtomicLong = AtomicLong(),
         val peerEof: AtomicBoolean = AtomicBoolean(false),
     )
     private data class UdpPeer(val peer: InetSocketAddress, val proxy: DatagramSocket)
@@ -94,7 +96,8 @@ class OcbmSocketTunnel(
 
         private val lock = ReentrantLock()
         private val notEmpty = lock.newCondition()
-        private val packets = ArrayDeque<ByteArray>()
+        data class Entry(val data: ByteArray, val queuedNs: Long = System.nanoTime())
+        private val packets = ArrayDeque<Entry>()
         private var queuedBytes = 0
         private var peakBytes = 0
         private var peakPackets = 0
@@ -103,7 +106,7 @@ class OcbmSocketTunnel(
             lock.lock()
             try {
                 if (data.size > capacityBytes - queuedBytes) return false
-                packets.addLast(data)
+                packets.addLast(Entry(data))
                 queuedBytes += data.size
                 peakBytes = maxOf(peakBytes, queuedBytes)
                 peakPackets = maxOf(peakPackets, packets.size)
@@ -115,13 +118,13 @@ class OcbmSocketTunnel(
         }
 
         @Throws(InterruptedException::class)
-        fun poll(timeoutMs: Long): ByteArray? {
+        fun poll(timeoutMs: Long): Entry? {
             var nanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
             lock.lockInterruptibly()
             try {
                 while (packets.isEmpty() && nanos > 0) nanos = notEmpty.awaitNanos(nanos)
                 val data = packets.pollFirst() ?: return null
-                queuedBytes -= data.size
+                queuedBytes -= data.data.size
                 return data
             } finally {
                 lock.unlock()
@@ -368,13 +371,16 @@ class OcbmSocketTunnel(
             var lastStatsAt = System.nanoTime()
             var lastReceivedBytes = 0L
             var lastForwardedBytes = 0L
+            var maxQueueAgeUs = 0L
             var maxSocketWriteUs = 0L
             var maxCreditSendUs = 0L
             var socketWriteUs = 0L
             var creditSendUs = 0L
             while (alive.get() && !socket.isClosed) {
-                val data = queue.poll(250)
-                if (data != null) {
+                val entry = queue.poll(250)
+                if (entry != null) {
+                    val data = entry.data
+                    maxQueueAgeUs = maxOf(maxQueueAgeUs, (System.nanoTime()-entry.queuedNs)/1000)
                     val writeStarted = System.nanoTime()
                     output.write(data)
                     output.flush()
@@ -410,6 +416,7 @@ class OcbmSocketTunnel(
                             "rx=${stream.receivedPackets.get()}pk/${received}B(${rxKbps}Kbps) " +
                             "forwarded=${stream.forwardedPackets.get()}pk/${forwarded}B(${txKbps}Kbps) " +
                             "queue=${snapshot.bytes}B/${snapshot.packets}pk peak=${snapshot.peakBytes}B/${snapshot.peakPackets}pk " +
+                            "maxQueueAgeUs=$maxQueueAgeUs maxArrivalGapUs=${stream.maxArrivalGapUs.getAndSet(0)} " +
                             "socketWriteUs=$socketWriteUs maxSocketWriteUs=$maxSocketWriteUs " +
                             "creditSendUs=$creditSendUs maxCreditSendUs=$maxCreditSendUs " +
                             "uplink=${stream.uplinkPackets.get()}pk/${stream.uplinkBytes.get()}B " +
@@ -419,6 +426,7 @@ class OcbmSocketTunnel(
                         lastReceivedBytes = received
                         lastForwardedBytes = forwarded
                     }
+                    maxQueueAgeUs = 0L
                     socketWriteUs = 0L
                     creditSendUs = 0L
                     maxSocketWriteUs = 0L
@@ -437,6 +445,9 @@ class OcbmSocketTunnel(
         if (frame.size <= 9) return
         val data = frame.copyOfRange(9, frame.size)
         val stream = streams[id] ?: return
+        val arrived = System.nanoTime()
+        val previous = stream.lastArrivalNs.getAndSet(arrived)
+        if (previous != 0L) stream.maxArrivalGapUs.updateAndGet { maxOf(it, (arrived-previous)/1000) }
         if (!stream.incoming.offer(data)) {
             val snapshot = stream.incoming.snapshot()
             log("TCP inbound queue byte limit exceeded stream=$id incoming=${data.size}B " +
