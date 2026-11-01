@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::os::unix::net::UnixStream;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Mutex;
@@ -157,7 +157,7 @@ impl Prefix {
 
 enum Object {
     Listener { socket: TcpListener, prefix: Prefix, credit: u32 },
-    Tcp { socket: TcpStream, credit: u32, rx_credit: u32, pending_credit: u32, pending: Option<Vec<u8>>, writeq: VecDeque<Vec<u8>>, write_offset: usize, write_eof: bool, read_eof: bool, remote_eof: bool },
+    Tcp { socket: TcpStream, credit: u32, rx_credit: u32, pending_credit: u32, pending: Option<Vec<u8>>, writeq: VecDeque<Vec<u8>>, write_offset: usize, write_eof: bool, read_eof: bool, remote_eof: bool, timing: TcpTiming },
     Udp { socket: UdpSocket, prefix: Prefix, timing: UdpTiming },
 }
 
@@ -165,6 +165,9 @@ enum Object {
 struct UdpTiming {
     packets: u64, bytes: u64, drops: u64, rejected: u64,
     last: Option<Instant>, max_gap_us: u128, report: Option<Instant>,
+    kernel_last_ns: Option<u64>, kernel_samples: u64, kernel_max_gap_us: u64,
+    kernel_max_age_us: u64, overflow_last: u32, overflow_delta: u64,
+    truncated: u64, control_truncated: u64,
 }
 impl UdpTiming {
     fn received(&mut self, bytes: usize) {
@@ -172,14 +175,123 @@ impl UdpTiming {
         if let Some(last) = self.last { self.max_gap_us = self.max_gap_us.max(now.duration_since(last).as_micros()); }
         self.last = Some(now); self.packets += 1; self.bytes += bytes as u64;
     }
+    fn kernel(&mut self, metadata: UdpMetadata) {
+        if let Some(ns) = metadata.timestamp_ns {
+            self.kernel_samples += 1;
+            if let Some(last) = self.kernel_last_ns { if ns >= last { self.kernel_max_gap_us = self.kernel_max_gap_us.max((ns-last)/1000); } }
+            self.kernel_last_ns = Some(ns);
+            // SO_TIMESTAMPNS uses CLOCK_REALTIME. Ignore backwards wall-clock adjustments.
+            if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                let now = now.as_nanos().min(u64::MAX as u128) as u64;
+                if now >= ns { self.kernel_max_age_us = self.kernel_max_age_us.max((now-ns)/1000); }
+            }
+        }
+        if let Some(count) = metadata.overflow {
+            self.overflow_delta += count.wrapping_sub(self.overflow_last) as u64;
+            self.overflow_last = count;
+        }
+        self.control_truncated += metadata.control_truncated as u64;
+    }
     fn report(&mut self, id: u32, port: u16) -> Option<String> {
         let now = Instant::now();
         let start = self.report.get_or_insert(now);
         if now.duration_since(*start) < Duration::from_secs(5) { return None; }
         let idle_ms = self.last.map(|last| now.duration_since(last).as_millis()).unwrap_or(0);
         let line = format!("[udp-perf] id={id} port={port} packets={} bytes={} event_drops={} rejected={} max_gap_us={} idle_ms={idle_ms} interval_ms={}", self.packets, self.bytes, self.drops, self.rejected, self.max_gap_us, now.duration_since(*start).as_millis());
+        let line = format!("{line} kernel_samples={} kernel_max_gap_us={} kernel_max_age_us={} socket_drops={} socket_drops_total={} truncated={} control_truncated={}",
+            self.kernel_samples, self.kernel_max_gap_us, self.kernel_max_age_us, self.overflow_delta, self.overflow_last, self.truncated, self.control_truncated);
+        self.kernel_samples=0; self.kernel_max_gap_us=0; self.kernel_max_age_us=0; self.overflow_delta=0; self.truncated=0; self.control_truncated=0;
         self.packets=0; self.bytes=0; self.drops=0; self.rejected=0; self.max_gap_us=0; self.report=Some(now);
         Some(line)
+    }
+}
+
+// Ancillary receive data never changes the tunnel wire format. Missing kernel support is
+// explicitly reported at bind; non-Linux host tests use ordinary recv_from.
+#[derive(Default)]
+struct UdpMetadata { timestamp_ns: Option<u64>, overflow: Option<u32>, truncated: bool, control_truncated: bool }
+
+#[cfg(target_os = "linux")]
+fn enable_udp_metrics(socket: &UdpSocket) -> String {
+    let enabled: libc::c_int = 1;
+    let set = |option| unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, option,
+        &enabled as *const _ as *const libc::c_void, std::mem::size_of_val(&enabled) as libc::socklen_t) == 0 };
+    format!("kernel_timestamp={} socket_overflow={}", set(libc::SO_TIMESTAMPNS), set(libc::SO_RXQ_OVFL))
+}
+#[cfg(not(target_os = "linux"))]
+fn enable_udp_metrics(_: &UdpSocket) -> String { "kernel_timestamp=false socket_overflow=false platform=non-linux".into() }
+
+#[cfg(target_os = "linux")]
+fn receive_udp(socket: &UdpSocket, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr, UdpMetadata)> {
+    unsafe {
+        let mut address: libc::sockaddr_storage = std::mem::zeroed();
+        let mut iov = libc::iovec { iov_base: buffer.as_mut_ptr().cast(), iov_len: buffer.len() };
+        // cmsghdr-aligned storage, large enough for timespec and overflow count on both ABIs.
+        let mut control = [0usize; 32];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = (&mut address as *mut libc::sockaddr_storage).cast();
+        msg.msg_namelen = std::mem::size_of_val(&address) as libc::socklen_t;
+        msg.msg_iov = &mut iov; msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast(); msg.msg_controllen = std::mem::size_of_val(&control) as _;
+        let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
+        if n < 0 { return Err(std::io::Error::last_os_error()); }
+        let peer = match address.ss_family as libc::c_int {
+            libc::AF_INET => {
+                let a = &*((&address as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>());
+                SocketAddr::new(std::net::Ipv4Addr::from(a.sin_addr.s_addr.to_ne_bytes()).into(), u16::from_be(a.sin_port))
+            },
+            libc::AF_INET6 => {
+                let a = &*((&address as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>());
+                SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::from(a.sin6_addr.s6_addr), u16::from_be(a.sin6_port), 0, a.sin6_scope_id))
+            },
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown UDP peer family")),
+        };
+        let mut metadata = UdpMetadata { truncated: msg.msg_flags & libc::MSG_TRUNC != 0,
+            control_truncated: msg.msg_flags & libc::MSG_CTRUNC != 0, ..Default::default() };
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET {
+                if (*cmsg).cmsg_type == libc::SO_TIMESTAMPNS && (*cmsg).cmsg_len as usize >= libc::CMSG_LEN(std::mem::size_of::<libc::timespec>() as _) as usize {
+                    let t = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::timespec>());
+                    if t.tv_sec >= 0 && t.tv_nsec >= 0 && t.tv_nsec < 1_000_000_000 {
+                        metadata.timestamp_ns = (t.tv_sec as u64).checked_mul(1_000_000_000).and_then(|sec| sec.checked_add(t.tv_nsec as u64));
+                    }
+                } else if (*cmsg).cmsg_type == libc::SO_RXQ_OVFL && (*cmsg).cmsg_len as usize >= libc::CMSG_LEN(4) as usize {
+                    metadata.overflow = Some(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<u32>()));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+        Ok((n as usize, peer, metadata))
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn receive_udp(socket: &UdpSocket, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr, UdpMetadata)> {
+    socket.recv_from(buffer).map(|(n, peer)| (n, peer, UdpMetadata::default()))
+}
+
+#[derive(Default)]
+struct TcpTiming { since: Option<Instant>, last: Option<Instant>, packets: u64, bytes: u64,
+    max_gap_us: u128, peak_unread: libc::c_int, credit_since: Option<Instant>, max_credit_wait_us: u128 }
+impl TcpTiming {
+    fn received(&mut self, bytes: usize) {
+        let now = Instant::now();
+        if let Some(last) = self.last { self.max_gap_us = self.max_gap_us.max(now.duration_since(last).as_micros()); }
+        self.last = Some(now); self.packets += 1; self.bytes += bytes as u64;
+    }
+    fn report(&mut self, socket: &TcpStream, id: u32, credit: u32, pending: bool, events: &EventSender) {
+        let now = Instant::now();
+        if credit == 0 {
+            self.credit_since.get_or_insert(now);
+        } else if let Some(start) = self.credit_since.take() { self.max_credit_wait_us = self.max_credit_wait_us.max(start.elapsed().as_micros()); }
+        let start = self.since.get_or_insert(now);
+        if start.elapsed() < Duration::from_secs(5) { return; }
+        let waiting = self.credit_since.map(|s| s.elapsed().as_micros()).unwrap_or(0);
+        let _ = events.diagnostics.try_send(format!("[tcp-perf] id={id} port={} packets={} bytes={} max_gap_us={} idle_ms={} peak_unread_bytes={} credit={} max_credit_wait_us={} pending_event={pending} interval_ms={}",
+            socket.local_addr().map(|a| a.port()).unwrap_or(0), self.packets, self.bytes, self.max_gap_us,
+            self.last.map(|s| s.elapsed().as_millis()).unwrap_or(0), self.peak_unread, credit, self.max_credit_wait_us.max(waiting), start.elapsed().as_millis()));
+        self.since=Some(now); self.packets=0; self.bytes=0; self.max_gap_us=0; self.peak_unread=0; self.max_credit_wait_us=0;
+        if self.credit_since.is_some() { self.credit_since=Some(now); }
     }
 }
 
@@ -192,7 +304,10 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
     let mut mdns: Option<Mdns> = None;
     let mut next_stream = 0x8000_0000u32;
     let mut rx = vec![0u8; TCP_CHUNK.max(UDP_MAX)];
+    let mut report_at = Instant::now();
+    let (mut turns, mut active_us, mut max_active_us, mut max_commands_us, mut max_prepare_us, mut max_service_us, mut max_poll_us, mut max_timeout_late_us) = (0u64, 0u128, 0u128, 0u128, 0u128, 0u128, 0u128, 0u128);
     loop {
+        let turn_start = Instant::now();
         if !clear_notification(&command_wake) { return; }
         let mut command_count = 0;
         for _ in 0..COMMAND_BATCH {
@@ -207,6 +322,8 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
             }
         }
 
+        max_commands_us = max_commands_us.max(turn_start.elapsed().as_micros());
+        let prepare_start = Instant::now();
         let mut pending_index = 0;
         while pending_index < pending_accepts.len() {
             let (stream_id, listener_id, _stream, peer, _credit) = &pending_accepts[pending_index];
@@ -217,7 +334,7 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
             if try_event(&events, payload).is_ok() {
                 let (stream_id, _listener_id, stream, _peer, credit) = pending_accepts.swap_remove(pending_index);
                 let _ = stream.set_nonblocking(true);
-                objects.insert(stream_id, Object::Tcp { socket: stream, credit: 0, rx_credit: credit.min(MAX_TCP_CREDIT), pending_credit: 0, pending: None, writeq: VecDeque::new(), write_offset: 0, write_eof: false, read_eof: false, remote_eof: false });
+                objects.insert(stream_id, Object::Tcp { socket: stream, credit: 0, rx_credit: credit.min(MAX_TCP_CREDIT), pending_credit: 0, pending: None, writeq: VecDeque::new(), write_offset: 0, write_eof: false, read_eof: false, remote_eof: false, timing: TcpTiming::default() });
             } else { pending_index += 1; }
         }
 
@@ -230,7 +347,8 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
             let (fd, interest) = match object {
                 Object::Listener { socket, .. } => (socket.as_raw_fd(), if can_accept { libc::POLLIN } else { 0 }),
                 Object::Udp { socket, .. } => (socket.as_raw_fd(), libc::POLLIN),
-                Object::Tcp { socket, credit, rx_credit, pending_credit, pending, writeq, write_eof, read_eof, .. } => {
+                Object::Tcp { socket, credit, rx_credit, pending_credit, pending, writeq, write_eof, read_eof, timing, .. } => {
+                    timing.report(socket, id, *credit, pending.is_some(), &events);
                     if *pending_credit > 0 {
                         let amount = (*pending_credit).min(MAX_TCP_CREDIT);
                         let mut e = header(p::TUNNEL_TCP_CREDIT, epoch, id);
@@ -265,8 +383,16 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
         });
         // The timer exists only to emit idle diagnostics. Commands and freed event capacity
         // wake the descriptor; a full command batch gets an immediate next pass.
+        max_prepare_us = max_prepare_us.max(prepare_start.elapsed().as_micros());
+        let before_poll_us = turn_start.elapsed().as_micros();
+        let poll_start = Instant::now();
+        let timeout_ms = if command_count == COMMAND_BATCH { 0 } else { 1000 };
         let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t,
-            if command_count == COMMAND_BATCH { 0 } else { 1000 }) };
+            timeout_ms) };
+        let poll_us = poll_start.elapsed().as_micros();
+        max_poll_us = max_poll_us.max(poll_us);
+        if ready == 0 { max_timeout_late_us = max_timeout_late_us.max(poll_us.saturating_sub(timeout_ms as u128 * 1000)); }
+        let service_start = Instant::now();
         if ready < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
             let _ = events.diagnostics.try_send(format!("[tunnel-perf] poll_error={}", std::io::Error::last_os_error()));
@@ -315,16 +441,18 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
                             encode_peer(&mut payload, peer);
                             if try_event(&events, payload).is_ok() {
                                 // The listener's initial window is granted to each accepted stream.
-                                objects.insert(stream_id, Object::Tcp { socket: stream, credit: 0, rx_credit: credit.min(MAX_TCP_CREDIT), pending_credit: 0, pending: None, writeq: VecDeque::new(), write_offset: 0, write_eof: false, read_eof: false, remote_eof: false });
+                                objects.insert(stream_id, Object::Tcp { socket: stream, credit: 0, rx_credit: credit.min(MAX_TCP_CREDIT), pending_credit: 0, pending: None, writeq: VecDeque::new(), write_offset: 0, write_eof: false, read_eof: false, remote_eof: false, timing: TcpTiming::default() });
                             } else {
                                 pending_accepts.push((stream_id, id, stream, peer, credit));
                             }
                         }
                     }
                 }
-                Some(Object::Tcp { socket, credit, pending_credit, pending, writeq, write_offset, write_eof, read_eof, remote_eof, .. }) => {
+                Some(Object::Tcp { socket, credit, pending_credit, pending, writeq, write_offset, write_eof, read_eof, remote_eof, timing, .. }) => {
                     if readable && pending.is_none() && *credit > 0 && !*read_eof {
                         let nmax = (*credit as usize).min(TCP_CHUNK);
+                        let mut unread: libc::c_int = 0;
+                        if unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut unread) } == 0 { timing.peak_unread = timing.peak_unread.max(unread); }
                         match socket.read(&mut rx[..nmax]) {
                             Ok(0) => {
                                 let eof = header(p::TUNNEL_TCP_EOF, epoch, id);
@@ -332,6 +460,7 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
                                 *read_eof = true;
                             }
                             Ok(n) => {
+                                timing.received(n);
                                 let mut event = header(p::TUNNEL_TCP_DATA, epoch, id);
                                 event.extend_from_slice(&rx[..n]);
                                 match try_event(&events, event) {
@@ -364,8 +493,11 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
                 Some(Object::Udp { socket, prefix, timing }) => {
                     if let Some(line) = timing.report(id, socket.local_addr().map(|a| a.port()).unwrap_or(0)) { let _ = events.diagnostics.try_send(line); }
                     for _ in 0..if readable { DATAGRAM_BATCH } else { 0 } {
-                    match socket.recv_from(&mut rx[..UDP_MAX]) {
-                        Ok((n, peer)) if prefix.contains(peer.ip()) => {
+                    match receive_udp(socket, &mut rx[..UDP_MAX]) {
+                        Ok((n, peer, metadata)) if prefix.contains(peer.ip()) => {
+                            let truncated = metadata.truncated;
+                            timing.kernel(metadata);
+                            if truncated || n > UDP_MAX { timing.truncated += 1; continue; }
                             timing.received(n);
                             let mut event = header(p::TUNNEL_UDP_DATAGRAM, epoch, id);
                             encode_peer(&mut event, peer);
@@ -387,6 +519,15 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
                 let _ = try_event(&events, header(p::TUNNEL_CLOSE, epoch, id));
             }
         }
+        let service_us = service_start.elapsed().as_micros();
+        max_service_us = max_service_us.max(service_us);
+        let active = before_poll_us + service_us;
+        active_us += active; max_active_us = max_active_us.max(active); turns += 1;
+        if report_at.elapsed() >= Duration::from_secs(5) {
+            let _ = events.diagnostics.try_send(format!("[broker-perf] turns={turns} active_us={active_us} max_active_us={max_active_us} max_commands_us={max_commands_us} max_prepare_us={max_prepare_us} max_service_us={max_service_us} max_poll_us={max_poll_us} max_timeout_late_us={max_timeout_late_us} interval_ms={}", report_at.elapsed().as_millis()));
+            report_at=Instant::now(); turns=0; active_us=0; max_active_us=0; max_commands_us=0; max_prepare_us=0; max_service_us=0; max_poll_us=0; max_timeout_late_us=0;
+        }
+
 
     }
 }
@@ -419,7 +560,7 @@ fn command(frame: &[u8], epoch: &mut u32, objects: &mut HashMap<u32, Object>, ne
             let bound = if op == p::TUNNEL_LISTEN_TCP {
                 TcpListener::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); Object::Listener { socket: s, prefix, credit } })
             } else {
-                UdpSocket::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); Object::Udp { socket: s, prefix, timing: UdpTiming::default() } })
+                UdpSocket::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); { let support = enable_udp_metrics(&s); let _ = events.diagnostics.try_send(format!("[udp-perf] id={id} {support}")); Object::Udp { socket: s, prefix, timing: UdpTiming::default() } } })
             };
             match bound {
                 Ok(object) => {
@@ -686,6 +827,44 @@ mod wake_tests {
         for _ in 0..130 { assert_eq!(receive(&broker)[0], p::TUNNEL_RESULT); }
         drop(broker);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn kernel_udp_metrics_keep_cross_interval_gaps_and_count_overflow_wrap() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let mut timing = UdpTiming::default();
+        timing.overflow_last = u32::MAX - 1;
+        timing.kernel(UdpMetadata { timestamp_ns: Some(now - 3_000_000_000), overflow: Some(2), control_truncated: true, ..Default::default() });
+        timing.kernel(UdpMetadata { timestamp_ns: Some(now - 1_000_000_000), ..Default::default() });
+        assert_eq!(timing.overflow_delta, 4);
+        assert_eq!(timing.kernel_max_gap_us, 2_000_000);
+        assert!(timing.kernel_max_age_us >= 3_000_000);
+        timing.report = Some(Instant::now() - Duration::from_secs(6));
+        let line = timing.report(1, 5000).unwrap();
+        assert!(line.contains("socket_drops=4"));
+        assert!(line.contains("control_truncated=1"));
+        assert_eq!(timing.overflow_delta, 0);
+        timing.kernel(UdpMetadata { timestamp_ns: Some(now), overflow: Some(3), ..Default::default() });
+        assert_eq!(timing.kernel_max_gap_us, 1_000_000);
+        assert_eq!(timing.overflow_delta, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recvmsg_preserves_udp_boundaries_and_extracts_kernel_timestamp() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert!(enable_udp_metrics(&socket).contains("kernel_timestamp=true"));
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"packet", socket.local_addr().unwrap()).unwrap();
+        let mut bytes = [0; 16];
+        let (n, peer, metadata) = receive_udp(&socket, &mut bytes).unwrap();
+        assert_eq!(&bytes[..n], b"packet");
+        assert_eq!(peer, sender.local_addr().unwrap());
+        assert!(metadata.timestamp_ns.is_some());
+        assert!(!metadata.truncated && !metadata.control_truncated);
+        sender.send_to(b"oversized", socket.local_addr().unwrap()).unwrap();
+        assert!(receive_udp(&socket, &mut bytes[..2]).unwrap().2.truncated);
     }
 
     #[test]

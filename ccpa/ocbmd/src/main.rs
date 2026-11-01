@@ -4542,7 +4542,10 @@ fn main() {
             (0..64).filter_map(|_| tunnel.event()).collect()
         }).unwrap_or_default();
         if d.log.enabled {
-            if let Some(metrics) = d.tunnel.as_ref().and_then(|t| t.take_metrics()) {
+            // Multiple stream summaries can become due together. Drain a bounded batch so idle
+            // 500 ms dispatch passes do not leave diagnostics lagging behind the media interval.
+            for _ in 0..8 {
+                let Some(metrics) = d.tunnel.as_ref().and_then(|t| t.take_metrics()) else { break; };
                 d.log_internal(&metrics);
             }
         }
