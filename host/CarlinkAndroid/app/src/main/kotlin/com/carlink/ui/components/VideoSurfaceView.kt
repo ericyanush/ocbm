@@ -80,6 +80,7 @@ class VideoSurfaceView
         private var panelHeight = 960
         /** A Compose update can arrive before Android has created the SurfaceControl. */
         private var geometryPending = false
+        private var compactGeometryApplied = false
 
         /** Crop/position the HWC layer in the panel's coordinates, without scaling the video. */
         fun setCarPlayViewArea(index: Int, panelWidth: Int, panelHeight: Int) {
@@ -95,13 +96,16 @@ class VideoSurfaceView
                 logWarn("[VIDEO_SURFACE_VIEW] View-area crop requires API 31+ (device=${Build.VERSION.SDK_INT})", tag = "UI")
                 return
             }
-            val panelSizeChanged = this.panelWidth != panelWidth || this.panelHeight != panelHeight
             this.panelWidth = panelWidth
             this.panelHeight = panelHeight
             // The normal full-panel layout is already the SurfaceView default. Avoid a SurfaceFlinger
             // geometry transaction during app startup; only touch the layer after an actual resize
             // request (or when returning from compact mode).
-            if (index == 0 && viewAreaIndex == 0 && !panelSizeChanged) return
+            if (index == 0 && !compactGeometryApplied) {
+                viewAreaIndex = 0
+                geometryPending = false
+                return
+            }
             viewAreaIndex = index
             logInfo(
                 "[VIDEO_SURFACE_VIEW] Applying view area index=$index panel=${panelWidth}x$panelHeight " +
@@ -115,6 +119,10 @@ class VideoSurfaceView
 
         private fun applyViewAreaGeometry() {
             if (Build.VERSION.SDK_INT < 31) return
+            if (viewAreaIndex == 0 && !compactGeometryApplied) {
+                geometryPending = false
+                return
+            }
             geometryPending = true
             val control = surfaceControl ?: return
             if (!control.isValid) return
@@ -125,11 +133,24 @@ class VideoSurfaceView
                     transaction.apply()
                 }
                 geometryPending = false
+                compactGeometryApplied = viewAreaIndex != 0
+                logPlacement("manual-geometry")
                 logInfo("[VIDEO_SURFACE_VIEW] SurfaceControl geometry applied: source=$area destination=$area", tag = "UI")
             }.onFailure {
                 geometryPending = true
                 logWarn("[VIDEO_SURFACE_VIEW] view-area geometry failed: ${it.message}", tag = "UI")
             }
+        }
+
+        private fun logPlacement(reason: String) {
+            val screen = IntArray(2)
+            val window = IntArray(2)
+            getLocationOnScreen(screen)
+            getLocationInWindow(window)
+            logInfo("[VIDEO_SURFACE_VIEW] placement reason=$reason view=${width}x$height " +
+                "screen=${screen[0]},${screen[1]} window=${window[0]},${window[1]} " +
+                "layout=$left,$top translation=$translationX,$translationY " +
+                "holder=${holder.surfaceFrame} area=$viewAreaIndex manual=$compactGeometryApplied", tag = "UI")
         }
 
         private fun viewArea(index: Int): Rect =
@@ -183,7 +204,15 @@ class VideoSurfaceView
         override fun surfaceCreated(holder: SurfaceHolder) {
             isSurfaceCreated = true
             logInfo("[VIDEO_SURFACE_VIEW] Surface created", tag = "UI")
-            if (geometryPending) post { applyViewAreaGeometry() }
+            // A new layer has framework-managed placement, even if the previous layer was cropped.
+            compactGeometryApplied = false
+            geometryPending = viewAreaIndex != 0
+            post {
+                if (holder.surface.isValid) {
+                    if (geometryPending) applyViewAreaGeometry()
+                    logPlacement("surface-created")
+                }
+            }
         }
 
         /**
@@ -206,6 +235,7 @@ class VideoSurfaceView
             // Acceptable at INFO for debugging surface sizing; switch to logDebugOnly if noisy.
             logInfo("[VIDEO_SURFACE_VIEW] Surface: ${width}x$height", tag = "UI")
             if (geometryPending || viewAreaIndex != 0) applyViewAreaGeometry()
+            post { if (holder.surface.isValid) logPlacement("surface-changed") }
 
             if (isSurfaceCreated) {
                 isSurfaceCreated = false
@@ -224,7 +254,8 @@ class VideoSurfaceView
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             logWarn("[VIDEO_SURFACE_VIEW] Surface destroyed", tag = "UI")
             isSurfaceCreated = false
-            if (viewAreaIndex != 0) geometryPending = true
+            compactGeometryApplied = false
+            geometryPending = viewAreaIndex != 0
             callback?.onSurfaceDestroyed()
         }
     }
