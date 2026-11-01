@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 mod tunnel;
 mod accessory_reader;
+mod mfi_worker;
 
 const ACC_DEV: &str = "/dev/usb_accessory";
 
@@ -40,6 +41,7 @@ const RTSP_INGEST_ADDR: &str = "127.0.0.1:9106";
 enum Kind {
     TunnelWake,
     AccessoryReadWake,
+    MfiWake,
     Acc,
     Pty,
     Conn(u16),
@@ -338,10 +340,30 @@ impl Mfi {
     fn sign(&mut self, challenge: &[u8]) -> Result<Vec<u8>, MfiError> { self.0.signature(challenge) }
 }
 
+fn mfi_response(mfi: &mut Option<Mfi>, pl: &[u8]) -> Vec<u8> {
+    let op = pl[0];
+    let ilen = ((pl[1] as usize) << 8) | pl[2] as usize;
+    let tag = (pl.len() == 3 + ilen + p::MFI_TAG_LEN).then(|| pl[3 + ilen]);
+    let valid = op == 1 || (op == 2 && ilen > 0 && ilen <= 1024 && 3 + ilen <= pl.len());
+    if !valid { let mut r = vec![2,0,0]; if let Some(t) = tag { r.push(t); } return r; }
+    let result = (|| {
+        if mfi.is_none() { *mfi = Some(Mfi::open()?); }
+        let chip = mfi.as_mut().unwrap();
+        if op == 1 { chip.cert() } else { chip.sign(&pl[3..3+ilen]) }
+    })();
+    let mut response = match result {
+        Ok(data) => { let mut r = vec![0, (data.len() >> 8) as u8, data.len() as u8]; r.extend(data); r },
+        Err(error) => { eprintln!("[mfi] op={op} failed: {error}"); vec![1,0,0] },
+    };
+    if let Some(t) = tag { response.push(t); }
+    response
+}
+
 struct Daemon {
     acc: File,
     seq: u32,
     mfi: Option<Mfi>,
+    mfi_worker: Option<mfi_worker::MfiWorker>,
     ptm: Option<File>,
     file: FileState,
     eth: Option<RawFd>, // AF_PACKET raw socket bridging ncm0 <-> CH_ETH (host-driven, on demand)
@@ -1903,6 +1925,7 @@ impl Daemon {
     /// HELLO_ACK within 8 ms, which the app reads as "the box dropped us" on a link that just came
     /// up. `CT_HELLO`'s queue-clear cannot retract it. So: go idle silently.
     fn go_idle(&mut self, notify_host: bool) {
+        if let Some(worker) = &self.mfi_worker { worker.invalidate(); }
         let _ = std::fs::remove_file(carplay_start_session::REQUEST);
         if notify_host {
             self.set_present(false);
@@ -2992,14 +3015,6 @@ impl Daemon {
         );
     }
 
-    fn ensure_mfi(&mut self) -> Result<&mut Mfi, MfiError> {
-        if self.mfi.is_none() {
-            self.mfi = Some(Mfi::open()?);
-        }
-        // Set above or already populated.
-        Ok(self.mfi.as_mut().expect("MFi initialized"))
-    }
-
     fn handle_mfi(&mut self, pl: &[u8]) {
         if pl.len() < 3 {
             return;
@@ -3035,58 +3050,16 @@ impl Daemon {
             "[mfi] request source=ocbm-host op={op_name} tag={} active_bt_peer={active_peer} iap2_slots=[{slots}]",
             tag.map(|t| format!("{t:02x}")).unwrap_or_else(|| "none".into())
         );
-        let start = Instant::now();
-        let result: Result<Vec<u8>, MfiError> = match op {
-            0x01 => self.ensure_mfi().and_then(Mfi::cert),
-            // Bound the OCBM request; the shared driver also validates the chip
-            // challenge limit before any stateful write.
-            0x02 if ilen > 0 && ilen <= 1024 && 3 + ilen <= pl.len() => {
-                self.ensure_mfi().and_then(|m| m.sign(&pl[3..3 + ilen]))
-            }
-            _ => {
-                let mut resp = vec![0x02, 0, 0];
-                if let Some(t) = tag {
-                    resp.push(t);
-                }
-                self.send(p::CH_MFI, p::F_SOM | p::F_EOM, &resp);
-                return;
-            }
-        };
-        // Same trap as the CT_SRC bench (see CT_SRC below): a contended MFi request blocks this
-        // single-threaded dispatch for up to ~12 s (10 s MfiLock deadline + chip polling) while
-        // heartbeats sit unread in the kernel buffer — `presence_tick` would then see a stale
-        // `last_hb` and tear down a live session. If we measurably blocked, refresh `last_hb`
-        // (the host was alive throughout — we simply could not read its beats).
-        if start.elapsed() >= Duration::from_secs(1) && self.last_hb.is_some() {
-            self.last_hb = Some(Instant::now());
+        if let Some(worker) = &self.mfi_worker {
+            if worker.submit(pl) { return; }
+            let mut response = vec![1, 0, 0];
+            if let Some(t) = tag { response.push(t); }
+            self.log_internal("[mfi-perf] request refused: worker queue full or unavailable");
+            self.send(p::CH_MFI, p::F_SOM | p::F_EOM, &response);
+            return;
         }
-        match result {
-            Ok(data) => {
-                let mut resp = Vec::with_capacity(3 + data.len() + 1);
-                resp.push(0);
-                resp.push((data.len() >> 8) as u8);
-                resp.push(data.len() as u8);
-                resp.extend_from_slice(&data);
-                if let Some(t) = tag {
-                    resp.push(t);
-                }
-                self.send(p::CH_MFI, p::F_SOM | p::F_EOM, &resp);
-            }
-            // Errors carry the tag too — a misattributed FAILED is as damaging as a misattributed
-            // signature to a caller that does not retry.
-            Err(err) => {
-                let name = if op == 0x01 { "cert" } else { "sign" };
-                eprintln!(
-                    "[mfi] {name} failed after {} ms: {err}",
-                    start.elapsed().as_millis()
-                );
-                let mut resp = vec![0x01, 0, 0];
-                if let Some(t) = tag {
-                    resp.push(t);
-                }
-                self.send(p::CH_MFI, p::F_SOM | p::F_EOM, &resp);
-            }
-        }
+        let response = mfi_response(&mut self.mfi, pl);
+        self.send(p::CH_MFI, p::F_SOM | p::F_EOM, &response);
     }
 
     fn send_ip(&mut self, typ: u8, id: u16, data: &[u8]) {
@@ -3711,6 +3684,7 @@ impl Daemon {
                 if pl.first() == Some(&p::CT_CARPLAY_START_SESSION) {
                     self.start_session_request(&pl[1..]);
                 } else if pl.first() == Some(&p::CT_HELLO) {
+                    if let Some(worker) = &self.mfi_worker { worker.invalidate(); }
                     let _ = std::fs::remove_file(carplay_start_session::REQUEST);
                     self.start_events.clear();
                     // Host instance nonce (trailing u32 LE, 0 = not supplied). A DIFFERENT nonce while
@@ -3814,7 +3788,7 @@ impl Daemon {
                         | p::CAP_MULTI_IAP2
                         | p::CAP_CARPLAY_START_SESSION
                         | p::CAP_SOCKET_TUNNEL;
-                    if self.mfi.is_some() {
+                    if self.mfi.is_some() || self.mfi_worker.is_some() {
                         caps |= p::CAP_MFI;
                     }
                     // Unconditional: everything above logs only CHANGES, so a host reattaching with
@@ -4154,7 +4128,7 @@ impl Daemon {
                     self.log.cap = cap_kb as u64 * 1024; // 0 => LogTail::cap_bytes' default
                     self.log.enabled = enable;
                     if enable {
-                        self.log_internal("[tunnel-perf] implementation=tunnel-wake-v3 poll_wakeup=socketpair tcp_nodelay=true accessory_reader=threaded metrics=CH_LOG");
+                        self.log_internal("[tunnel-perf] implementation=tunnel-wake-v3 poll_wakeup=socketpair tcp_nodelay=true accessory_reader=threaded mfi_worker=serialized metrics=CH_LOG");
                     }
                     // Fire on the very next tick rather than up to LOG_TICK later, the same
                     // `last_*_check = None` trick the phone/box-health mirrors use on SUBSCRIBE.
@@ -4387,7 +4361,8 @@ fn main() {
     let mut d = Daemon {
         acc,
         seq: 0,
-        mfi,
+        mfi: None,
+        mfi_worker: Some(mfi_worker::MfiWorker::start(move |pl| mfi_response(&mut mfi, pl)).expect("start MFi worker")),
         ptm: None,
         file: FileState::default(),
         eth: None,
@@ -4547,6 +4522,20 @@ fn main() {
             }
 
         }
+        if d.mfi_worker.as_ref().is_some_and(|w| w.stopped()) {
+            eprintln!("[ocbmd] MFi worker stopped unexpectedly; exiting for respawn");
+            clear_session_state_for_exit();
+            std::process::exit(1);
+        }
+        let replies = d.mfi_worker.as_ref().map(|w| { w.clear_wake(); w.replies() }).unwrap_or_default();
+        for reply in replies {
+            if d.log.enabled {
+                let length = ((reply.payload[1] as usize) << 8) | reply.payload[2] as usize;
+                let tag = if reply.payload.len() == 4 + length { format!("{:02x}", reply.payload[3 + length]) } else { "none".into() };
+                d.log_internal(&format!("[mfi-perf] op={} tag={} queue_us={} chip_us={} status={} threaded=true", reply.op, tag, reply.queue_us, reply.chip_us, reply.payload[0]));
+            }
+            d.send(p::CH_MFI, p::F_SOM | p::F_EOM, &reply.payload);
+        }
         let broker_started = Instant::now();
         let tunnel_events: Vec<Vec<u8>> = d.tunnel.as_ref().map(|tunnel| {
             tunnel.clear_wake();
@@ -4575,6 +4564,10 @@ fn main() {
         // read() for seconds despite O_NONBLOCK. Only the dedicated reader touches read().
         fds.push(libc::pollfd { fd: accessory_reader.wake_fd(), events: libc::POLLIN, revents: 0 });
         kinds.push(Kind::AccessoryReadWake);
+        if let Some(worker) = &d.mfi_worker {
+            fds.push(libc::pollfd { fd: worker.wake_fd(), events: libc::POLLIN, revents: 0 });
+            kinds.push(Kind::MfiWake);
+        }
         let acc_ev = if want_out { libc::POLLOUT } else { 0 };
         if want_out {
             fds.push(libc::pollfd { fd: d.acc.as_raw_fd(), events: acc_ev, revents: 0 });
@@ -4697,6 +4690,7 @@ fn main() {
                     match kinds[i] {
                         Kind::TunnelWake => {},
                         Kind::AccessoryReadWake => {},
+                        Kind::MfiWake => {},
                         Kind::Pty => d.ptm = None, // console shell exited → drop the master pty
                         Kind::Eth => {
                             if let Some(fd) = d.eth.take() {
@@ -4730,7 +4724,8 @@ fn main() {
             match kinds[i] {
                         Kind::TunnelWake => {},
                 Kind::Acc => {}, // writable accessory; output is drained after dispatch
-                Kind::AccessoryReadWake => {}, // queued reads are processed at the next loop head
+                Kind::AccessoryReadWake => {},
+                        Kind::MfiWake => {}, // queued reads are processed at the next loop head
                 Kind::Pty => {
                     let mut t = [0u8; 4096];
                     // WouldBlock-aware (audit #5): the master is now O_NONBLOCK, so a spurious POLLIN wake
@@ -4884,7 +4879,7 @@ fn main() {
             loop_timing.record(match kinds[i] {
                 Kind::Acc => "usb_dispatch", Kind::Pty => "console", Kind::Conn(_) => "ip_socket",
                 Kind::Eth => "ethernet", Kind::Mic => "mic_socket", Kind::Rtsp => "rtsp_socket",
-                Kind::AvListen(_) => "av_accept", Kind::AvConn(_) => "av_read", Kind::TunnelWake => "tunnel_wake", Kind::AccessoryReadWake => "accessory_wake",
+                Kind::AvListen(_) => "av_accept", Kind::AvConn(_) => "av_read", Kind::TunnelWake => "tunnel_wake", Kind::AccessoryReadWake => "accessory_wake", Kind::MfiWake => "mfi_wake",
             }, fd_started);
         }
         loop_timing.record("dispatch", dispatch_started);
@@ -4982,6 +4977,7 @@ mod tests {
             acc: OpenOptions::new().write(true).open("/dev/null").unwrap(),
             seq: 0,
             mfi: None,
+            mfi_worker: None,
             ptm: None,
             file: FileState::default(),
             eth: None,
