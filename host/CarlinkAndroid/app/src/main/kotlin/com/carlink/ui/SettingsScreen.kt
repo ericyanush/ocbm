@@ -60,6 +60,7 @@ import com.carlink.ui.adaptive.asWindowInsets
 import com.carlink.ui.settings.ControlTabContent
 import com.carlink.ui.settings.DisplayMode
 import com.carlink.ui.settings.HotspotTabContent
+import com.carlink.ui.settings.NetworkDiagnosticsTabContent
 import com.carlink.ui.settings.PhonesTabContent
 import com.carlink.ui.settings.SettingsTab
 import com.carlink.ui.theme.AutomotiveDimens
@@ -131,6 +132,7 @@ fun SettingsScreen(
                 when (selectedTab) {
                     SettingsTab.PHONES -> PhonesPane(carlinkManager)
                     SettingsTab.WIFI -> HotspotTabContent(carlinkManager)
+                    SettingsTab.NETWORK -> NetworkDiagnosticsTabContent(carlinkManager)
                     SettingsTab.CONTROL ->
                         ControlTabContent(carlinkManager, connectionState, displayMode, actions.onDisplayModeSelected)
                     SettingsTab.LOGS ->

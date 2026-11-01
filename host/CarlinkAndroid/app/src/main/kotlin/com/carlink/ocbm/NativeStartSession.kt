@@ -19,6 +19,8 @@ class NativeStartSession(
     private val status: (String) -> Unit,
     private val log: (String) -> Unit,
     private val onDialBackTimeout: (peerMac: String, slotId: String) -> Unit = { _, _ -> },
+    private val endpointOverride: () -> JSONObject? = { null },
+    private val requireEndpointOverride: () -> Boolean = { false },
 ) {
     var enabled = false
     @Volatile var progressText: String? = null
@@ -58,10 +60,14 @@ class NativeStartSession(
     }
 
     fun endpoint(): JSONObject {
+        if (requireEndpointOverride()) {
+            return checkNotNull(endpointOverride()) { "Dongle Wi-Fi tunnel endpoint is not ready" }
+        }
+        endpointOverride()?.let { return it }
         val rx = checkNotNull(receiver()) { "Native receiver is unavailable" }
         val credentials = hotspot() ?: throw HotspotNotReady("Hotspot credentials unavailable; waiting for saved settings")
         val iface = StartSessionHotspot.select(StartSessionHotspot.snapshot())
-        val addresses = iface.usableAddresses
+        val addresses = StartSessionHotspot.advertisedAddresses(iface, rx.controlBindAddress)
         check(addresses.isNotEmpty() && addresses.size <= 16) { "Hotspot addresses unavailable" }
         return rx.startSessionIdentity().put("interface", iface.name).put("addresses", JSONArray(addresses))
             .put("ssid", credentials.ssid).put("passphrase", credentials.password)

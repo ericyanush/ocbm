@@ -245,7 +245,9 @@ class MainActivity : ComponentActivity() {
 
                     device?.let {
                         // Only handle if it's a known Carlinkit device
-                        if (KnownDevices.isKnownDevice(it.vendorId, it.productId)) {
+                        if (KnownDevices.isKnownDevice(it.vendorId, it.productId) ||
+                            (carlinkManager?.usbTransportMode == com.carlink.ocbm.UsbTransportMode.DIRECT &&
+                                carlinkManager?.usbAdapterIdentity?.matches(it.vendorId, it.productId) == true)) {
                             logWarn(
                                 "[USB_DETACH] Carlinkit device detached: VID=0x${it.vendorId.toString(16)} " +
                                     "PID=0x${it.productId.toString(16)} path=${it.deviceName}",
@@ -466,7 +468,7 @@ class MainActivity : ComponentActivity() {
         val isDebugBuild = BuildConfig.DEBUG
         Logger.setDebugLoggingEnabled(isDebugBuild)
 
-        logInfo("Carlink Native starting - version $appVersion", tag = "MAIN")
+        logInfo("Carlink Native starting - version $appVersion pid=${android.os.Process.myPid()}", tag = "MAIN")
         logInfo("[LOGGING] Debug logging: ${if (isDebugBuild) "ENABLED" else "DISABLED (release build)"}", tag = "MAIN")
     }
 

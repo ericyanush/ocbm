@@ -10,6 +10,45 @@ class StartSessionHotspotTest {
     private fun iface(name: String = "br0", up: Boolean = true, vararg addresses: String) =
         HotspotInterface(name, up, addresses.map { InetAddress.getByName(it) })
 
+    @Test fun explicit_bridge_binding_advertises_only_the_bound_address_and_rejects_stale_binding() {
+        val bridge = iface("ap_br_swlan0", true, "10.10.0.1", "fe80::1")
+        val bound = StartSessionHotspot.selectIpv4(listOf(iface("wlan0", true, "192.168.1.2"), bridge))
+        assertEquals(listOf("10.10.0.1"), StartSessionHotspot.advertisedAddresses(bridge, bound))
+        assertEquals(2, StartSessionHotspot.advertisedAddresses(bridge, null).size)
+        try {
+            StartSessionHotspot.advertisedAddresses(iface("ap_br_swlan0", true, "10.11.0.1"), bound)
+            fail("A listener on the old address must not advertise the new address")
+        } catch (_: HotspotNotReady) { }
+    }
+
+    @Test fun explicit_ipv4_binding_waits_instead_of_using_station_wifi() {
+        try {
+            StartSessionHotspot.selectIpv4(listOf(iface("ap_br_swlan0", true, "fe80::1"), iface("wlan0", true, "10.0.0.2")))
+            fail("The hotspot bridge has no IPv4 address yet")
+        } catch (_: HotspotNotReady) { }
+    }
+
+    @Test fun blazer_softap_bridge_is_selected_instead_of_station_wifi_or_vehicle_ethernet() {
+        val selected = StartSessionHotspot.select(listOf(
+            iface("wlan0", true, "10.0.1.86"),
+            iface("vt236", true, "172.16.236.100"),
+            iface("swlan0", true, "fe80::2"),
+            iface("ap_br_swlan0", true, "10.245.124.229", "fe80::1"),
+        ))
+        assertEquals("ap_br_swlan0", selected.name)
+        assertEquals(listOf("10.245.124.229", "fe80:0:0:0:0:0:0:1"), selected.usableAddresses)
+    }
+
+    @Test fun multiple_ready_softap_bridges_are_ambiguous() {
+        try {
+            StartSessionHotspot.select(listOf(
+                iface("ap_br_swlan0", true, "10.0.0.1"),
+                iface("ap_br_swlan1", true, "10.1.0.1"),
+            ))
+            fail("Ambiguous SoftAP bridges must not be guessed")
+        } catch (_: HotspotNotReady) { }
+    }
+
     @Test fun ipv6_only_bridge_is_ready_and_non_bridge_networks_are_not_candidates() {
         val bridge = iface(addresses = arrayOf("fe80::1"))
         val selected = StartSessionHotspot.select(listOf(iface("tun0", true, "192.168.2.1"), bridge))

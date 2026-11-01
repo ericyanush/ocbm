@@ -52,11 +52,21 @@ import com.carlink.ocbm.HostInstanceNonce
 import com.carlink.ocbm.Ocbm
 import com.carlink.ocbm.OcbmAvLanes
 import com.carlink.ocbm.OcbmClient
+import com.carlink.ocbm.OcbmSocketTunnel
+import com.carlink.ocbm.DirectUsbBulkTransport
 import com.carlink.ocbm.Mfi
 import com.carlink.ocbm.RebindableMfiRelay
 import com.carlink.ocbm.ConnectionMfiRelay
 import com.carlink.ocbm.OemIcon
 import com.carlink.ocbm.UsbBulkTransport
+import com.carlink.ocbm.UsbAdapterTransport
+import com.carlink.ocbm.UsbTransportMode
+import com.carlink.ocbm.CarPlayNetworkMode
+import com.carlink.ocbm.CarPlayNetworkModeStore
+import com.carlink.ocbm.UsbAdapterIdentity
+import com.carlink.ocbm.CarPlayControlPortStore
+import com.carlink.ocbm.StartSessionHotspot
+import com.carlink.ocbm.UsbTransportModeStore
 import com.carlink.ocbm.VehicleConfigSpec
 import com.carlink.ocbm.VehicleConfigYaml
 import com.carlink.ocbm.VehicleHotspotCredentials
@@ -95,13 +105,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.CopyOnWriteArrayList
+import java.net.InetAddress
 
 /**
  * Main Carlink Manager — OCBM.
  *
  * Central orchestrator for the CarPlay-only app against the **open OCBM userspace** on a
  * CPC200-CCPA:
- * - USB device lifecycle ([UsbBulkTransport]) and the OCBM session ([OcbmClient])
+ * - USB device lifecycle (split helper by default, optional direct USB) and the OCBM session ([OcbmClient])
  * - Video via [VideoRenderer] (H.264 or HEVC, whichever iOS negotiated), fed from `CH_VIDEO` through the forward-encrypted seam
  * - Audio via [MediaAudioPlayer] (media: PCM wired / AAC-LC wireless) and [VoiceRouter] (telephony/Siri/alert/nav)
  * - Microphone capture gated by the box's own `CT_UPLINK`, shipped over `CH_MIC`
@@ -149,6 +160,8 @@ class CarlinkManager(
      */
     val displayProfile: DisplayProfile? = null,
 ) {
+    private data class DongleApInfo(val address: InetAddress, val ssid: String, val channel: Int)
+
     private var config: AdapterConfig = initialConfig
 
     /** Stable projection-frame dimensions. Unlike Compose content bounds, these do not change when
@@ -451,10 +464,56 @@ class CarlinkManager(
 
     // ---- OCBM session -----------------------------------------------------------------------
     // One transport + one client PER SESSION, by contract: OcbmClient.stop() is terminal and
-    // UsbBulkTransport has no reopen, so reconnecting means constructing a fresh pair. Both are
+    // USB transports have no reopen, so reconnecting means constructing a fresh pair. Both are
     // cheap — neither holds a Context or native resources beyond the claimed interface.
-    @Volatile private var transport: UsbBulkTransport? = null
+    @Volatile private var transport: UsbAdapterTransport? = null
+    private val usbTransportModeStore by lazy { UsbTransportModeStore(context) }
+    val usbTransportMode: UsbTransportMode get() = usbTransportModeStore.mode
+    val usbAdapterIdentity: UsbAdapterIdentity get() = usbTransportModeStore.adapterIdentity
+    private val controlPortStore by lazy { CarPlayControlPortStore(context) }
+    private val carPlayNetworkModeStore by lazy { CarPlayNetworkModeStore(context) }
+    val carPlayNetworkMode: CarPlayNetworkMode get() = carPlayNetworkModeStore.mode
+    val socketTunnelSupported: Boolean get() = client?.hasSocketTunnel == true
+    val configuredCarPlayControlPort: Int get() = controlPortStore.port
+    val carPlayBridgeOnly: Boolean get() = controlPortStore.bridgeOnly
+    val carPlayControlPort: Int get() = carPlayReceiver?.controlPort ?: configuredCarPlayControlPort
+
+    suspend fun applyCarPlayControlPort(port: Int, bridgeOnly: Boolean = carPlayBridgeOnly): Boolean {
+        require(CarPlayControlPortStore.isValid(port))
+        return lifecycleMutex.withLock {
+            withContext(Dispatchers.IO) {
+                if (released || !controlPortStore.save(port, bridgeOnly)) return@withContext false
+                logInfo("[CP_RX] control port saved=$port bridgeOnly=$bridgeOnly; restarting session", tag = Logger.Tags.ADAPTR)
+                cleanSlate.run()
+            }
+        }
+    }
+
+    fun setUsbAdapterIdentity(identity: UsbAdapterIdentity) {
+        usbTransportModeStore.adapterIdentity = identity
+        logInfo("[USB_TRANSPORT] selected direct adapter identity=${identity.hexId}", tag = Logger.Tags.USB)
+    }
+
+    fun setUsbTransportMode(mode: UsbTransportMode) {
+        usbTransportModeStore.mode = mode
+        logInfo("[USB_TRANSPORT] selected mode=${mode.name}", tag = Logger.Tags.USB)
+    }
+
+    fun setCarPlayNetworkMode(mode: CarPlayNetworkMode) {
+        carPlayNetworkModeStore.mode = mode
+        logInfo("[CP_NETWORK] selected mode=${mode.name}; reconnect required", tag = Logger.Tags.ADAPTR)
+    }
+
+    /** Apply the phone-network choice and reconnect from the manager's lifetime scope. */
+    fun applyCarPlayNetworkMode(mode: CarPlayNetworkMode) {
+        scope.launch {
+            setCarPlayNetworkMode(mode)
+            cleanSlateReset()
+        }
+    }
     private var client: OcbmClient? = null
+    @Volatile private var socketTunnel: OcbmSocketTunnel? = null
+    @Volatile private var dongleApInfo: DongleApInfo? = null
     /** Invalidates delayed detach/error work and MFi callbacks from retired sessions. */
     private val connectionGeneration = AtomicLong(0)
 
@@ -535,6 +594,8 @@ class CarlinkManager(
     @Volatile private var previousPhoneSwitchTargetBtMac: String? = null
     @Volatile private var streamingPhoneMac: String? = null
     @Volatile private var mediaConfirmationGeneration: Long = 0L
+    /** Render count before this control generation; frames left over from a previous phone don't count. */
+    @Volatile private var mediaConfirmationFrameBaseline: Long = 0L
     /** Receiver/control generation whose first rendered frame has already promoted the UI to STREAMING. */
     @Volatile private var confirmedMediaReceiver: CarPlayRx? = null
     @Volatile private var confirmedMediaControlGeneration: Long = 0L
@@ -666,6 +727,8 @@ class CarlinkManager(
             hotspot = { VehicleHotspotStore(context).credentialsForStartSession() }, status = { setStatusText(it) },
             log = { logInfo("[START_SESSION] $it", tag = Logger.Tags.PHONE) },
             onDialBackTimeout = { peer, slotId -> onPreferredDialBackTimeout(peer, slotId) },
+            endpointOverride = { dongleStartSessionEndpoint() },
+            requireEndpointOverride = { carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL },
         )
     }
 
@@ -1103,18 +1166,23 @@ class CarlinkManager(
      * attempt 0, schedules no retry. `release()` also cancels [scope], so the zombie's state
      * posts silently no-op and nothing on screen explains it.
      */
-    private suspend fun acquireTransport(): UsbBulkTransport? {
+    private suspend fun acquireTransport(): UsbAdapterTransport? {
         val maxBindAttempts = 2
         for (attempt in 1..maxBindAttempts) {
-            val t = UsbBulkTransport(context, usbLog)
+            val mode = usbTransportModeStore.mode
+            val t: UsbAdapterTransport = when (mode) {
+                UsbTransportMode.SPLIT_HELPER -> UsbBulkTransport(context, usbLog)
+                UsbTransportMode.DIRECT -> DirectUsbBulkTransport(context, usbLog, usbTransportModeStore.adapterIdentity)
+            }
             transport = t
 
             if (t.connect()) {
+                logInfo("[USB_TRANSPORT] acquisition mode=${mode.name} directIdentity=${usbAdapterIdentity.hexId}", tag = Logger.Tags.USB)
                 return acquireOpenedAdapter(t)
             }
 
-            val detail = t.lastError ?: "USB helper unavailable"
-            logError("USB helper bind attempt $attempt/$maxBindAttempts failed: $detail", tag = Logger.Tags.USB)
+            val detail = t.lastError ?: "USB transport unavailable"
+            logError("USB transport ${mode.name} attempt $attempt/$maxBindAttempts failed: $detail", tag = Logger.Tags.USB)
             t.stop()
             if (transport === t) transport = null
 
@@ -1127,17 +1195,17 @@ class CarlinkManager(
                 continue
             }
 
-            handleFailedStart("USB helper unavailable: $detail")
+            handleFailedStart("USB transport unavailable: $detail")
             return null
         }
 
         return null
     }
 
-    private suspend fun acquireOpenedAdapter(t: UsbBulkTransport): UsbBulkTransport? {
+    private suspend fun acquireOpenedAdapter(t: UsbAdapterTransport): UsbAdapterTransport? {
         val dev = findDevice(t)
         if (dev == null) {
-            val detail = t.lastError ?: "Adapter not found or helper grant unavailable"
+            val detail = t.lastError ?: "Adapter not found or USB permission unavailable"
             logError("Failed to find/open the OCBM adapter: $detail", tag = Logger.Tags.USB)
             t.stop()
             if (transport === t) transport = null
@@ -1153,7 +1221,7 @@ class CarlinkManager(
 
         setStatusText("Adapter found — USB interface open")
         return if (released) {
-            logWarn("[LIFECYCLE] released after helper opened USB — closing and abandoning", tag = Logger.Tags.ADAPTR)
+            logWarn("[LIFECYCLE] released after USB open — closing and abandoning", tag = Logger.Tags.ADAPTR)
             t.stop()
             if (transport === t) transport = null
             null
@@ -1202,9 +1270,11 @@ class CarlinkManager(
         // Tear down any existing session BEFORE entering CONNECTING, so the FGS started at
         // CONNECTING isn't immediately stopped by the teardown's DISCONNECTED transition.
         if (client != null) stopImpl()
-        if (carPlayReceiver?.sessionLive != true) nativeStartForConnection = startSessionExperimentEnabled
+        val dongleTunnelMode = carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL
+        if (carPlayReceiver?.sessionLive != true) nativeStartForConnection = startSessionExperimentEnabled || dongleTunnelMode
         nativeStart.enabled = nativeStartForConnection
         nativeStartEndpoint = null
+        dongleApInfo = null
 
         val generation = connectionGeneration.incrementAndGet()
         carPlayMfiRelay.clear()
@@ -1219,7 +1289,7 @@ class CarlinkManager(
         // Stable for this manager's whole life, NOT per client: a reattach after a USB blip is the same
         // host and should warm-reuse the box's live session, whereas a new process must force a re-arm.
         c.instanceNonce = instanceNonce
-        if (nativeStartForConnection) {
+        if (nativeStartForConnection && !dongleTunnelMode) {
             nativeStart.adapterSessionChanged()
             if (carPlayReceiver?.sessionLive != true) {
                 // These per-peer phases belong to the old OCBM client. Retaining them can select
@@ -1249,13 +1319,27 @@ class CarlinkManager(
         // SETTIME ack does not mean the link is bad.
         c.setTime()
 
-        if (nativeStartForConnection) {
-            if (!c.hasStartSession) {
-                stopImpl()
-                setStatusText("Update adapter firmware to use experimental StartSession")
-                return
-            }
+        if (nativeStartForConnection && !c.hasStartSession) {
+            stopImpl()
+            setStatusText("Update adapter firmware to use iAP2 StartSession")
+            return
+        }
+        if (nativeStartForConnection && !dongleTunnelMode) {
             val prepared = runCatching {
+                if (carPlayBridgeOnly && carPlayReceiver?.sessionLive != true) {
+                    withContext(Dispatchers.IO) {
+                        kotlinx.coroutines.withTimeout(60_000) {
+                            awaitHotspotReady(
+                                isCurrent = { !released && client === c && connectionGeneration.get() == generation },
+                                read = { StartSessionHotspot.selectIpv4(StartSessionHotspot.snapshot()) },
+                                waiting = { evidence ->
+                                    setStatusText("Waiting for vehicle hotspot binding...")
+                                    logInfo("[CP_RX] waiting for bridge binding: $evidence", tag = Logger.Tags.ADAPTR)
+                                },
+                            )
+                        }
+                    }
+                }
                 startCarPlayReceiver()
                 withContext(Dispatchers.IO) {
                     kotlinx.coroutines.withTimeout(60_000) {
@@ -1292,6 +1376,73 @@ class CarlinkManager(
         // This is deliberately best-effort: older adapter builds may not implement CT_LOG_CTL.
         c.enableAdapterLogs()
         c.startHeartbeat()
+
+        if (dongleTunnelMode) {
+            val ap = try {
+                withContext(Dispatchers.IO) {
+                    kotlinx.coroutines.withTimeout(60_000) {
+                        awaitDongleApReady(c) { !released && client === c && connectionGeneration.get() == generation }
+                    }
+                }
+            } catch (t: Throwable) {
+                if (released || client !== c || connectionGeneration.get() != generation) return
+                stopImpl()
+                setStatusText("Adapter Wi-Fi unavailable: ${t.message ?: t.javaClass.simpleName}")
+                logError("[CP_TUNNEL] adapter AP did not become ready: ${t.message}", tag = Logger.Tags.ADAPTR, throwable = t)
+                scheduleReconnect()
+                return
+            }
+            dongleApInfo = ap
+            val relay = OcbmSocketTunnel(
+                send = c::sendSocketTunnelFrame,
+                apAddress = ap.address,
+                apPrefixBits = 24,
+                controlPort = configuredCarPlayControlPort,
+                log = { logInfo("[CP_TUNNEL] $it", tag = Logger.Tags.ADAPTR) },
+            )
+            try {
+                relay.start(c)
+                // StartSession and the tunneled AirPlay DNS-SD record advertise the receiver's
+                // control endpoint at the adapter AP address. The native receiver's control server
+                // itself listens on AAOS loopback, so explicitly map that fixed port through the
+                // adapter before publishing the advertisement. The native socket registrar only
+                // handles the receiver's later dynamically allocated media ports; it cannot create
+                // this initial phone-facing control listener.
+                relay.listenTcp(ap.address, 24, configuredCarPlayControlPort)
+                socketTunnel = relay
+            } catch (t: Throwable) {
+                relay.close()
+                socketTunnel = null
+                dongleApInfo = null
+                stopImpl()
+                setStatusText("Adapter Wi-Fi tunnel unavailable: ${t.message ?: t.javaClass.simpleName}")
+                logError("[CP_TUNNEL] failed to initialize adapter socket tunnel: ${t.message}", tag = Logger.Tags.ADAPTR, throwable = t)
+                return
+            }
+            try {
+                startCarPlayReceiver()
+                val receiver = carPlayReceiver
+                check(receiver?.awaitAdvertRegistered(5000) == true) {
+                    "Tunneled AirPlay advertisement did not become ready"
+                }
+                val endpoint = withContext(Dispatchers.IO) {
+                    kotlinx.coroutines.withTimeout(10_000) {
+                        nativeStart.awaitEndpoint { !released && client === c && connectionGeneration.get() == generation }
+                    }
+                }
+                nativeStartEndpoint = endpoint
+                // Slot events can arrive while the adapter AP is being brought up. Reconcile the
+                // selected slot now that the receiver and tunneled advert are ready.
+                syncMultiPhoneReceiverTarget(c, adapterActiveBtPeer.orEmpty())
+            } catch (t: Throwable) {
+                if (released || client !== c || connectionGeneration.get() != generation) return
+                stopImpl()
+                setStatusText("CarPlay tunnel setup failed: ${t.message ?: t.javaClass.simpleName}")
+                logError("[CP_TUNNEL] receiver startup failed: ${t.message}", tag = Logger.Tags.ADAPTR, throwable = t)
+                scheduleReconnect()
+                return
+            }
+        }
 
         // The adapter remains the Bluetooth/MFi coprocessor. The phone's Wi-Fi CarPlay control
         // and A/V sessions terminate in this app, using gm_ccpa's receiver and Carlink's media
@@ -1391,6 +1542,15 @@ class CarlinkManager(
 
     private fun startCarPlayReceiver() {
         if (carPlayReceiver != null) return
+        val dongleMode = carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL
+        val bindAddress = if (dongleMode) {
+            InetAddress.getByName("127.0.0.1")
+        } else if (carPlayBridgeOnly) {
+            requireNotNull(StartSessionHotspot.selectIpv4(StartSessionHotspot.snapshot())) {
+                "Vehicle hotspot bridge IPv4 unavailable; refusing wildcard listener"
+            }
+        } else null
+        logInfo("[CP_RX] requested listener binding=${bindAddress?.hostAddress ?: "wildcard"} port=$configuredCarPlayControlPort", tag = Logger.Tags.ADAPTR)
         val locationAdvertised = gpsForwardingPreference.enabled && hasFineLocationPermission()
         NativeCore.setLocationForwardingEnabled(locationAdvertised)
         logInfo("[GNSS] native Identify location capability=" +
@@ -1401,6 +1561,8 @@ class CarlinkManager(
         val returnIconLabel = context.getString(R.string.app_name)
         val receiver = CarPlayRx(
             context,
+            port = configuredCarPlayControlPort,
+            controlBindAddress = bindAddress,
             mfiRelay = carPlayMfiRelay,
             peerFile = java.io.File(context.filesDir, "carplay_peers.bin").absolutePath,
             infoTransformer = { source ->
@@ -1409,6 +1571,8 @@ class CarlinkManager(
             // Diagnostic test: publish only NsdManager's gm-ccpa record, not gmccpa-rx.local.
             selfHostedMdnsEnabled = false,
             startSessionOnly = nativeStartForConnection,
+            socketTunnelRelay = if (dongleMode) socketTunnel else null,
+            externalMdnsAddress = if (dongleMode) dongleApInfo?.address?.hostAddress else null,
         )
         receiver.onPhoneDiscovered = { name, deviceId ->
             scope.launch { rememberDiscoveredPhone(name, deviceId) }
@@ -1418,6 +1582,7 @@ class CarlinkManager(
             if (nativeStartForConnection) nativeStart.connected()
             val sessionGeneration = carPlaySessionGeneration.incrementAndGet()
             val controlGeneration = receiver.activeControlGeneration
+            armMediaConfirmation(controlGeneration)
             streamingPhoneMac = null
             wirelessRecoveryAttempted.set(false)
             logInfo("[CP_RX] native receiver accepted a phone control session", tag = Logger.Tags.ADAPTR)
@@ -1459,11 +1624,7 @@ class CarlinkManager(
             }
         }
         receiver.onControlConnectionAccepted = { phoneMac, generation ->
-            mediaConfirmationGeneration = generation
-            val currentEpoch = videoEpoch
-            currentEpoch?.renderer?.armFirstFrameCallback {
-                confirmCarPlayMedia(currentEpoch.seq, generation)
-            }
+            armMediaConfirmation(generation)
             logInfo(
                 "[CP_RX] accepted control generation=$generation for iAP2 phone=${phoneMac ?: "unidentified"}; streaming remains pending until media is rendered",
                 tag = Logger.Tags.PHONE,
@@ -1488,6 +1649,7 @@ class CarlinkManager(
                 carPlayMicUplink = null
                 streamingPhoneMac = null
                 mediaConfirmationGeneration = 0L
+                mediaConfirmationFrameBaseline = 0L
                 connectedPhoneMac = null
                 clearCachedMediaMetadata()
                 if (state == State.STREAMING) setState(State.DEVICE_CONNECTED)
@@ -1608,7 +1770,7 @@ class CarlinkManager(
             schedulePreferredPhoneFallback(it)
             syncMultiPhoneReceiverTarget(it, "")
         }
-        logInfo("[CP_RX] wireless CarPlay receiver started on control port 7011", tag = Logger.Tags.ADAPTR)
+        logInfo("[CP_RX] wireless CarPlay receiver started on control port ${receiver.controlPort}", tag = Logger.Tags.ADAPTR)
     }
 
     /**
@@ -1633,10 +1795,11 @@ class CarlinkManager(
         val spec =
             VehicleConfigSpec(
                 enablesHevc = caps.hevc,
-                wifiAp = false,
+                wifiAp = carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL,
                 wifiSsid = hotspot.ssid,
                 wifiPass = hotspot.password,
                 wifiChannel = hotspot.channel,
+                wirelessStartSession = nativeStartForConnection,
                 nativeStartEndpoint = nativeStartEndpoint,
                 name = config.boxName,
                 width = g.width,
@@ -1658,6 +1821,50 @@ class CarlinkManager(
             )
         logInfo("[CONFIG] ${g.describe()}", tag = Logger.Tags.ADAPTR)
         return spec
+    }
+
+    private suspend fun awaitDongleApReady(c: OcbmClient, isCurrent: () -> Boolean): DongleApInfo {
+        val deadline = SystemClock.elapsedRealtime() + 60_000
+        var last = "no MGMT_INFO received"
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (!isCurrent()) throw kotlinx.coroutines.CancellationException("adapter connection changed")
+            val raw = runCatching { c.mgmtGetInfo(timeoutMs = 2500) }.getOrNull()
+            val info = raw?.let { runCatching { JSONObject(it) }.getOrNull() }
+            if (info != null) {
+                val ip = info.optString("ap_ip").trim()
+                val ssid = info.optString("ap_ssid").trim()
+                val channel = info.optString("ap_channel").toIntOrNull() ?: info.optInt("ap_channel", 0)
+                last = "wlan_ap=${info.optBoolean("wlan_ap")} ap_ip=${ip.ifEmpty { "<empty>" }} " +
+                    "ap_ssid=${ssid.ifEmpty { "<empty>" }} ap_channel=$channel ap_iface=${info.optString("ap_iface")}"
+                val address = runCatching { InetAddress.getByName(ip) }.getOrNull()
+                if (info.optBoolean("wlan_ap") && address is java.net.Inet4Address && ssid.isNotEmpty() && channel in 1..196) {
+                    logInfo("[CP_TUNNEL] adapter AP ready ip=${address.hostAddress} ssid=$ssid channel=$channel", tag = Logger.Tags.ADAPTR)
+                    return DongleApInfo(address, ssid, channel)
+                }
+            } else {
+                last = "MGMT_INFO timed out or malformed"
+            }
+            setStatusText("Waiting for adapter Wi-Fi...")
+            delay(1000)
+        }
+        throw IllegalStateException("adapter AP not ready after 60s ($last)")
+    }
+
+    private fun dongleStartSessionEndpoint(): JSONObject? {
+        val rx = carPlayReceiver ?: return null
+        val ap = dongleApInfo ?: return null
+        val credentials = VehicleHotspotStore(context).credentialsForStartSession() ?: return null
+        val endpoint = rx.startSessionIdentity()
+        endpoint.put("interface", "dongle-ap")
+            .put("addresses", org.json.JSONArray().put(ap.address.hostAddress))
+            .put("ssid", ap.ssid)
+            .put("passphrase", credentials.password)
+            .put("channel", ap.channel)
+            .put("security", 2)
+        logInfo("[CP_TUNNEL] StartSession endpoint interface=dongle-ap address=${ap.address.hostAddress} " +
+            "port=${endpoint.optInt("port")} ssid=${ap.ssid} channel=${ap.channel} security=2 passphrase=<redacted>",
+            tag = Logger.Tags.PHONE)
+        return endpoint
     }
 
     /** Lazily rendered once per manager; the launcher icon cannot change under a running process. */
@@ -1712,6 +1919,9 @@ class CarlinkManager(
             receiver.stop()
         }
         carPlayReceiver = null
+        socketTunnel?.let { tunnel -> runCatching { tunnel.close() } }
+        socketTunnel = null
+        dongleApInfo = null
         lastTouchRoute = null
         lastTouchContactCount = 0
         carPlayMicUplink?.stop("Carlink session stopping")
@@ -2361,7 +2571,9 @@ class CarlinkManager(
         )
         val confirmGeneration = mediaConfirmationGeneration
         if (confirmGeneration != 0L) {
-            renderer.armFirstFrameCallback { confirmCarPlayMedia(seq, confirmGeneration) }
+            mediaConfirmationFrameBaseline = renderer.armFirstFrameCallback {
+                confirmCarPlayMedia(seq, confirmGeneration)
+            }
         }
         renderer.start()
         val thread = lanes.runConsumer("cp-video", pipe) { renderer.consume(it) }
@@ -2560,9 +2772,29 @@ class CarlinkManager(
             startCodecIfDeferred()
         }
         val e = videoEpoch ?: return
-        logInfo("[LIFECYCLE] Recovering video after overlay close (state=$state)", tag = Logger.Tags.VIDEO)
         val before = e.renderer.framesRendered.get()
-        requestCurrentKeyframe()
+        val rendererState = e.renderer.diagnosticState()
+        if (before == 0L) {
+            // At initial connection the overlay can close before pair-verify/SETUP or before the
+            // first video AU. Rebuilding a decoder that has never rendered a frame is not recovery;
+            // it can race the receiver's startup and exercise vendor MediaCodec teardown at the
+            // most fragile point in session startup. openVideoEpoch() already asks for a keyframe.
+            logInfo(
+                "[LIFECYCLE] Overlay closed before first video frame; deferring recovery " +
+                    "(state=$state control=${carPlayReceiver?.activeControlGeneration ?: 0} " +
+                    "epoch=${e.seq} $rendererState)",
+                tag = Logger.Tags.VIDEO,
+            )
+            return
+        }
+        logInfo(
+            "[LIFECYCLE] Recovering video after overlay close " +
+                "(state=$state control=${carPlayReceiver?.activeControlGeneration ?: 0} " +
+                "epoch=${e.seq} $rendererState)",
+            tag = Logger.Tags.VIDEO,
+        )
+        val keyframeRequested = requestCurrentKeyframe()
+        logInfo("[LIFECYCLE] overlay recovery keyframe requested=$keyframeRequested epoch=${e.seq}", tag = Logger.Tags.VIDEO)
 
         scope.launch {
             delay(OVERLAY_RECOVERY_WATCHDOG_MS)
@@ -2570,7 +2802,9 @@ class CarlinkManager(
             if (still.seq != e.seq) return@launch // already replaced
             if (still.renderer.framesRendered.get() == before) {
                 logWarn(
-                    "[LIFECYCLE] No frames ${OVERLAY_RECOVERY_WATCHDOG_MS}ms after overlay keyframe — rebuilding decoder",
+                    "[LIFECYCLE] No new frames ${OVERLAY_RECOVERY_WATCHDOG_MS}ms after overlay keyframe; " +
+                        "rebuilding decoder state=${state} control=${carPlayReceiver?.activeControlGeneration ?: 0} " +
+                        "epoch=${still.seq} ${still.renderer.diagnosticState()}",
                     tag = Logger.Tags.VIDEO,
                 )
                 val surface = videoSurface ?: return@launch
@@ -3603,14 +3837,45 @@ class CarlinkManager(
      */
     private fun markStreamingIfFirstMedia() {
         if (state != State.DEVICE_CONNECTED) return
-        if (carPlayReceiver != null) {
+        val receiver = carPlayReceiver
+        if (receiver != null) {
             // Metadata may be stale or arrive before the new phone's screen/media pipeline. For the
-            // native wireless receiver, only a rendered frame confirms that this generation streams.
-            logDebug("[CP_RX] metadata observed before first rendered frame; keeping session in DEVICE_CONNECTED", tag = Logger.Tags.PHONE)
+            // native wireless receiver, only a frame rendered after this generation was accepted
+            // confirms streaming. This also covers a callback registered during decoder output.
+            val epoch = videoEpoch
+            val generation = mediaConfirmationGeneration
+            val frames = epoch?.renderer?.framesRendered?.get() ?: 0L
+            if (generation != 0L && receiver.activeControlGeneration == generation &&
+                epoch != null && frames > mediaConfirmationFrameBaseline
+            ) {
+                logInfo(
+                    "[CP_RX] metadata fallback confirms rendered media controlGen=$generation " +
+                        "epoch=${epoch.seq} frames=$frames baseline=$mediaConfirmationFrameBaseline",
+                    tag = Logger.Tags.PHONE,
+                )
+                confirmCarPlayMedia(epoch.seq, generation)
+            } else {
+                logDebug("[CP_RX] metadata observed before a frame from the current control generation; keeping session in DEVICE_CONNECTED", tag = Logger.Tags.PHONE)
+            }
             return
         }
         lastStreamingStartMs = SystemClock.elapsedRealtime()
         setState(State.STREAMING)
+    }
+
+    /** Bind first-frame promotion to the active iAP2 control generation and decoder epoch. */
+    private fun armMediaConfirmation(generation: Long) {
+        if (generation == 0L) return
+        mediaConfirmationGeneration = generation
+        val epoch = videoEpoch
+        mediaConfirmationFrameBaseline = epoch?.renderer?.armFirstFrameCallback {
+            confirmCarPlayMedia(epoch.seq, generation)
+        } ?: 0L
+        logInfo(
+            "[CP_RX] first-frame confirmation armed controlGen=$generation " +
+                "epoch=${epoch?.seq ?: "pending"} baseline=$mediaConfirmationFrameBaseline",
+            tag = Logger.Tags.PHONE,
+        )
     }
 
     /** Promote the accepted control generation only after a real frame from its A/V lane is rendered. */
@@ -3878,18 +4143,18 @@ class CarlinkManager(
         }
     }
 
-    /** Ask the fixed-handler helper UID to discover, await GM's grant, and open the adapter. */
-    private suspend fun findDevice(t: UsbBulkTransport): String? {
+    /** Discover and open the adapter through the configured USB ownership path. */
+    private suspend fun findDevice(t: UsbAdapterTransport): String? {
         var attempts = 0
         while (attempts < 10) {
             val opened = t.findAndOpenFirstAdapter()
             if (opened != null) {
-                log("OCBM adapter discovered and opened by helper UID: $opened")
+                log("OCBM adapter discovered and opened: path=$opened mode=${usbTransportModeStore.mode}")
                 return opened
             }
             attempts++
-            // Retain app-level backoff for devices attached after the helper's bounded window.
-            // USB permission requests remain exclusively with GM's fixed-handler policy.
+            // Retain app-level backoff for devices attached after the first enumeration. Direct
+            // mode requests permission once, then this poll observes the system grant.
             delay(USB_WAIT_PERIOD_MS)
         }
         return null
@@ -3920,7 +4185,7 @@ class CarlinkManager(
     private fun handleErrorImpl(
         error: String,
         erroredClient: OcbmClient?,
-        erroredTransport: UsbBulkTransport?,
+        erroredTransport: UsbAdapterTransport?,
         expectedGeneration: Long,
     ) {
         if (expectedGeneration != connectionGeneration.get()) {

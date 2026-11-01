@@ -17,6 +17,7 @@ enum class SettingsTab(
 ) {
     PHONES("Phones", Icons.Default.PhoneAndroid),
     WIFI("Wi-Fi", Icons.Default.Wifi),
+    NETWORK("Network", Icons.Default.Wifi),
     CONTROL("Control", Icons.Default.Settings),
     LOGS("Logs", Icons.AutoMirrored.Filled.Article),
 }

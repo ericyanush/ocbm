@@ -19,6 +19,21 @@ internal data class HotspotInterface(val name: String, val up: Boolean, val addr
 }
 
 internal object StartSessionHotspot {
+    fun advertisedAddresses(bridge: HotspotInterface, bound: InetAddress?): List<String> {
+        if (bound == null) return bridge.usableAddresses
+        if (bridge.addresses.none { it.address.contentEquals(bound.address) }) {
+            throw HotspotNotReady("Hotspot address changed from listener binding ${bound.hostAddress}; restart receiver")
+        }
+        return listOfNotNull(bound.hostAddress?.substringBefore('%'))
+    }
+
+    fun selectIpv4(interfaces: List<HotspotInterface>): Inet4Address {
+        val bridge = select(interfaces)
+        return bridge.addresses.filterIsInstance<Inet4Address>().firstOrNull {
+            !it.isAnyLocalAddress && !it.isLoopbackAddress && !it.isMulticastAddress
+        } ?: throw HotspotNotReady("Hotspot bridge ${bridge.name} has no usable IPv4 address")
+    }
+
     fun snapshot(): List<HotspotInterface> = try {
         NetworkInterface.getNetworkInterfaces()?.toList().orEmpty().map {
             HotspotInterface(it.name, it.isUp, it.inetAddresses.toList())
@@ -28,7 +43,9 @@ internal object StartSessionHotspot {
     }
 
     fun select(interfaces: List<HotspotInterface>): HotspotInterface {
-        val bridges = interfaces.filter { it.name.startsWith("br") }
+        // GM platforms expose their SoftAP bridge as either br0 (Silverado/AAOS 12)
+        // or ap_br_swlan0 (Blazer/AAOS 14). Station Wi-Fi and vt* vehicle links are not candidates.
+        val bridges = interfaces.filter { it.name.startsWith("br") || it.name.startsWith("ap_br_") }
         val preferred = bridges.firstOrNull { it.name == "br0" }
         val ready = bridges.filter { it.up && it.usableAddresses.isNotEmpty() }
         // If the known bridge is present but down, wait for it. Do not switch to another network.

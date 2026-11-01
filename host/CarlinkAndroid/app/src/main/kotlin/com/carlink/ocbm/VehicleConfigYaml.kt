@@ -50,6 +50,7 @@ data class VehicleConfigSpec(
     val wifiSsid: String? = null,
     val wifiPass: String? = null,
     val wifiChannel: Int? = null,
+    val wirelessStartSession: Boolean = false,
     val nativeStartEndpoint: org.json.JSONObject? = null,
     val pairing: String = "just_works",
     val enablesHevc: Boolean = true,
@@ -262,10 +263,10 @@ object VehicleConfigYaml {
         s.wifiSsid?.let { line("wifi_ssid: $it") }
         s.wifiPass?.let { line("wifi_pass: $it") }
         s.wifiChannel?.let { line("wifi_channel: $it") }
-        s.nativeStartEndpoint?.let {
+        if (s.wirelessStartSession || s.nativeStartEndpoint != null) {
             line("iapConfig:")
             line("  wirelessStartSession: true")
-            line("  nativeReceiverEndpoint: $it")
+            s.nativeStartEndpoint?.let { line("  nativeReceiverEndpoint: $it") }
         }
         line("rightHandDrive: false")
         // Emitted for shape parity with the pinned fixture; the box does not read it. Night mode is a

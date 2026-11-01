@@ -33,6 +33,7 @@ object Ocbm {
     const val CH_MFI: Int = 0x0001
     const val CH_CONSOLE: Int = 0x0002
     const val CH_IP: Int = 0x0010
+    const val CH_TUNNEL: Int = 0x0013
     const val CH_FILE: Int = 0x0011
     const val CH_ETH: Int = 0x0012
     const val CH_VIDEO: Int = 0x0020
@@ -58,6 +59,7 @@ object Ocbm {
             CH_MFI -> "MFI"
             CH_CONSOLE -> "CONSOLE"
             CH_IP -> "IP"
+            CH_TUNNEL -> "TUNNEL"
             CH_FILE -> "FILE"
             CH_ETH -> "ETH"
             CH_VIDEO -> "VIDEO"
@@ -289,6 +291,24 @@ object Ocbm {
     const val CAP_FILE: Int = 0x0000_0010
     const val CAP_ETH: Int = 0x0000_0020
     const val CAP_MULTI_IAP2: Int = 0x0000_0040
+    const val CAP_SOCKET_TUNNEL: Int = 0x0000_0100
+
+    // CH_TUNNEL socket-broker operations. Payload prefix is [op][epoch:u32 LE][object:u32 LE].
+    const val TUNNEL_LISTEN_TCP: Byte = 0x01
+    const val TUNNEL_BIND_UDP: Byte = 0x02
+    const val TUNNEL_CLOSE: Byte = 0x03
+    const val TUNNEL_ACCEPT: Byte = 0x04
+    const val TUNNEL_TCP_DATA: Byte = 0x05
+    const val TUNNEL_TCP_CREDIT: Byte = 0x06
+    const val TUNNEL_TCP_EOF: Byte = 0x07
+    const val TUNNEL_UDP_DATAGRAM: Byte = 0x08
+    const val TUNNEL_UDP_SEND: Byte = 0x09
+    const val TUNNEL_RESULT: Byte = 0x0A
+    const val TUNNEL_START: Byte = 0x0B
+    const val TUNNEL_STOP: Byte = 0x0C
+    const val TUNNEL_MDNS_START: Byte = 0x0D
+    const val TUNNEL_MDNS_PACKET: Byte = 0x0E
+    const val TUNNEL_MDNS_SEND: Byte = 0x0F
 
     fun capsString(caps: Int): String {
         val bits = ArrayList<String>()
@@ -299,6 +319,7 @@ object Ocbm {
         if (caps and CAP_FILE != 0) bits.add("FILE")
         if (caps and CAP_ETH != 0) bits.add("ETH")
         if (caps and CAP_MULTI_IAP2 != 0) bits.add("MULTI_IAP2")
+        if (caps and CAP_SOCKET_TUNNEL != 0) bits.add("SOCKET_TUNNEL")
         return if (bits.isEmpty()) "none" else bits.joinToString("|")
     }
 

@@ -117,6 +117,12 @@ class OcbmClient(
     var onIap2Slot: ((mac: String, phase: Byte) -> Unit)? = null
     var onStartSessionEvent: ((org.json.JSONObject) -> Unit)? = null
     val hasStartSession: Boolean get() = (caps and Ocbm.CAP_CARPLAY_START_SESSION) != 0
+    val hasSocketTunnel: Boolean get() = (caps and Ocbm.CAP_SOCKET_TUNNEL) != 0
+    /** Socket tunnel callbacks must enqueue quickly; this is invoked on the USB receive thread. */
+    @Volatile var onSocketTunnelFrame: ((ByteArray) -> Unit)? = null
+
+    fun sendSocketTunnelFrame(payload: ByteArray): Boolean =
+        hasSocketTunnel && payload.size <= Ocbm.MAX_PAYLOAD && send(Ocbm.CH_TUNNEL, payload)
     fun startSessionRequest(request: org.json.JSONObject): Boolean {
         val bytes = request.toString().toByteArray(Charsets.UTF_8)
         return hasStartSession && bytes.size <= 8192 && send(Ocbm.CH_CTRL, byteArrayOf(Ocbm.CT_CARPLAY_START_SESSION) + bytes)
@@ -371,6 +377,10 @@ class OcbmClient(
             Ocbm.CH_MFI -> mfiQ.offer(f.payload)
             Ocbm.CH_MGMT -> mgmtQ.offer(f.payload)
             Ocbm.CH_LOG -> handleLog(f.payload)
+            Ocbm.CH_TUNNEL -> {
+                val handler = onSocketTunnelFrame
+                if (handler != null) handler(f.payload) else log.w("unexpected CH_TUNNEL frame without a registered socket broker")
+            }
             Ocbm.CH_VIDEO -> lanes?.feedVideo(f.payload) ?: dropAv(f)
             Ocbm.CH_MEDIA_AUDIO -> lanes?.feedMedia(f.payload) ?: dropAv(f)
             Ocbm.CH_ALT_AUDIO -> lanes?.feedVoice(f.payload) ?: dropAv(f)

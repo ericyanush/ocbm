@@ -39,6 +39,14 @@ interface RawBulkTransport {
     fun stop()
 }
 
+/** USB adapter acquisition contract shared by the split helper and direct in-app transports. */
+interface UsbAdapterTransport : RawBulkTransport {
+    val lastError: String?
+    val activeDeviceName: String?
+    fun connect(): Boolean
+    fun findAndOpenFirstAdapter(): String?
+}
+
 /**
  * An in-memory transport for headless testing. Whatever the client writes lands in [written]; call
  * [feed] to deliver bytes as if the box had sent them.

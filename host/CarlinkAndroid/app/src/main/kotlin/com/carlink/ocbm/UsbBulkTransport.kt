@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicLong
 class UsbBulkTransport(
     context: Context,
     private val log: ProbeLog.Logger,
-) : RawBulkTransport {
+) : UsbAdapterTransport {
     private data class BindingCleanup(
         val remote: IUsbBridge?,
         val unregisterCallback: Boolean,
@@ -74,11 +74,11 @@ class UsbBulkTransport(
 
     @Volatile private var deadHandler: (() -> Unit)? = null
 
-    @Volatile var lastError: String? = null
+    @Volatile override var lastError: String? = null
         private set
 
     /** USB enumeration path selected for this transport (e.g. `/dev/bus/usb/001/012`). */
-    @Volatile var activeDeviceName: String? = null
+    @Volatile override var activeDeviceName: String? = null
         private set
 
     override fun setReadHandler(handler: (ByteArray, Int) -> Unit) {
@@ -115,7 +115,9 @@ class UsbBulkTransport(
         }
 
     /** Bind on a worker thread; deliver binding callbacks off the AAOS main looper. */
-    fun connect(timeoutMs: Long = DEFAULT_BIND_TIMEOUT_MS): Boolean {
+    override fun connect(): Boolean = connect(DEFAULT_BIND_TIMEOUT_MS)
+
+    fun connect(timeoutMs: Long): Boolean {
         check(Looper.myLooper() != Looper.getMainLooper()) { "USB helper bind must not block the main thread" }
         if (bridge != null) return true
         if (!connectStarted.compareAndSet(false, true)) {
@@ -304,7 +306,7 @@ class UsbBulkTransport(
         }
 
     /** Discover, wait for the GM fixed-handler grant, and open through the helper UID. */
-    fun findAndOpenFirstAdapter(): String? =
+    override fun findAndOpenFirstAdapter(): String? =
         synchronized(lifecycleLock) {
             if (stopped) {
                 lastError = "USB helper transport is stopped"

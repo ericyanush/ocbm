@@ -38,6 +38,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -63,6 +64,9 @@ import com.carlink.CarlinkManager
 import com.carlink.callui.CallNotificationMode
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
+import com.carlink.ocbm.UsbTransportMode
+import com.carlink.ocbm.UsbAdapterIdentity
+import com.carlink.ocbm.CarPlayNetworkMode
 import com.carlink.navigation.ClusterNavigationController
 import com.carlink.ui.settings.LaneGuidanceStore
 import com.carlink.ui.settings.TurnAlertStore
@@ -399,8 +403,140 @@ private fun AdapterCard(
     // Read once per composition; the box cannot gain the capability mid-session (it is a
     // HELLO_ACK caps bit), and `connected` recomposes this card on every session edge anyway.
     val phoneDisconnectSupported = carlinkManager.phoneDisconnectSupported
+    var selectedUsbMode by remember(carlinkManager) { mutableStateOf(carlinkManager.usbTransportMode) }
+    var selectedNetworkMode by remember(carlinkManager) { mutableStateOf(carlinkManager.carPlayNetworkMode) }
+    var selectedUsbIdentity by remember(carlinkManager) { mutableStateOf(carlinkManager.usbAdapterIdentity) }
+    var controlPort by remember(carlinkManager) { mutableStateOf(carlinkManager.configuredCarPlayControlPort.toString()) }
+    var bridgeOnly by remember(carlinkManager) { mutableStateOf(carlinkManager.carPlayBridgeOnly) }
+    var applyingPort by remember(carlinkManager) { mutableStateOf(false) }
+    var portMessage by remember(carlinkManager) { mutableStateOf<String?>(null) }
 
     ControlCard(title = "Adapter", icon = Icons.Default.SettingsInputComponent, modifier = modifier) {
+        Text("USB connection path", style = MaterialTheme.typography.titleMedium)
+        UsbTransportMode.entries.forEach { mode ->
+            Row(
+                modifier = Modifier.fillMaxWidth().clickable { selectedUsbMode = mode },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(selected = selectedUsbMode == mode, onClick = { selectedUsbMode = mode })
+                Column {
+                    Text(mode.label, style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        if (mode == UsbTransportMode.SPLIT_HELPER)
+                            "Uses the separate GM USB handler. Default for the truck."
+                        else
+                            "Opens the adapter from this app and requests its own USB grant. For head units that block helper sideloading.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        if (selectedUsbMode == UsbTransportMode.DIRECT) {
+            Text("Adapter USB identity", style = MaterialTheme.typography.titleMedium)
+            UsbAdapterIdentity.entries.forEach { identity ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable { selectedUsbIdentity = identity },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = selectedUsbIdentity == identity, onClick = { selectedUsbIdentity = identity })
+                    Text(identity.label, style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+            Text("Select the identity already configured on the adapter. This setting does not change its firmware.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (selectedUsbMode != carlinkManager.usbTransportMode ||
+            (selectedUsbMode == UsbTransportMode.DIRECT && selectedUsbIdentity != carlinkManager.usbAdapterIdentity)) {
+            Button(
+                onClick = {
+                    carlinkManager.setUsbTransportMode(selectedUsbMode)
+                    if (selectedUsbMode == UsbTransportMode.DIRECT) carlinkManager.setUsbAdapterIdentity(selectedUsbIdentity)
+                    scope.launch(Dispatchers.IO) { carlinkManager.cleanSlateReset() }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Apply USB path and reconnect")
+            }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Text("CarPlay phone network", style = MaterialTheme.typography.titleMedium)
+        if (selectedNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL && !carlinkManager.socketTunnelSupported) {
+            Text("The connected adapter firmware does not advertise socket-tunnel support yet. Direct vehicle-hotspot mode remains active.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        }
+        CarPlayNetworkMode.entries.forEach { mode ->
+            Row(
+                modifier = Modifier.fillMaxWidth().clickable {
+                    if (mode != CarPlayNetworkMode.DONGLE_WIFI_TUNNEL || carlinkManager.socketTunnelSupported) {
+                        selectedNetworkMode = mode
+                    }
+                },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(
+                    selected = selectedNetworkMode == mode,
+                    enabled = mode != CarPlayNetworkMode.DONGLE_WIFI_TUNNEL || carlinkManager.socketTunnelSupported,
+                    onClick = {
+                        if (mode != CarPlayNetworkMode.DONGLE_WIFI_TUNNEL || carlinkManager.socketTunnelSupported) {
+                            selectedNetworkMode = mode
+                        }
+                    },
+                )
+                Column {
+                    Text(mode.label, style = MaterialTheme.typography.bodyLarge)
+                    Text(mode.description, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+        if (selectedNetworkMode != carlinkManager.carPlayNetworkMode) {
+            Button(onClick = {
+                // The reconnect can outlive this settings composition as the overlay/activity
+                // changes. Let CarlinkManager own the coroutine so Compose cancellation cannot
+                // abort adapter startup midway through the dongle-AP wait.
+                carlinkManager.applyCarPlayNetworkMode(selectedNetworkMode)
+            }, modifier = Modifier.fillMaxWidth()) {
+                Text("Apply phone network and reconnect")
+            }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Text("CarPlay control listener", style = MaterialTheme.typography.titleMedium)
+        val parsedControlPort = controlPort.toIntOrNull()
+        val validControlPort = parsedControlPort != null && parsedControlPort in 1024..65535
+        OutlinedTextField(
+            value = controlPort, onValueChange = { controlPort = it; portMessage = null },
+            label = { Text("Listening TCP port") }, singleLine = true, enabled = !applyingPort,
+            isError = !validControlPort,
+            supportingText = { Text("Default 7011; try 5000 on the Blazer. Used for the listener, mDNS, and iAP2 StartSession. Stop any diagnostic listener using this port first.") },
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        listOf(false to "All local addresses (wildcard)", true to "Vehicle hotspot bridge IPv4 only").forEach { (value, label) ->
+            Row(modifier = Modifier.fillMaxWidth().clickable(enabled = !applyingPort) { bridgeOnly = value },
+                verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = bridgeOnly == value, enabled = !applyingPort, onClick = { bridgeOnly = value })
+                Text(label, style = MaterialTheme.typography.bodyLarge)
+            }
+        }
+        Text("Bridge-only mode resolves the current bridge address when the receiver starts and sends only that IPv4 address in StartSession. If the bridge address changes, restart the session.",
+            style = MaterialTheme.typography.bodySmall)
+        Button(
+            enabled = validControlPort && !applyingPort && !carlinkManager.resetInFlight,
+            modifier = Modifier.fillMaxWidth().heightIn(min = AutomotiveDimens.ButtonMinHeight),
+            onClick = {
+                val port = controlPort.toIntOrNull() ?: return@Button
+                applyingPort = true
+                scope.launch {
+                    try {
+                        portMessage = if (carlinkManager.applyCarPlayControlPort(port, bridgeOnly)) "Listener settings saved; session restart attempted."
+                            else "Could not apply port; retry when the app is ready."
+                    } finally { applyingPort = false }
+                }
+            },
+        ) { Text(if (applyingPort) "Restarting session…" else "Apply listener settings and reconnect") }
+        portMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        Spacer(modifier = Modifier.height(16.dp))
         Text(
             text = "Connect phone to: ${carlinkManager.adapterName}",
             style = MaterialTheme.typography.titleMedium,
