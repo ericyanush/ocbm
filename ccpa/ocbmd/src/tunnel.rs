@@ -22,9 +22,12 @@ const MAX_OBJECTS: usize = 32;
 const MAX_TCP_CREDIT: u32 = 256 * 1024;
 const TCP_CHUNK: usize = 16 * 1024;
 const UDP_MAX: usize = 60 * 1024;
+const COMMAND_BATCH: usize = 64;
+const DATAGRAM_BATCH: usize = 32;
 
 pub struct TunnelBroker {
     commands: SyncSender<Vec<u8>>,
+    command_wake: UnixStream,
     events: Receiver<Event>,
     wake: UnixStream,
     timing: Mutex<EventTiming>,
@@ -38,6 +41,9 @@ struct EventTiming { since: Instant, count: u64, bytes: usize, max_age_us: u128 
 impl TunnelBroker {
     pub fn new() -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(COMMAND_CAP);
+        let (command_reader, command_wake) = UnixStream::pair().expect("tunnel command wake socketpair");
+        command_reader.set_nonblocking(true).expect("command reader nonblocking");
+        command_wake.set_nonblocking(true).expect("command writer nonblocking");
         let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAP);
         let (wake_rx, wake_tx) = UnixStream::pair().expect("tunnel wake socketpair");
         wake_rx.set_nonblocking(true).expect("tunnel wake reader nonblocking");
@@ -47,15 +53,17 @@ impl TunnelBroker {
         let event_tx = EventSender { tx: event_tx, wake: wake_tx, diagnostics: diag_tx };
         thread::Builder::new()
             .name("ocbm-socket-tunnel".into())
-            .spawn(move || run(cmd_rx, event_tx))
+            .spawn(move || run(cmd_rx, command_reader, event_tx))
             .expect("spawn OCBM socket tunnel worker");
-        Self { commands: cmd_tx, events: event_rx, wake: wake_rx, diagnostics, timing: Mutex::new(EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 }) }
+        Self { commands: cmd_tx, command_wake, events: event_rx, wake: wake_rx, diagnostics, timing: Mutex::new(EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 }) }
     }
 
     /// USB dispatch path: copy at most one bounded OCBM payload and never wait for network I/O.
     pub fn command(&self, payload: &[u8]) -> bool {
         if payload.len() > p::MAX_PAYLOAD { return false; }
-        self.commands.try_send(payload.to_vec()).is_ok()
+        if self.commands.try_send(payload.to_vec()).is_err() { return false; }
+        notify(&self.command_wake);
+        true
     }
 
     /// Drain summaries through the daemon's normal CH_LOG encoder, independently of stderr.
@@ -63,7 +71,7 @@ impl TunnelBroker {
         if let Ok(line) = self.diagnostics.try_recv() { return Some(line); }
         let mut t = self.timing.lock().unwrap();
         if t.since.elapsed() < Duration::from_secs(5) { return None; }
-        let line = format!("[tunnel-perf] implementation=tunnel-wake-v3 events={} bytes={} interval_ms={} max_event_age_us={}", t.count, t.bytes, t.since.elapsed().as_millis(), t.max_age_us);
+        let line = format!("[tunnel-perf] implementation=tunnel-poll-v4 events={} bytes={} interval_ms={} max_event_age_us={}", t.count, t.bytes, t.since.elapsed().as_millis(), t.max_age_us);
         *t = EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 };
         Some(line)
     }
@@ -88,11 +96,43 @@ impl TunnelBroker {
     /// Non-blocking event drain. The caller frames returned payloads on CH_TUNNEL.
     pub fn event(&self) -> Option<Vec<u8>> {
         let event = self.events.try_recv().ok()?;
+        // Event capacity is readiness too: retry pending accepts/TCP data/credits immediately.
+        notify(&self.command_wake);
         let mut timing = self.timing.lock().unwrap();
         timing.count += 1;
         timing.bytes += event.payload.len();
         timing.max_age_us = timing.max_age_us.max(event.queued.elapsed().as_micros());
         Some(event.payload)
+    }
+}
+
+impl Drop for TunnelBroker {
+    fn drop(&mut self) {
+        // Wake an idle worker even before Rust drops the command sender.
+        let _ = self.command_wake.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+fn notify(socket: &UnixStream) {
+    let mut socket = socket;
+    loop {
+        match socket.write(&[1]) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => break, // A full wake socket already has a readable notification.
+        }
+    }
+}
+
+fn clear_notification(mut socket: &UnixStream) -> bool {
+    let mut bytes = [0u8; 512];
+    loop {
+        match socket.read(&mut bytes) {
+            Ok(0) => return false,
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(_) => return false,
+        }
     }
 }
 
@@ -145,7 +185,7 @@ impl UdpTiming {
 
 struct Mdns { socket: UdpSocket, prefix: Prefix }
 
-fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
+fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSender) {
     let mut epoch = 0u32;
     let mut objects: HashMap<u32, Object> = HashMap::new();
     let mut pending_accepts: Vec<(u32, u32, TcpStream, SocketAddr, u32)> = Vec::new();
@@ -153,9 +193,12 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
     let mut next_stream = 0x8000_0000u32;
     let mut rx = vec![0u8; TCP_CHUNK.max(UDP_MAX)];
     loop {
-        loop {
+        if !clear_notification(&command_wake) { return; }
+        let mut command_count = 0;
+        for _ in 0..COMMAND_BATCH {
             match commands.try_recv() {
                 Ok(frame) => {
+                    command_count += 1;
                     if matches!(frame.first(), Some(&p::TUNNEL_START) | Some(&p::TUNNEL_STOP)) { pending_accepts.clear(); }
                     command(&frame, &mut epoch, &mut objects, &mut next_stream, &mut mdns, &events)
                 }
@@ -179,8 +222,59 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
         }
 
         let can_accept = objects.len() + pending_accepts.len() < MAX_OBJECTS;
+        // Only watch useful readiness. In particular, do not watch TCP reads while credit is
+        // exhausted or a reliable event is pending: a readable socket would otherwise spin.
+        let mut pollfds = vec![libc::pollfd { fd: command_wake.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        let mut slots = HashMap::new();
+        for (&id, object) in objects.iter_mut() {
+            let (fd, interest) = match object {
+                Object::Listener { socket, .. } => (socket.as_raw_fd(), if can_accept { libc::POLLIN } else { 0 }),
+                Object::Udp { socket, .. } => (socket.as_raw_fd(), libc::POLLIN),
+                Object::Tcp { socket, credit, rx_credit, pending_credit, pending, writeq, write_eof, read_eof, .. } => {
+                    if *pending_credit > 0 {
+                        let amount = (*pending_credit).min(MAX_TCP_CREDIT);
+                        let mut e = header(p::TUNNEL_TCP_CREDIT, epoch, id);
+                        e.extend_from_slice(&amount.to_le_bytes());
+                        if try_event(&events, e).is_ok() {
+                            *pending_credit -= amount;
+                            *rx_credit = rx_credit.saturating_add(amount).min(MAX_TCP_CREDIT);
+                        }
+                    }
+                    if let Some(event) = pending.take() {
+                        let bytes = event.len().saturating_sub(9) as u32;
+                        if let Err(event) = try_event(&events, event) { *pending = Some(event); }
+                        else { *credit = credit.saturating_sub(bytes); }
+                    }
+                    if writeq.is_empty() && *write_eof {
+                        let _ = socket.shutdown(std::net::Shutdown::Write);
+                        *write_eof = false;
+                    }
+                    let mut interest = 0;
+                    if *credit > 0 && pending.is_none() && !*read_eof { interest |= libc::POLLIN; }
+                    if !writeq.is_empty() { interest |= libc::POLLOUT; }
+                    (socket.as_raw_fd(), interest)
+                }
+            };
+            slots.insert(id, pollfds.len());
+            pollfds.push(libc::pollfd { fd: if interest == 0 { -1 } else { fd }, events: interest, revents: 0 });
+        }
+        let mdns_slot = mdns.as_ref().map(|state| {
+            let index = pollfds.len();
+            pollfds.push(libc::pollfd { fd: state.socket.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            index
+        });
+        // The timer exists only to emit idle diagnostics. Commands and freed event capacity
+        // wake the descriptor; a full command batch gets an immediate next pass.
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t,
+            if command_count == COMMAND_BATCH { 0 } else { 1000 }) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+            let _ = events.diagnostics.try_send(format!("[tunnel-perf] poll_error={}", std::io::Error::last_os_error()));
+            return;
+        }
+
         if let Some(mdns_state) = &mdns {
-            loop {
+            for _ in 0..if mdns_slot.is_some_and(|i| pollfds[i].revents != 0) { DATAGRAM_BATCH } else { 0 } {
                 match mdns_state.socket.recv_from(&mut rx[..9000]) {
                     Ok((n, peer)) if mdns_state.prefix.contains(peer.ip()) => {
                         let mut event = header(p::TUNNEL_MDNS_PACKET, epoch, 0);
@@ -196,16 +290,19 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
         }
         let ids: Vec<u32> = objects.keys().copied().collect();
         for id in ids {
+            let readiness = slots.get(&id).map(|&i| pollfds[i].revents).unwrap_or(0);
+            let readable = readiness & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+            let writable = readiness & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0;
             let mut remove = false;
             match objects.get_mut(&id) {
                 Some(Object::Listener { socket, prefix, credit }) => {
-                    let accepted = if can_accept { match socket.accept() {
+                    let accepted = if can_accept && readable { match socket.accept() {
                         Ok((stream, peer)) => Some((stream, peer, *prefix, *credit)),
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
                         Err(_) => { remove = true; None }
                     }} else { None };
                     if let Some((stream, peer, prefix, credit)) = accepted {
-                        if !prefix.contains(peer.ip()) || objects.len() >= MAX_OBJECTS {
+                        if !prefix.contains(peer.ip()) || objects.len() + pending_accepts.len() >= MAX_OBJECTS {
                             drop(stream);
                         } else {
                             // Small control/HID writes must not wait for Nagle batching.
@@ -225,22 +322,8 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
                         }
                     }
                 }
-                Some(Object::Tcp { socket, credit, rx_credit, pending_credit, pending, writeq, write_offset, write_eof, read_eof, remote_eof }) => {
-                    if *pending_credit > 0 {
-                        let amount = (*pending_credit).min(MAX_TCP_CREDIT);
-                        let mut e = header(p::TUNNEL_TCP_CREDIT, epoch, id);
-                        e.extend_from_slice(&amount.to_le_bytes());
-                        if try_event(&events, e).is_ok() {
-                            *pending_credit -= amount;
-                            *rx_credit = rx_credit.saturating_add(amount).min(MAX_TCP_CREDIT);
-                        }
-                    }
-                    if let Some(event) = pending.take() {
-                        let bytes = event.len().saturating_sub(9) as u32;
-                        if let Err(event) = try_event(&events, event) { *pending = Some(event); }
-                        else { *credit = credit.saturating_sub(bytes); }
-                    }
-                    if pending.is_none() && *credit > 0 && !*read_eof {
+                Some(Object::Tcp { socket, credit, pending_credit, pending, writeq, write_offset, write_eof, read_eof, remote_eof, .. }) => {
+                    if readable && pending.is_none() && *credit > 0 && !*read_eof {
                         let nmax = (*credit as usize).min(TCP_CHUNK);
                         match socket.read(&mut rx[..nmax]) {
                             Ok(0) => {
@@ -260,7 +343,7 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
                             Err(_) => remove = true,
                         }
                     }
-                    if let Some(front) = writeq.front() {
+                    if writable { if let Some(front) = writeq.front() {
                         match socket.write(&front[*write_offset..]) {
                             Ok(0) => remove = true,
                             Ok(n) => {
@@ -271,7 +354,8 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                             Err(_) => remove = true,
                         }
-                    } else if *write_eof {
+                    }}
+                    if writeq.is_empty() && *write_eof {
                         let _ = socket.shutdown(std::net::Shutdown::Write);
                         *write_eof = false;
                     }
@@ -279,7 +363,7 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
                 }
                 Some(Object::Udp { socket, prefix, timing }) => {
                     if let Some(line) = timing.report(id, socket.local_addr().map(|a| a.port()).unwrap_or(0)) { let _ = events.diagnostics.try_send(line); }
-                    loop {
+                    for _ in 0..if readable { DATAGRAM_BATCH } else { 0 } {
                     match socket.recv_from(&mut rx[..UDP_MAX]) {
                         Ok((n, peer)) if prefix.contains(peer.ip()) => {
                             timing.received(n);
@@ -303,7 +387,7 @@ fn run(commands: Receiver<Vec<u8>>, events: EventSender) {
                 let _ = try_event(&events, header(p::TUNNEL_CLOSE, epoch, id));
             }
         }
-        thread::sleep(Duration::from_millis(2));
+
     }
 }
 
@@ -478,6 +562,132 @@ fn allocate_id(next: &mut u32, objects: &HashMap<u32, Object>) -> u32 {
 mod wake_tests {
     use super::*;
 
+    fn broker(capacity: usize) -> (TunnelBroker, thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::sync_channel(COMMAND_CAP);
+        let (events, incoming) = mpsc::sync_channel(capacity);
+        let (reader, command_wake) = UnixStream::pair().unwrap();
+        let (wake, writer) = UnixStream::pair().unwrap();
+        for socket in [&reader, &command_wake, &wake, &writer] { socket.set_nonblocking(true).unwrap(); }
+        let (diagnostics, diagnostic_rx) = mpsc::sync_channel(64);
+        let worker = thread::spawn(move || run(rx, reader, EventSender { tx: events, wake: writer, diagnostics }));
+        (TunnelBroker { commands: tx, command_wake, events: incoming, wake,
+            diagnostics: diagnostic_rx, timing: Mutex::new(EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 }) }, worker)
+    }
+
+    fn receive(broker: &TunnelBroker) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            broker.clear_wake();
+            if let Some(event) = broker.event() { return event; }
+            assert!(Instant::now() < deadline, "broker event timed out");
+            let mut fd = libc::pollfd { fd: broker.wake_fd(), events: libc::POLLIN, revents: 0 };
+            unsafe { libc::poll(&mut fd, 1, 50); }
+        }
+    }
+
+    fn listen(broker: &TunnelBroker) -> (u16, u32) {
+        assert!(broker.command(&header(p::TUNNEL_START, 1, 0)));
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let mut frame = header(p::TUNNEL_LISTEN_TCP, 1, 1);
+        frame.extend_from_slice(&[4, 127, 0, 0, 1, 8]);
+        frame.extend_from_slice(&port.to_le_bytes());
+        frame.extend_from_slice(&MAX_TCP_CREDIT.to_le_bytes());
+        assert!(broker.command(&frame));
+        let result = receive(broker);
+        assert_eq!(result[0], p::TUNNEL_RESULT);
+        assert_eq!(result[9], 0);
+        (port, 1)
+    }
+
+    #[test]
+    fn idle_commands_credit_and_half_close_wake_the_broker() {
+        let (broker, worker) = broker(EVENT_CAP);
+        let (port, _) = listen(&broker);
+        let mut phone = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        phone.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let accept = receive(&broker);
+        assert_eq!(accept[0], p::TUNNEL_ACCEPT);
+        let id = u32::from_le_bytes(accept[5..9].try_into().unwrap());
+        phone.write_all(b"reply").unwrap();
+        // No read credit: readability must not spin or lose the pending bytes.
+        let mut frame = header(p::TUNNEL_TCP_CREDIT, 1, id);
+        frame.extend_from_slice(&5u32.to_le_bytes());
+        assert!(broker.command(&frame));
+        let data = receive(&broker);
+        assert_eq!(data[0], p::TUNNEL_TCP_DATA);
+        assert_eq!(&data[9..], b"reply");
+        let mut frame = header(p::TUNNEL_TCP_DATA, 1, id);
+        frame.extend_from_slice(b"request");
+        assert!(broker.command(&frame));
+        let mut body = [0; 7]; phone.read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"request");
+        let credit = receive(&broker);
+        assert_eq!(credit[0], p::TUNNEL_TCP_CREDIT);
+        assert!(broker.command(&header(p::TUNNEL_TCP_EOF, 1, id)));
+        assert_eq!(phone.read(&mut body).unwrap(), 0);
+        drop(broker);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn freed_event_capacity_retries_pending_accept_without_network_activity() {
+        let (broker, worker) = broker(1);
+        let (port, _) = listen(&broker);
+        let _first = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        // Poll for the first accept without consuming it: the event channel is now full.
+        let mut fd = libc::pollfd { fd: broker.wake_fd(), events: libc::POLLIN, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, 1000) }, 1);
+        let _second = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        assert_eq!(receive(&broker)[0], p::TUNNEL_ACCEPT);
+        assert_eq!(receive(&broker)[0], p::TUNNEL_ACCEPT);
+        drop(broker);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn udp_burst_larger_than_budget_preserves_datagrams_and_services_commands() {
+        let (broker, worker) = broker(EVENT_CAP);
+        let (tcp_port, _) = listen(&broker);
+        let reservation = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let mut bind = header(p::TUNNEL_BIND_UDP, 1, 2);
+        bind.extend_from_slice(&[4, 127, 0, 0, 1, 8]);
+        bind.extend_from_slice(&port.to_le_bytes());
+        bind.extend_from_slice(&0u32.to_le_bytes());
+        assert!(broker.command(&bind));
+        assert_eq!(receive(&broker)[9], 0);
+        let phone = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for i in 0..64u8 { phone.send_to(&[i], (std::net::Ipv4Addr::LOCALHOST, port)).unwrap(); }
+        let _tcp = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, tcp_port)).unwrap();
+        let mut datagrams = Vec::new();
+        let mut accepted = false;
+        while datagrams.len() < 64 || !accepted {
+            let event = receive(&broker);
+            match event[0] {
+                p::TUNNEL_ACCEPT => accepted = true,
+                p::TUNNEL_UDP_DATAGRAM => datagrams.push(parse_peer(&event[9..]).unwrap().1[0]),
+                op => panic!("unexpected event {op}"),
+            }
+        }
+        assert_eq!(datagrams, (0..64u8).collect::<Vec<_>>());
+        drop(broker);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn command_batches_larger_than_budget_do_not_lose_their_wakeup() {
+        let (broker, worker) = broker(EVENT_CAP);
+        assert!(broker.command(&header(p::TUNNEL_START, 1, 0)));
+        // Malformed binds return results without opening sockets.
+        for id in 1..=130 { assert!(broker.command(&header(p::TUNNEL_BIND_UDP, 1, id))); }
+        for _ in 0..130 { assert_eq!(receive(&broker)[0], p::TUNNEL_RESULT); }
+        drop(broker);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn published_events_wake_poll_and_survive_notification_drain() {
         let (tx, rx) = mpsc::sync_channel(EVENT_CAP);
@@ -487,6 +697,7 @@ mod wake_tests {
         let sender = EventSender { tx, wake: writer, diagnostics: mpsc::sync_channel(1).0 };
         let broker = TunnelBroker {
             commands: mpsc::sync_channel(1).0,
+            command_wake: UnixStream::pair().unwrap().0,
             events: rx, wake: reader, diagnostics: mpsc::sync_channel(1).1,
             timing: Mutex::new(EventTiming { since: Instant::now(), count: 0, bytes: 0, max_age_us: 0 }),
         };

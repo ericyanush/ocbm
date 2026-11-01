@@ -104,3 +104,20 @@ The longer `update_mfi_worker` capture contained foreground audio gaps of 1562 m
 - Player `audio-perf`: tagged-seam arrival gaps, read wait and decode/AudioTrack-write duration. Player reports are emitted when frames arrive, so a long stalled read reports its duration on resumption.
 
 Compare local elapsed times and matching ports/IDs; adapter and Android wall clocks are not synchronized enough for cross-device one-way timing. Idle/static video alone is not proof of a stall. Update `ocbmd` plus the main APK with rebuilt JNI libraries for this instrumentation; no supervisor or btd update is needed.
+
+### Event-driven adapter tunnel broker
+
+The broker now uses `poll()` instead of scanning sockets followed by a 2 ms sleep.
+A nonblocking socketpair wakes it for commands and for newly available outbound
+event capacity. TCP read interest is disabled when credit is exhausted or a reliable
+event is pending; write interest is enabled only for queued output. Each pass processes
+at most 64 commands, 32 datagrams per UDP/mDNS socket, and one TCP read/write per
+stream, so a busy socket cannot drain indefinitely before others are serviced.
+An idle one-second poll timeout preserves diagnostic reporting; it does not delay
+socket readiness or commands. Logs identify this broker as `implementation=tunnel-poll-v4`.
+
+Deploy the rebuilt `ocbmd` only. This does not change the wire protocol or require an
+APK/helper/btd update. Validate startup, sustained animated video with audio, and
+reconnect; compare UDP gaps/drops and tunnel event age with the previous capture.
+This removes polling delay and unbounded drain loops but does not establish that
+these were the cause of the previously observed multi-second receive gaps.
