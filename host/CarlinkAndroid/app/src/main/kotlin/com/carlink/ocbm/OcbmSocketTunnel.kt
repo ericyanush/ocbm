@@ -55,6 +55,11 @@ class OcbmSocketTunnel(
         val receivedBytes: AtomicLong = AtomicLong(),
         val forwardedPackets: AtomicLong = AtomicLong(),
         val forwardedBytes: AtomicLong = AtomicLong(),
+        val uplinkPackets: AtomicLong = AtomicLong(),
+        val uplinkBytes: AtomicLong = AtomicLong(),
+        val uplinkSendUs: AtomicLong = AtomicLong(),
+        val maxUplinkSendUs: AtomicLong = AtomicLong(),
+        val creditWaitUs: AtomicLong = AtomicLong(),
         val peerEof: AtomicBoolean = AtomicBoolean(false),
     )
     private data class UdpPeer(val peer: InetSocketAddress, val proxy: DatagramSocket)
@@ -304,14 +309,25 @@ class OcbmSocketTunnel(
         try {
             while (alive.get() && !socket.isClosed) {
                 val credit = stream.credit.get()
-                if (credit <= 0) { Thread.sleep(5); continue }
+                if (credit <= 0) {
+                    val began = System.nanoTime()
+                    Thread.sleep(5)
+                    stream.creditWaitUs.addAndGet((System.nanoTime() - began) / 1000)
+                    continue
+                }
                 val n = input.read(bytes, 0, minOf(bytes.size, credit))
                 if (n < 0) {
                     send(header(Ocbm.TUNNEL_TCP_EOF, streamId))
                     // Half-close only. The adapter may still have response bytes to deliver.
                     return
                 }
+                val began = System.nanoTime()
                 if (!send(tcpData(streamId, bytes, n))) throw java.io.IOException("USB tunnel write failed")
+                val sendUs = (System.nanoTime() - began) / 1000
+                stream.uplinkPackets.incrementAndGet()
+                stream.uplinkBytes.addAndGet(n.toLong())
+                stream.uplinkSendUs.addAndGet(sendUs)
+                stream.maxUplinkSendUs.updateAndGet { maxOf(it, sendUs) }
                 stream.credit.addAndGet(-n)
             }
         } catch (e: Exception) {
@@ -370,7 +386,11 @@ class OcbmSocketTunnel(
                             "forwarded=${stream.forwardedPackets.get()}pk/${forwarded}B(${txKbps}Kbps) " +
                             "queue=${snapshot.bytes}B/${snapshot.packets}pk peak=${snapshot.peakBytes}B/${snapshot.peakPackets}pk " +
                             "socketWriteUs=$socketWriteUs maxSocketWriteUs=$maxSocketWriteUs " +
-                            "creditSendUs=$creditSendUs maxCreditSendUs=$maxCreditSendUs")
+                            "creditSendUs=$creditSendUs maxCreditSendUs=$maxCreditSendUs " +
+                            "uplink=${stream.uplinkPackets.get()}pk/${stream.uplinkBytes.get()}B " +
+                            "uplinkSendUs=${stream.uplinkSendUs.getAndSet(0)} " +
+                            "maxUplinkSendUs=${stream.maxUplinkSendUs.getAndSet(0)} " +
+                            "creditWaitUs=${stream.creditWaitUs.getAndSet(0)} credit=${stream.credit.get()}")
                         lastReceivedBytes = received
                         lastForwardedBytes = forwarded
                     }
