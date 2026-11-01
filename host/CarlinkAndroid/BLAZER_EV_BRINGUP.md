@@ -156,3 +156,33 @@ Summaries are aggregated around five seconds; stream summaries with blocking rea
 can appear on the next packet after a stall. Compare intervals and local durations,
 not absolute timestamps between phone/adapter/AAOS clocks. Deploy rebuilt `ocbmd`
 and the main APK with rebuilt x86_64 and arm64 JNI libraries. No helper/btd update.
+
+### Drain decoder output while video input is idle
+
+The synchronous renderer previously checked MediaCodec output only after feeding
+new input (or while waiting for an input buffer). It then blocked reading the next
+seam message. A decoded final transition frame could therefore wait for unrelated
+future video input before being released to the Surface.
+
+A bounded video-only reader now supplies complete messages to the codec owner.
+The owner services output independently, with an 8 ms idle input wait while a codec
+is configured and 5 ms input-buffer waits. Codec create/feed/drain/reconfigure/release
+remain on one thread. The reader has one queued message plus its current message,
+uses backpressure rather than dropping compressed frames, and is closed/interrupted
+on teardown. The exported video log identifies `output servicing independent of seam input`.
+Regression tests cover output progress without a second frame, bounded ingestion,
+reader failure propagation and cleanup.
+
+`video-timing` now calls enqueue-to-output-release time `maxOutputReleaseUs` (it is
+not hardware decode execution time), includes `maxInputQueueAgeUs`, and reports
+`timestampAnomalies` / `validPresentations`. Vendor render timestamps earlier than
+our output release are excluded from latency maxima rather than clamped into valid
+zero-delay samples. Audio summaries add track buffered-duration estimates sampled
+before/after writes, split decode/track-write timings, and diagnostic RTP sequence/
+timestamp continuity. RTP missing counts are estimates and do not distinguish loss
+from reordering or stream sequence resets. Audio buffering policy is unchanged.
+
+Deploy the main APK with rebuilt JNI libraries. This change needs no `ocbmd`, btd,
+or USB helper update. Test a single tap into an app and launcher, especially the
+last frame of a transition followed by a static screen, then background/resume and
+phone switching to exercise codec ownership and shutdown.

@@ -6,6 +6,7 @@
 //! and the **event** TCP listener, answer with their ports, and run the timing responder (required
 //! before the iPhone streams). Phase-2 streams + the RTP/screen receive loops land in B2–B4.
 
+use crate::rtp_timing::AudioRtpTiming;
 use std::collections::HashMap;
 use std::io::{Cursor, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -3055,10 +3056,11 @@ fn spawn_audio(
         let mut perf_processing: Option<Instant> = None;
         let (mut perf_packets, mut perf_bytes) = (0u64, 0u64);
         let (mut perf_gap_us, mut perf_process_us) = (0u128, 0u128);
+        let mut rtp_timing = AudioRtpTiming::default();
         loop {
             if let Some(start) = perf_processing.take() { perf_process_us = perf_process_us.max(start.elapsed().as_micros()); }
             if perf_since.elapsed() >= Duration::from_secs(5) {
-                eprintln!("[audio-perf] stream_type={stream_type} local={:?} interval_ms={} packets={perf_packets} bytes={perf_bytes} max_gap_us={perf_gap_us} max_process_us={perf_process_us} idle_ms={} drops={drops}", sock.local_addr(), perf_since.elapsed().as_millis(), perf_last_rx.map(|t| t.elapsed().as_millis()).unwrap_or(0));
+                eprintln!("[audio-perf] stream_type={stream_type} local={:?} interval_ms={} packets={perf_packets} bytes={perf_bytes} max_gap_us={perf_gap_us} max_process_us={perf_process_us} idle_ms={} drops={drops} {}", sock.local_addr(), perf_since.elapsed().as_millis(), perf_last_rx.map(|t| t.elapsed().as_millis()).unwrap_or(0), rtp_timing.summary());
                 perf_since = Instant::now(); perf_packets=0; perf_bytes=0; perf_gap_us=0; perf_process_us=0;
             }
             let (n, peer) = match sock.recv_from(&mut buf) {
@@ -3084,6 +3086,7 @@ fn spawn_audio(
             }
             activity.store(now_ms(), Ordering::Relaxed); // A/V progress → feeds the idle watchdog
             let pkt = &buf[..n];
+            rtp_timing.observe(pkt);
             if frames == 0 && drops == 0 {
                 if let Ok(p) = std::env::var("CARPLAY_AUDIO_CAPTURE") {
                     let mut cap = Vec::new();

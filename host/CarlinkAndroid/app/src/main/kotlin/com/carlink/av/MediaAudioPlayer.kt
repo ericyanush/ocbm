@@ -210,6 +210,8 @@ class MediaAudioPlayer(
         log.i("stopping — ${framesDecoded.get()} frames, ${bytesIn.get()} bytes")
     }
 
+    private var measuredWriteNs = 0L
+
     /** Consume tagged media frames off the seam until it closes. Blocking; call on its own thread. */
     fun consume(ins: InputStream) {
         consumeStarted = true
@@ -221,6 +223,8 @@ class MediaAudioPlayer(
         var maxGapUs = 0L
         var maxReadUs = 0L
         var maxHandleUs = 0L
+        var maxDecodeOnlyUs = 0L
+        var maxTrackWriteUs = 0L
         try {
             while (running.get()) {
                 val readBegan = System.nanoTime()
@@ -231,13 +235,18 @@ class MediaAudioPlayer(
                 lastArrival = arrived
                 packets++
                 bytesIn.addAndGet((VoiceTag.LEN + au.size).toLong())
+                val writeBefore = measuredWriteNs
                 if (au.isNotEmpty()) handle(fmt, au)
                 val done = System.nanoTime()
                 maxHandleUs = maxOf(maxHandleUs, (done-arrived)/1000)
+                val writeNs = measuredWriteNs-writeBefore
+                maxTrackWriteUs = maxOf(maxTrackWriteUs, writeNs/1000)
+                maxDecodeOnlyUs = maxOf(maxDecodeOnlyUs, ((done-arrived)-writeNs).coerceAtLeast(0)/1000)
                 if (done-perfSince >= 5_000_000_000L) {
                     log.i("audio-perf intervalMs=${(done-perfSince)/1_000_000} packets=$packets " +
-                        "maxArrivalGapUs=$maxGapUs maxSeamReadUs=$maxReadUs maxDecodeWriteUs=$maxHandleUs bytes=${bytesIn.get()}")
-                    perfSince=done; packets=0; maxGapUs=0; maxReadUs=0; maxHandleUs=0
+                        "maxArrivalGapUs=$maxGapUs maxSeamReadUs=$maxReadUs maxDecodeWriteUs=$maxHandleUs " +
+                        "maxDecodeOnlyUs=$maxDecodeOnlyUs maxTrackWriteUs=$maxTrackWriteUs ${track?.bufferDiagnostics() ?: "track=none"} bytes=${bytesIn.get()}")
+                    perfSince=done; packets=0; maxGapUs=0; maxReadUs=0; maxHandleUs=0; maxDecodeOnlyUs=0; maxTrackWriteUs=0
                 }
             }
         } finally {
@@ -295,7 +304,9 @@ class MediaAudioPlayer(
         if (trk.gapSinceLastWrite(now) && ramp.start(now)) log.i("resume ramp triggered by the first media frame after a ${now - trk.lastWriteAt} ms gap")
         ramp.apply(pcm, off, len, ResumeRamp.Format(trk.channels, trk.rate), now)
         if (PcmLevel.audible(pcm, off, len)) lastAudibleAt = now
-        if (!trk.write(pcm, off, len, running)) {
+        val writeStarted = System.nanoTime()
+        val writeOk = try { trk.write(pcm, off, len, running) } finally { measuredWriteNs += System.nanoTime()-writeStarted }
+        if (!writeOk) {
             log.e("AudioTrack ERROR_DEAD_OBJECT — rebuilding")
             track = null
             runCatching { trk.release() }
@@ -522,6 +533,12 @@ private class MediaTrack(
     @Volatile var lastWriteAt = 0L
         private set
     private var writes = 0
+    private var submittedBytes = 0L
+    private var headLast = 0L
+    private var headWrap = 0L
+    private var minBufferedFrames = Long.MAX_VALUE
+    private var maxBufferedFrames = 0L
+    private var headResets = 0L
     private var underruns = 0
     private var lastUnderrunLogAt = 0L
 
@@ -605,6 +622,7 @@ private class MediaTrack(
     ): Boolean {
         val now = SystemClock.elapsedRealtime()
         if (gapSinceLastWrite(now)) reprime(now - lastWriteAt)
+        runCatching { bufferedFrames() }
         var o = off
         var remaining = len
         while (remaining > 0 && running.get()) {
@@ -616,14 +634,38 @@ private class MediaTrack(
                 return w != AudioTrack.ERROR_DEAD_OBJECT && w != AudioTrack.ERROR_INVALID_OPERATION
             }
             if (w == 0 && started) SystemClock.sleep(PAUSED_POLL_MS)
+            submittedBytes += w.coerceAtLeast(0)
             o += w
             remaining -= w
         }
         // Stamped AFTER the write: a write that blocked through a Siri turn must not read as a gap.
         lastWriteAt = SystemClock.elapsedRealtime()
+        runCatching { bufferedFrames() }
         if (started && ++writes % UNDERRUN_POLL_EVERY == 0) pollUnderruns()
         return true
     }
+
+    private fun bufferedFrames(): Long {
+        val raw = track.playbackHeadPosition.toLong() and 0xffffffffL
+        if (raw < headLast) {
+            if (headLast-raw > 0x80000000L) headWrap += 0x1_0000_0000L else headResets++
+        }
+        headLast = raw
+        val queued = (submittedBytes / (channels*2) - headWrap - raw).coerceAtLeast(0)
+        minBufferedFrames = minOf(minBufferedFrames, queued)
+        maxBufferedFrames = maxOf(maxBufferedFrames, queued)
+        return queued
+    }
+
+    fun bufferDiagnostics(): String = runCatching {
+        val frames = bufferedFrames()
+        if (headResets != 0L) return "bufferedMs=unavailable headResets=$headResets"
+        val line = "bufferedMs=${frames*1000/rate} minBufferedMs=${minBufferedFrames*1000/rate} " +
+            "maxBufferedMs=${maxBufferedFrames*1000/rate} capacityMs=${bufferBytes*1000L/bytesPerSecond} " +
+            "headResets=$headResets paused=$paused started=$started"
+        minBufferedFrames=Long.MAX_VALUE; maxBufferedFrames=0
+        line
+    }.getOrElse { "bufferedMs=unavailable" }
 
     /** Non-blocking until the threshold, then `play()`. Anything the stopped buffer would not take is written after. */
     private fun prefillWrite(
