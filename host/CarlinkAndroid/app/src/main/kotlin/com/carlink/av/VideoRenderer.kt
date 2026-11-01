@@ -9,7 +9,6 @@ import java.io.InputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * H.264 / HEVC decoder for the CarPlay screen stream, rendering straight to a [Surface].
@@ -43,13 +42,17 @@ class VideoRenderer(
 ) {
     private val log = ProbeLog.sub("video")
     private val running = AtomicBoolean(false)
-    private val firstFrameCallback = AtomicReference<(() -> Unit)?>(null)
+    private val firstFrameLock = Any()
+    private var firstFrameCallback: (() -> Unit)? = null
+    private var firstFrameCallbackAfterCount = 0L
 
     @Volatile private var codec: MediaCodec? = null
 
     @Volatile private var configured = false
 
     @Volatile private var configureFailedAt = 0L
+    @Volatile private var phase = "created"
+    @Volatile private var decoderName: String? = null
 
     /** Latched from the first parameter set of the stream; reset by [start]. */
     @Volatile var videoCodec: VideoCodec? = null
@@ -65,6 +68,13 @@ class VideoRenderer(
 
     /** The parameter sets actually baked into the live codec, to detect a mid-session change. */
     private var configuredCsd: ByteArray? = null
+    private var perfStartedNs = System.nanoTime()
+    private var perfInputWaitUs = 0L
+    private var perfMaxInputWaitUs = 0L
+    private var perfFeedUs = 0L
+    private var perfInputCount = 0L
+    private var perfLastFrames = 0L
+
 
     private companion object {
         const val CONFIGURE_RETRY_MS = 5_000L // don't re-attempt configure per NAL (codec-pool leak)
@@ -80,13 +90,28 @@ class VideoRenderer(
     fun start() {
         // A restart must not carry parameter sets, codec or keyframe state across streams: mixing a
         // new VPS with a stale SPS/PPS configures a codec that cannot decode what follows.
+        perfStartedNs = System.nanoTime()
+        perfInputWaitUs = 0L
+        perfMaxInputWaitUs = 0L
+        perfFeedUs = 0L
+        perfInputCount = 0L
+        perfLastFrames = framesRendered.get()
         paramSets.clear()
         videoCodec = null
         sawKeyframe = false
         configured = false
         configureFailedAt = 0L
+        phase = "started-awaiting-video-config"
+        decoderName = null
         running.set(true)
+        log.i("renderer started ${width}x$height surfaceValid=${surface.isValid}")
     }
+
+    /** Snapshot safe to include in lifecycle diagnostics without calling into MediaCodec. */
+    fun diagnosticState(): String =
+        "phase=$phase configured=$configured codec=${videoCodec?.label ?: "unknown"} " +
+            "decoder=${decoderName ?: "none"} frames=${framesRendered.get()} bytes=${bytesIn.get()} " +
+            "dropped=${ausDropped.get()} surfaceValid=${surface.isValid}"
 
     /** Flag-only. The codec is released by [consume] on its own thread; the caller closes the pipe. */
     fun stop() {
@@ -95,8 +120,25 @@ class VideoRenderer(
     }
 
     /** Arm a one-shot callback for the next real decoded frame; used once per CarPlay session. */
-    fun armFirstFrameCallback(callback: () -> Unit) {
-        firstFrameCallback.set(callback)
+    fun armFirstFrameCallback(callback: () -> Unit): Long = synchronized(firstFrameLock) {
+        // Baseline the callback at the same lock used by output-frame confirmation. A frame that
+        // races registration is either before this baseline or observes the newly armed callback;
+        // it can no longer be lost between getAndSet(null) and set(callback).
+        val baseline = framesRendered.get()
+        firstFrameCallbackAfterCount = baseline
+        firstFrameCallback = callback
+        baseline
+    }
+
+    private fun confirmFirstFrameIfArmed(frameCount: Long) {
+        val callback = synchronized(firstFrameLock) {
+            if (frameCount <= firstFrameCallbackAfterCount) null
+            else firstFrameCallback.also { firstFrameCallback = null }
+        } ?: return
+        log.i("session first-frame confirmation")
+        runCatching(callback).onFailure {
+            log.w("first-frame callback failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
     }
 
     /**
@@ -111,6 +153,8 @@ class VideoRenderer(
         // has no reference frames — so the IRAP gate must be re-armed. Parameter sets are KEPT: a
         // mid-stream re-dial re-sends no VideoConfig, so the cache is the only way to configure.
         sawKeyframe = false
+        phase = "reading-seam"
+        log.i("consumer entered thread=${Thread.currentThread().name}; ${diagnosticState()}")
         val hdr = ByteArray(4)
         try {
             while (running.get()) {
@@ -121,9 +165,15 @@ class VideoRenderer(
                 // unit emitted before the sample-description fix.
                 if (msg.isNotEmpty()) handleMessage(msg)
             }
+        } catch (t: Throwable) {
+            phase = "consumer-threw-${t.javaClass.simpleName}"
+            log.e("video consumer threw ${t.javaClass.name}: ${t.message}\n${android.util.Log.getStackTraceString(t)}; ${diagnosticState()}")
+            throw t
         } finally {
+            phase = "releasing-codec"
             releaseCodec()
-            log.i("seam ended — ${framesRendered.get()} frames rendered, ${ausDropped.get()} AUs dropped")
+            phase = "ended"
+            log.i("seam ended — ${framesRendered.get()} frames rendered, ${bytesIn.get()} bytes, ${ausDropped.get()} AUs dropped; ${diagnosticState()}")
         }
     }
 
@@ -168,6 +218,7 @@ class VideoRenderer(
     ) {
         if (videoCodec == null) {
             videoCodec = c
+            phase = "received-${c.label}-parameters"
             log.i("stream codec: ${c.label}")
         }
         paramSets.absorb(scan)
@@ -193,8 +244,16 @@ class VideoRenderer(
         val c = codec ?: return
         codec = null
         configured = false
-        runCatching { c.stop() }
-        runCatching { c.release() }
+        phase = "codec-stop"
+        runCatching { c.stop() }.onFailure {
+            log.w("MediaCodec.stop failed decoder=${decoderName ?: "unknown"}: ${it.javaClass.simpleName}: ${it.message}")
+        }
+        phase = "codec-release"
+        runCatching { c.release() }.onFailure {
+            log.w("MediaCodec.release failed decoder=${decoderName ?: "unknown"}: ${it.javaClass.simpleName}: ${it.message}")
+        }
+        decoderName = null
+        phase = "awaiting-video-config"
     }
 
     private fun maybeConfigure(
@@ -205,6 +264,8 @@ class VideoRenderer(
         if (configureFailedAt != 0L && now - configureFailedAt < CONFIGURE_RETRY_MS) return
         var c: MediaCodec? = null
         runCatching {
+            phase = "codec-create"
+            log.i("MediaCodec create begin mime=${vc.mime} ${width}x$height csd=${csd.size}B")
             val fmt = MediaFormat.createVideoFormat(vc.mime, width, height)
             if (vc == VideoCodec.HEVC) {
                 // HEVC: ONE csd-0 holding VPS+SPS+PPS. Splitting them the way H.264 does fails here.
@@ -218,12 +279,18 @@ class VideoRenderer(
             fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
             val mc = MediaCodec.createDecoderByType(vc.mime)
             c = mc
+            phase = "codec-configure"
+            log.i("MediaCodec configure begin mime=${vc.mime} decoder=${mc.name}")
             mc.configure(fmt, surface, null, 0)
+            phase = "codec-start"
+            log.i("MediaCodec start begin decoder=${mc.name}")
             mc.start()
             codec = mc
+            decoderName = mc.name
             configuredCsd = csd
             configured = true
             configureFailedAt = 0L
+            phase = "codec-running"
             log.i("MediaCodec configured: ${vc.mime} ${width}x$height csd=${csd.size} B, decoder=${mc.name}")
         }.onFailure { e ->
             // runCatching, not catch Exception: an OutOfMemoryError while the framework allocates the
@@ -233,18 +300,24 @@ class VideoRenderer(
             // Bare release is correct HERE: stop() is invalid from the Configured state.
             runCatching { c?.release() }
             configureFailedAt = now
+            phase = "codec-configure-failed"
             log.e("configure failed (retry in ${CONFIGURE_RETRY_MS}ms): ${e.message}")
         }
     }
 
     private fun feed(auBytes: ByteArray) {
         val c = codec ?: return
+        val feedStartedNs = System.nanoTime()
         try {
             var idx = -1
             // Retry rather than drop: a dropped slice corrupts every frame until the next IDR, which
             // CarPlay may not send for a long time.
             while (running.get() && idx < 0) {
+                val waitStartedNs = System.nanoTime()
                 idx = c.dequeueInputBuffer(INPUT_DEQUEUE_US)
+                val waitUs = (System.nanoTime() - waitStartedNs) / 1000
+                perfInputWaitUs += waitUs
+                perfMaxInputWaitUs = maxOf(perfMaxInputWaitUs, waitUs)
                 if (idx < 0) drain(c)
             }
             if (idx < 0) return
@@ -273,6 +346,22 @@ class VideoRenderer(
             sawKeyframe = false
             configureFailedAt = SystemClock.elapsedRealtime()
             requestKeyframe()
+        } finally {
+            perfFeedUs += (System.nanoTime() - feedStartedNs) / 1000
+            perfInputCount++
+            val now = System.nanoTime()
+            if (now - perfStartedNs >= 5_000_000_000L) {
+                val frames = framesRendered.get()
+                log.i("perf intervalMs=${(now - perfStartedNs) / 1_000_000} inputs=$perfInputCount " +
+                    "outputs=${frames - perfLastFrames} inputWaitUs=$perfInputWaitUs " +
+                    "maxInputWaitUs=$perfMaxInputWaitUs feedUs=$perfFeedUs bytes=${bytesIn.get()}")
+                perfStartedNs = now
+                perfLastFrames = frames
+                perfInputCount = 0L
+                perfInputWaitUs = 0L
+                perfMaxInputWaitUs = 0L
+                perfFeedUs = 0L
+            }
         }
     }
 
@@ -293,12 +382,7 @@ class VideoRenderer(
                     c.releaseOutputBuffer(outIdx, real)
                     val n = if (real) framesRendered.incrementAndGet() else 0L
                     if (n == 1L) log.i("FIRST FRAME RENDERED")
-                    if (real) firstFrameCallback.getAndSet(null)?.let { callback ->
-                        log.i("session first-frame confirmation")
-                        runCatching(callback).onFailure {
-                            log.w("first-frame callback failed: ${it.javaClass.simpleName}: ${it.message}")
-                        }
-                    }
+                    if (real) confirmFirstFrameIfArmed(n)
                     if (n > 0L && n % LOG_EVERY_FRAMES == 0L) log.i("$n frames rendered (${bytesIn.get()} B in)")
                 }
                 outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> log.i("output format: ${c.outputFormat}")
