@@ -66,6 +66,7 @@ import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.ocbm.UsbTransportMode
 import com.carlink.ocbm.UsbAdapterIdentity
+import com.carlink.ocbm.CarPlayFrameRate
 import com.carlink.ocbm.CarPlayNetworkMode
 import com.carlink.navigation.ClusterNavigationController
 import com.carlink.ui.settings.LaneGuidanceStore
@@ -712,10 +713,21 @@ private fun AppControlCard(
     var showDeferredNotice by remember { mutableStateOf(false) }
     var showDisplayModeDialog by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
+    var showFrameRateDialog by remember { mutableStateOf(false) }
+    var selectedFrameRate by remember(carlinkManager) { mutableStateOf(carlinkManager.carPlayFrameRate) }
+    var frameRateMessage by remember { mutableStateOf<String?>(null) }
+
     var isRestarting by remember(carlinkManager) { mutableStateOf(carlinkManager.resetInFlight) }
 
     ControlCard(title = "App Control", icon = Icons.Default.DisplaySettings, modifier = modifier) {
         TonalActionButton(label = "Display Mode", icon = displayMode.icon, onClick = { showDisplayModeDialog = true })
+        Spacer(modifier = Modifier.height(12.dp))
+        TonalActionButton(label = "Frame Rate: ${carlinkManager.carPlayFrameRate.label}", icon = Icons.Default.VideoSettings, onClick = {
+            selectedFrameRate = carlinkManager.carPlayFrameRate
+            showFrameRateDialog = true
+        })
+        frameRateMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+
         Spacer(modifier = Modifier.height(12.dp))
         ControlButton(RESET_DECODER, enabled = !isRestarting, onClick = {
             logWarn("[UI_ACTION] Reset Decoder button clicked", tag = "UI")
@@ -727,6 +739,37 @@ private fun AppControlCard(
             enabled = connected,
             isProcessing = isRestarting,
             onClick = { showResetConfirm = true },
+        )
+    }
+
+    if (showFrameRateDialog) {
+        AlertDialog(
+            onDismissRequest = { showFrameRateDialog = false },
+            title = { Text("CarPlay frame rate") },
+            text = {
+                Column {
+                    Text("Maximum frame rate offered to the phone. Applying restarts the session.")
+                    CarPlayFrameRate.entries.forEach { mode ->
+                        Row(modifier = Modifier.fillMaxWidth().clickable { selectedFrameRate = mode }.heightIn(min = 56.dp), verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(selected = selectedFrameRate == mode, onClick = { selectedFrameRate = mode })
+                            Text(mode.label)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = !isRestarting, onClick = {
+                    showFrameRateDialog = false
+                    isRestarting = true
+                    scope.launch {
+                        try {
+                            frameRateMessage = if (carlinkManager.applyCarPlayFrameRate(selectedFrameRate)) "Frame rate saved; reconnecting."
+                                else "Could not save or restart the session."
+                        } finally { isRestarting = false }
+                    }
+                }) { Text("Apply and reconnect") }
+            },
+            dismissButton = { TextButton(onClick = { showFrameRateDialog = false }) { Text("Cancel") } },
         )
     }
 

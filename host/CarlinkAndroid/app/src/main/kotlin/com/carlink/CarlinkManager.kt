@@ -65,6 +65,8 @@ import com.carlink.ocbm.CarPlayNetworkMode
 import com.carlink.ocbm.CarPlayNetworkModeStore
 import com.carlink.ocbm.UsbAdapterIdentity
 import com.carlink.ocbm.CarPlayControlPortStore
+import com.carlink.ocbm.CarPlayFrameRate
+import com.carlink.ocbm.CarPlayFrameRateStore
 import com.carlink.ocbm.StartSessionHotspot
 import com.carlink.ocbm.UsbTransportModeStore
 import com.carlink.ocbm.VehicleConfigSpec
@@ -471,6 +473,22 @@ class CarlinkManager(
     val usbTransportMode: UsbTransportMode get() = usbTransportModeStore.mode
     val usbAdapterIdentity: UsbAdapterIdentity get() = usbTransportModeStore.adapterIdentity
     private val controlPortStore by lazy { CarPlayControlPortStore(context) }
+    private val frameRateStore by lazy { CarPlayFrameRateStore(context) }
+    val carPlayFrameRate: CarPlayFrameRate get() = frameRateStore.mode
+
+    private fun sessionGeometry(): PanelGeometry {
+        val detected = displayProfile?.geometry ?: PanelGeometry.fromConfig(config)
+        return detected.copy(maxFps = frameRateStore.mode.resolve(detected.maxFps))
+    }
+
+    suspend fun applyCarPlayFrameRate(mode: CarPlayFrameRate): Boolean = lifecycleMutex.withLock {
+        withContext(Dispatchers.IO) {
+            if (released || !frameRateStore.save(mode)) return@withContext false
+            logInfo("[CONFIG] CarPlay frame rate=${mode.name} effective=${sessionGeometry().maxFps}; restarting session", tag = Logger.Tags.ADAPTR)
+            cleanSlate.run()
+        }
+    }
+
     private val carPlayNetworkModeStore by lazy { CarPlayNetworkModeStore(context) }
     val carPlayNetworkMode: CarPlayNetworkMode get() = carPlayNetworkModeStore.mode
     val socketTunnelSupported: Boolean get() = client?.hasSocketTunnel == true
@@ -1566,7 +1584,7 @@ class CarlinkManager(
             mfiRelay = carPlayMfiRelay,
             peerFile = java.io.File(context.filesDir, "carplay_peers.bin").absolutePath,
             infoTransformer = { source ->
-                val geometry = displayProfile?.geometry ?: PanelGeometry.fromConfig(config)
+                val geometry = sessionGeometry()
                 val customized = CarPlayInfoCustomizer.withReturnIcon(source, returnIconImages, returnIconLabel)
                 CarPlayInfoCustomizer.withGeometry(customized, geometry).also {
                     logInfo("[CP_RX] /info geometry ${geometry.describe()} HID=${geometry.width}x${geometry.height}", tag = Logger.Tags.ADAPTR)
@@ -1786,7 +1804,7 @@ class CarlinkManager(
     private fun vehicleConfigSpec(hotspot: VehicleHotspotCredentials): VehicleConfigSpec {
         // Detected panel first (DisplayProfile.geometry, already clamped and legalised); the stored
         // AdapterConfig only fills in when no profile exists. The spec's own checks are a backstop.
-        val g = displayProfile?.geometry ?: PanelGeometry.fromConfig(config)
+        val g = sessionGeometry()
         // Advertise HEVC only when this head unit can actually decode it at the negotiated geometry:
         // `enablesHEVC` drives the box's `hevcInfo` lever (carplayd main.rs), and a stream iOS
         // encodes in a codec the decoder cannot take is a black screen with no error anywhere.
