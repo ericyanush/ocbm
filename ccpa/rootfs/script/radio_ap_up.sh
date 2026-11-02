@@ -177,11 +177,73 @@ if [ -e /etc/wifi_ip ]; then
     esac
   fi
 fi
+# BEGIN DHCP LEASE POLICY (also exercised with temporary files by tools/tests)
+# Stop only the server using this exact AP config, never the NCM DHCP server.
+stop_ap_dhcp() {
+  _pids=$(ps | awk -v conf="$1" '
+    { daemon=0; config=0; for (i=1;i<=NF;i++) {
+        n=split($i, parts, "/"); if (parts[n] == "udhcpd") daemon=1;
+        if ($i == conf) config=1;
+      }
+      if (daemon && config) print $1;
+    }')
+  for _pid in $_pids; do
+    kill "$_pid" 2>/dev/null || true
+    _wait=0
+    while kill -0 "$_pid" 2>/dev/null && [ "$_wait" -lt 20 ]; do
+      sleep 0.1; _wait=$((_wait+1))
+    done
+    if kill -0 "$_pid" 2>/dev/null; then
+      dhcp_policy_log "cannot stop old AP server pid=$_pid; refusing to change its pool"
+      return 1
+    fi
+  done
+}
+dhcp_policy_log() { echo "$L DHCP $*" | tee -a /tmp/box.log; }
+
+configure_ap_dhcp() {
+  _conf=$1; _base=$2; _iface=$3
+  _start=$(awk '$1 == "start" { print $2; exit }' "$_conf")
+  _end=$(awk '$1 == "end" { print $2; exit }' "$_conf")
+  _old_if=$(awk '$1 == "interface" { print $2; exit }' "$_conf")
+  _leases=$(awk '$1 == "lease_file" { print $2; exit }' "$_conf")
+  [ -n "$_leases" ] || _leases=/var/lib/udhcpd.leases
+  case "$_leases" in
+    /tmp/udhcpd_ncm.leases) dhcp_policy_log "refusing AP configuration using the NCM lease file"; return 1 ;;
+    /*) ;;
+    *) dhcp_policy_log "refusing non-absolute AP lease file"; return 1 ;;
+  esac
+  _pool_changed=0
+  if [ "$_start" != "$_base.100" ] || [ "$_end" != "$_base.200" ]; then _pool_changed=1; fi
+  # Stop first: a live old server can otherwise save incompatible leases on exit.
+  if [ "$_pool_changed" = 1 ] || [ "$_old_if" != "$_iface" ]; then
+    stop_ap_dhcp "$_conf" || return 1
+  fi
+  _new="$_conf.ocbm-dhcp.$$"
+  cp -p "$_conf" "$_new" || return 1
+  if ! awk -v first="$_base.100" -v last="$_base.200" -v iface="$_iface" '
+      $1 == "start" { if (!s++) print "start\t" first; next }
+      $1 == "end" { if (!e++) print "end\t" last; next }
+      $1 == "interface" { if (!i++) print "interface\t" iface; next }
+      { print }
+      END { if (!s) print "start\t" first; if (!e) print "end\t" last; if (!i) print "interface\t" iface }
+    ' "$_conf" > "$_new"; then rm -f "$_new"; return 1; fi
+  if cmp -s "$_conf" "$_new"; then rm -f "$_new"
+  else mv "$_new" "$_conf" || { rm -f "$_new"; return 1; }; fi
+  if [ "$_pool_changed" = 1 ]; then
+    rm -f "$_leases" || return 1
+    dhcp_policy_log "leases=invalidated reason=pool_changed old=${_start:-unknown}-${_end:-unknown} new=$_base.100-$_base.200"
+  elif [ -f "$_leases" ]; then
+    dhcp_policy_log "leases=preserved file=$_leases pool=$_base.100-$_base.200"
+  else
+    dhcp_policy_log "leases=absent file=$_leases pool=$_base.100-$_base.200"
+  fi
+}
+# END DHCP LEASE POLICY
+
 base=${WLANIP%.*}
-sed -i "s/192\.168\.[0-9]*\.100/${base}.100/; s/192\.168\.[0-9]*\.200/${base}.200/" /etc/udhcpd.conf 2>/dev/null
-# Point udhcpd at the interface we are actually serving.
-grep -q '^interface' /etc/udhcpd.conf 2>/dev/null && sed -i "s/^interface.*/interface	$IF/" /etc/udhcpd.conf
-rm -f /var/lib/udhcpd.leases
+# Keep cached client addresses valid when the phone returns using its previous lease.
+configure_ap_dhcp /etc/udhcpd.conf "$base" "$IF" || exit 1
 
 echo 1 > "/proc/sys/net/ipv6/conf/$IF/disable_ipv6" 2>/dev/null
 ifconfig "$IF" "$WLANIP" netmask 255.255.255.0 mtu 1500 up || {
