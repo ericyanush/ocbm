@@ -36,6 +36,56 @@ Renderer: seam read duration, access units received, input dequeue/queue duratio
 
 Do not subtract timestamps from different devices to infer one-way latency without clock synchronization. Compare per-stage elapsed times and correlate stream/session identifiers instead.
 
+### Adapter resource pressure measurements
+
+`ocbmd` now samples Linux system procfs/sysfs counters once per second on a separate
+`ocbm-resources` thread. Process/thread discovery and accounting run once per report
+(approximately five seconds), since a full task census is relatively expensive on
+this board. Approximately every five seconds it publishes a bounded report through the
+existing internal CH_LOG encoder. These entries appear in the AAOS app's normal
+adapter diagnostics and exported log bundle; no APK, JNI, helper or Bluetooth daemon
+change is required. Rebuild/deploy `ocbmd` only.
+
+* `[resource-perf] implementation=proc-v1`: whole-system CPU percentages (user,
+  system, IRQ, softIRQ, idle and I/O wait), peak sampled busy percentage, runnable/
+  blocked counts, load average, sampler lateness and collection time. These CPU
+  measurements are separate from the broker's **wall-time** active fraction.
+* `[memory-perf]`: current and minimum sampled available RAM, free RAM, slab,
+  unreclaimable slab, shared/dirty memory, and interval deltas for major faults,
+  allocation stalls, reclaim and OOM kills where exposed. Values ending in `_kb`
+  follow procfs's KiB units. An idle snapshot does not rule out a transient stall.
+* `[process-perf]`: busiest processes plus ocbmd/btd/carplayd when observed; CPU,
+  sampled RSS/peak RSS, thread count, state and block-I/O delay ticks. CPU is a
+  percentage of **one core**, so a multithreaded process can exceed 100% on SMP.
+  Task CPU/RSS peaks are based on the five-second task census, not one-second
+  samples; system-wide CPU peaks and available-memory minima retain one-second resolution.
+* `[thread-perf]`: busiest threads and threads with the most sampled run-queue wait.
+  This includes detailed daemon threads and single-threaded processes/kernel workers.
+  Scheduler runtime/wait and slice counts come from `schedstat`; run-queue wait is
+  runnable time waiting for CPU, not time blocked on socket input. The maximum is
+  the largest **sample interval's accumulated wait**, not an individual wakeup delay.
+* `[net-kernel-perf]`: softnet processed/drop/time-squeeze deltas, network softIRQ
+  counts, UDP error/buffer-drop deltas, TCP retransmissions and memory-pressure
+  counters. They are system-wide; correlate with the socket-specific metrics.
+* `[resource-hw]`: CPU0 current/minimum/maximum sampled frequency, configured and
+  hardware maximum frequency, governor, and current/peak sampled thermal readings.
+  Temperatures are millidegrees Celsius. A low frequency alone does not prove
+  thermal throttling; correlate it with utilization, policy limits and temperature.
+
+Every line carries the report's kernel `sample_uptime_ms` and measured interval.
+Only the latest unread report is retained, avoiding stale backfill when logging was
+disabled. The dispatch loop takes it without waiting for filesystem reads or locks.
+Sampling does not spawn external utilities, write persistent files or change
+governors/scheduler priorities. Discovery is capped at 256 processes and 128 detailed
+daemon threads; truncation flags are explicit. Process/TID start times fence PID
+reuse. Counter resets are ignored and reported; softnet's 32-bit per-CPU counters
+handle wraparound. Missing metrics print `na`, not zero. All-zero scheduling records
+are labeled `zero_or_disabled` and their wait metrics print `na`, since this kernel
+may omit/disable scheduler accounting (the bench adapter exposes no `schedstat`).
+Short-lived processes and subsecond peaks
+can be missed. Check `max_collect_us` and `max_sample_late_ms` for observer overhead
+and sampler starvation before attributing a media stall to resource pressure.
+
 ## Execution and acceptance
 
 1. Instrument baseline and fix the missing adapter poll wakeup first. Compare startup stage timing and event age; expect broker events to reach the USB loop promptly rather than waiting for unrelated host traffic or the 500 ms timer.
@@ -44,3 +94,25 @@ Do not subtract timestamps from different devices to infer one-way latency witho
 4. If USB credit writes dominate, introduce bounded credit batching and verify progress for tiny request/response exchanges and window-sized bursts. If local receiver/seam writes dominate, trace receiver and renderer backpressure before modifying USB.
 5. If decoder output waits for the next input, decouple output draining with safe single-owner lifecycle coordination. Verify reconnect, background/foreground and phone switching; codec release must not race dequeue calls.
 6. Require no reliable-stream drops, no growing queue age, prompt touch feedback and sustained presentation appropriate to the advertised frame rate during animated content. Static content need not produce 60 fps. Report measured startup and per-stage latency distributions before choosing larger windows, packet sizes or lower display resolution.
+
+### Preserve AP leases and expose microphone diagnostics (2026-11-01)
+
+The resource-log sessions showed a returning phone making its first receiver connection using a
+cached address before DHCP completed; the AP script unconditionally deleted its lease database on
+bring-up. `radio_ap_up.sh` now preserves the opaque lease file when the pool is unchanged, including
+when only the serving interface changes. A pool change stops the AP DHCP server before invalidating
+its leases so that it cannot write the old database back on exit. The NCM DHCP server is excluded.
+This fixes the lease-loss mechanism; another vehicle test must establish whether it eliminates all
+first-connection freezes. Test: `sh tools/tests/ap_dhcp_leases_test.sh`.
+
+Microphone capture now logs bounded two-second PCM summaries (peak, RMS, zero percentage), recording
+state and Android's client-silenced status. No audio is retained in diagnostics. Native `[uplink]`
+lines, previously visible only in logcat, now reach the standard exported app log, including input
+format, capture gate, received PCM chunks, encoder errors, and socket/tunnel acceptance failures.
+Successful packet acceptance is explicitly labelled as local acceptance, not proof of phone delivery.
+These are diagnostic changes, not a microphone routing or codec change.
+
+Deploy `ccpa/rootfs/script/radio_ap_up.sh` to `/script/radio_ap_up.sh` and update the main app with
+rebuilt JNI libraries. No new ocbmd, btd or USB-helper binary is required for these two changes.
+Android validation: `./gradlew :app:testSideloadDebugUnitTest --tests com.carlink.av.MicPcmLevelsTest
+--offline` (also rebuilds both JNI ABIs).

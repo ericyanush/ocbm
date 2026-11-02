@@ -186,3 +186,26 @@ Deploy the main APK with rebuilt JNI libraries. This change needs no `ocbmd`, bt
 or USB helper update. Test a single tap into an app and launcher, especially the
 last frame of a transition followed by a static screen, then background/resume and
 phone switching to exercise codec ownership and shutdown.
+
+### Adapter CPU, memory and kernel receive pressure
+
+The `proc-v1` resource sampler adds `[resource-perf]`, `[memory-perf]`,
+`[process-perf]`, `[thread-perf]`, `[net-kernel-perf]` and `[resource-hw]` entries to
+the existing adapter CH_LOG stream, so the normal main-app export includes them.
+System counters are sampled once per second off the USB dispatch thread; the more
+expensive process/thread census runs once per approximately five-second report.
+The latest unread report replaces old history rather than
+growing a queue while logging is disabled.
+
+This distinguishes whole-device/IRQ/softIRQ CPU load from broker wall time, and
+records per-process/thread CPU, runnable scheduling wait when supported, sampled
+memory/reclaim pressure, network backlog/buffer drops, CPU0 frequency and temperature.
+Each report includes its sample uptime, sampler cost/lateness, support/truncation
+information and explicit `na` for unavailable counters. Zeroed scheduler statistics
+are not treated as proof of zero CPU wait. Detailed field semantics and limitations
+are in `docs/carplay/TUNNEL_PERFORMANCE_INVESTIGATION.md`.
+
+Only rebuilt `ocbmd` needs deploying. The main APK/JNI, USB helper, btd and boot
+scripts need no update. Capture a real native tunnel session through a noticeable
+stall; the previous Wi-Fi benchmark's legacy receiver and idle memory snapshots do
+not establish resource use in the deployed native AAOS tunnel path.
