@@ -271,6 +271,15 @@ class MicUplink(context: Context) {
     private fun captureLoop(rec: AudioRecord, chunk: Int) {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
         val buf = ByteArray(chunk)
+        val levels = MicPcmLevels()
+        var reportAt = 0L
+        fun reportLevels() {
+            val silence = if (android.os.Build.VERSION.SDK_INT >= 29)
+                runCatching { rec.activeRecordingConfiguration?.isClientSilenced?.toString() ?: "unknown" }
+                    .getOrDefault("unknown") else "unsupported"
+            log.i("PCM capture #$captures ${levels.summary()} clientSilenced=$silence recordingState=${rec.recordingState} seamChunks=${framesSent.get()}")
+            levels.reset()
+        }
         try {
             while (capturing.get() && running.get()) {
                 var off = 0
@@ -297,9 +306,18 @@ class MicUplink(context: Context) {
                     }
                     off += n
                 }
-                if (off == chunk) send(buf, chunk)
+                if (off == chunk) {
+                    levels.add(buf, chunk)
+                    send(buf, chunk)
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (now >= reportAt) {
+                        reportLevels()
+                        reportAt = now + 2000
+                    }
+                }
             }
         } finally {
+            if (levels.samples > 0) reportLevels()
             runCatching { rec.stop() }; runCatching { rec.release() }   // deliberate: teardown
         }
     }
@@ -342,4 +360,24 @@ class MicUplink(context: Context) {
         captureThread = null   // the capture thread owns AudioRecord stop()/release() in its finally
         log.i("capture stopped — $why")
     }
+}
+
+/** Aggregate levels only: never retain or log microphone audio. */
+internal class MicPcmLevels {
+    var samples = 0L
+        private set
+    private var zeros = 0L
+    private var peak = 0
+    private var squares = 0.0
+    fun add(bytes: ByteArray, length: Int) {
+        for (i in 0 until (length and -2) step 2) {
+            val value = ((bytes[i].toInt() and 255) or (bytes[i + 1].toInt() shl 8)).toShort().toInt()
+            samples++
+            if (value == 0) zeros++
+            peak = maxOf(peak, kotlin.math.abs(value))
+            squares += value.toDouble() * value
+        }
+    }
+    fun summary(): String = "samples=$samples peak=$peak rms=${if (samples == 0L) 0 else kotlin.math.sqrt(squares / samples).toInt()} zeroPct=${if (samples == 0L) 0 else zeros * 100 / samples}"
+    fun reset() { samples = 0; zeros = 0; peak = 0; squares = 0.0 }
 }

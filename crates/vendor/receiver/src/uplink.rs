@@ -199,7 +199,7 @@ impl UplinkState {
             }
         }
         if self.sent == 1 || self.sent.is_multiple_of(100) {
-            eprintln!("[uplink] sent {} packets → {} (last AU {} B)", self.sent, self.dst, au.len());
+            eprintln!("[uplink] accepted {} packets → {} (last AU {} B, transport={}, local={:?}; acceptance is not phone delivery)", self.sent, self.dst, au.len(), if self.sender.is_some() { "adapter-tunnel" } else { "direct-udp" }, self.sock.local_addr());
         }
     }
 }
