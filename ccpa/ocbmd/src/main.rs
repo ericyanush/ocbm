@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 mod tunnel;
 mod accessory_reader;
 mod mfi_worker;
+mod resource_metrics;
 
 const ACC_DEV: &str = "/dev/usb_accessory";
 
@@ -4425,6 +4426,7 @@ fn main() {
         last_proj_mode_check: None,
         last_health_log: None,
     };
+    let resources = resource_metrics::Monitor::start();
     let mut reasm = p::Reassembler::new();
     let accessory_reader = accessory_reader::AccessoryReader::start(
         d.acc.try_clone().expect("duplicate accessory descriptor"), p::HDR_LEN + p::MAX_PAYLOAD,
@@ -4547,6 +4549,9 @@ fn main() {
             for _ in 0..8 {
                 let Some(metrics) = d.tunnel.as_ref().and_then(|t| t.take_metrics()) else { break; };
                 d.log_internal(&metrics);
+            }
+            if let Some(lines) = resources.take_report() {
+                for line in lines { d.log_internal(&line); }
             }
         }
         let tunnel_batch_full = tunnel_events.len() == 64;
