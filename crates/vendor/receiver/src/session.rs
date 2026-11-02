@@ -437,6 +437,8 @@ pub struct AvSession {
 pub trait SocketRegistrar: Send + Sync {
     fn register_tcp(&self, local_port: u16) -> std::io::Result<()>;
     fn register_udp(&self, local_port: u16) -> std::io::Result<()>;
+    /// Audio RTP sockets can be distinguished from timing and control UDP sockets.
+    fn register_audio_udp(&self, local_port: u16) -> std::io::Result<()> { self.register_udp(local_port) }
     fn unregister_tcp(&self, local_port: u16);
     fn unregister_udp(&self, local_port: u16);
     fn send_udp(&self, _local_port: u16, _peer: std::net::SocketAddr, _payload: &[u8]) -> std::io::Result<()> {
@@ -613,7 +615,7 @@ impl AvSession {
         let socket = UdpSocket::bind(self.session_bind_addr())?;
         let addr = socket.local_addr()?;
         if let Some(registrar) = &self.socket_registrar {
-            if let Err(e) = registrar.register_udp(addr.port()) {
+            if let Err(e) = if channel == "audio-data" { registrar.register_audio_udp(addr.port()) } else { registrar.register_udp(addr.port()) } {
                 eprintln!("[native-diag] gen={} {channel} UDP tunnel registration failed port={}: {e}", self.generation, addr.port());
                 return Err(e);
             }

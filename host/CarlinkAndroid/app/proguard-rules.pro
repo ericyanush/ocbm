@@ -144,3 +144,6 @@
 # gm_ccpa native JNI resolves these receiver classes and MFi callback methods by name.
 -keep class zeno.gmccpa.** { *; }
 -keep interface zeno.gmccpa.** { *; }
+
+# Rust JNI calls these methods by name on the concrete tunnel relay in release builds.
+-keepclassmembers class * implements zeno.gmccpa.pair.SocketTunnelRelay { public *; }

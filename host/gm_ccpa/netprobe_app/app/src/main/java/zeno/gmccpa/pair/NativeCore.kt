@@ -235,6 +235,7 @@ interface MfiRelay {
 interface SocketTunnelRelay {
     fun registerTcp(localPort: Int): Boolean
     fun registerUdp(localPort: Int): Boolean
+    fun registerAudioUdp(localPort: Int): Boolean = registerUdp(localPort)
     fun unregisterTcp(localPort: Int)
     fun unregisterUdp(localPort: Int)
     fun sendUdp(localPort: Int, peerAddress: String, peerPort: Int, payload: ByteArray): Boolean

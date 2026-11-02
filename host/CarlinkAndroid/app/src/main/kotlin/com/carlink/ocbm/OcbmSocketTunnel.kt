@@ -167,6 +167,10 @@ class OcbmSocketTunnel(
         bindUdp(apAddress, apPrefixBits, localPort)
     }.onFailure { log("UDP port registration failed port=$localPort: ${it.message}") }.isSuccess
 
+    override fun registerAudioUdp(localPort: Int): Boolean = runCatching {
+        register(Ocbm.TUNNEL_BIND_UDP, apAddress, apPrefixBits, localPort, 5000, audioRtp = true)
+    }.onFailure { log("Audio UDP port registration failed port=$localPort: ${it.message}") }.isSuccess
+
     override fun unregisterTcp(localPort: Int) = unregister(Ocbm.TUNNEL_LISTEN_TCP, localPort)
     override fun unregisterUdp(localPort: Int) = unregister(Ocbm.TUNNEL_BIND_UDP, localPort)
 
@@ -214,7 +218,7 @@ class OcbmSocketTunnel(
         log("unregistered ${if (protocol == Ocbm.TUNNEL_LISTEN_TCP) "TCP" else "UDP"} port=$localPort id=$id")
     }
 
-    private fun register(op: Byte, address: InetAddress, prefix: Int, localPort: Int, timeoutMs: Long): Int {
+    private fun register(op: Byte, address: InetAddress, prefix: Int, localPort: Int, timeoutMs: Long, audioRtp: Boolean = false): Int {
         check(alive.get()) { "socket tunnel is not active" }
         require(localPort in 1..65535)
         require(address !is java.net.Inet6Address) { "dongle AP tunnel currently requires an IPv4 address" }
@@ -233,6 +237,8 @@ class OcbmSocketTunnel(
         payload += ((localPort ushr 8) and 0xff).toByte()
         // For UDP this is unused; for TCP it is the adapter->host initial receive window.
         payload += littleU32(if (op == Ocbm.TUNNEL_LISTEN_TCP) INITIAL_WINDOW else 0)
+        // Optional extension: old adapters ignore trailing bytes; 1 marks audio RTP.
+        if (audioRtp) payload += 1.toByte()
         check(send(payload)) { "USB write failed registering tunneled socket $localPort" }
         try {
             val actual = future.get(timeoutMs, TimeUnit.MILLISECONDS).port
@@ -270,6 +276,7 @@ class OcbmSocketTunnel(
                     streams[id]?.credit?.updateAndGet { (it + readU32(frame, 9)).coerceAtMost(INITIAL_WINDOW) }
                 }
                 Ocbm.TUNNEL_TCP_EOF -> streams[id]?.let { stream ->
+                    log("TCP half-close epoch=${epoch.toUInt()} stream=$id source=adapter event=read_eof local=${stream.socket.localPort} target=${stream.socket.port}")
                     stream.peerEof.set(true)
                     if (stream.incoming.isEmpty()) stream.socket.shutdownOutputQuietly()
                 }
@@ -278,7 +285,7 @@ class OcbmSocketTunnel(
                     val peer = decodePeerAddress(frame, 9) ?: continue
                     mdnsHandler?.invoke(frame.copyOfRange(peer.second, frame.size))
                 }
-                Ocbm.TUNNEL_CLOSE -> closeStream(id)
+                Ocbm.TUNNEL_CLOSE -> closeStream(id, "adapter_close reason=${frame.getOrNull(9)?.toInt()?.and(255) ?: "unspecified"}")
             }
         }
     }
@@ -332,9 +339,9 @@ class OcbmSocketTunnel(
 
     private fun pumpNetworkToUsb(streamId: Int, stream: TunnelStream) {
         val socket = stream.socket
-        val input = socket.getInputStream()
         val bytes = ByteArray(TCP_CHUNK)
         try {
+            val input = socket.getInputStream()
             while (alive.get() && !socket.isClosed) {
                 val credit = stream.credit.get()
                 if (credit <= 0) {
@@ -345,6 +352,7 @@ class OcbmSocketTunnel(
                 }
                 val n = input.read(bytes, 0, minOf(bytes.size, credit))
                 if (n < 0) {
+                    log("TCP half-close epoch=${epoch.toUInt()} stream=$streamId source=local_receiver event=read_eof local=${socket.localPort} target=${socket.port}")
                     send(header(Ocbm.TUNNEL_TCP_EOF, streamId))
                     // Half-close only. The adapter may still have response bytes to deliver.
                     return
@@ -359,9 +367,9 @@ class OcbmSocketTunnel(
                 stream.credit.addAndGet(-n)
             }
         } catch (e: Exception) {
-            if (alive.get()) log("TCP uplink closed stream=$streamId: ${e.message}")
+            if (alive.get()) log("TCP uplink error epoch=${epoch.toUInt()} stream=$streamId type=${e.javaClass.simpleName} error=${e.message}")
             send(closeFrame(streamId))
-            closeStream(streamId)
+            closeStream(streamId, "local_read_or_usb_write_error type=${e.javaClass.simpleName} error=${e.message}")
         }
     }
 
@@ -435,9 +443,9 @@ class OcbmSocketTunnel(
                 }
             }
         } catch (e: Exception) {
-            if (alive.get()) log("TCP downlink closed stream=$streamId: ${e.message}")
+            if (alive.get()) log("TCP downlink error epoch=${epoch.toUInt()} stream=$streamId type=${e.javaClass.simpleName} error=${e.message}")
             send(closeFrame(streamId))
-            closeStream(streamId)
+            closeStream(streamId, "local_write_or_credit_error type=${e.javaClass.simpleName} error=${e.message}")
         }
     }
 
@@ -452,7 +460,7 @@ class OcbmSocketTunnel(
             val snapshot = stream.incoming.snapshot()
             log("TCP inbound queue byte limit exceeded stream=$id incoming=${data.size}B " +
                 "queued=${snapshot.bytes}B/${snapshot.packets}pk capacity=${INITIAL_WINDOW}B; closing")
-            send(closeFrame(id)); closeStream(id)
+            send(closeFrame(id)); closeStream(id, "inbound_queue_overflow")
         } else {
             stream.receivedPackets.incrementAndGet()
             stream.receivedBytes.addAndGet(data.size.toLong())
@@ -505,10 +513,10 @@ class OcbmSocketTunnel(
         finally { flow.proxy.close() }
     }
 
-    private fun closeStream(id: Int) {
+    private fun closeStream(id: Int, reason: String) {
         streams.remove(id)?.let { stream ->
             val queue = stream.incoming.snapshot()
-            log("TCP tunnel closed stream=$id local=${stream.socket.localPort} " +
+            log("TCP tunnel closed epoch=${epoch.toUInt()} stream=$id reason=$reason local=${stream.socket.localPort} target=${stream.socket.port} peerEof=${stream.peerEof.get()} " +
                 "rx=${stream.receivedPackets.get()}pk/${stream.receivedBytes.get()}B " +
                 "forwarded=${stream.forwardedPackets.get()}pk/${stream.forwardedBytes.get()}B " +
                 "queue=${queue.bytes}B/${queue.packets}pk peak=${queue.peakBytes}B/${queue.peakPackets}pk")
@@ -520,7 +528,7 @@ class OcbmSocketTunnel(
     override fun close() {
         if (!alive.compareAndSet(true, false)) return
         send(header(Ocbm.TUNNEL_STOP, 0))
-        streams.keys.toList().forEach(::closeStream)
+        streams.keys.toList().forEach { closeStream(it, "tunnel_shutdown") }
         udpPeers.values.forEach { it.proxy.close() }
         mdnsHandler = null
         udpPeers.clear(); registrations.clear(); controlProxyPeers.clear(); results.values.forEach { it.completeExceptionally(IllegalStateException("tunnel stopped")) }

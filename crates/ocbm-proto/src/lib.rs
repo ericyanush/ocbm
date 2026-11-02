@@ -388,7 +388,7 @@ pub const IP_OPEN_UDP: u8 = 0x04; // UDP: data = target "ip:port"; box binds + c
 // host for each USB session; frames from an older session are ignored even if IDs are reused.
 // TCP_DATA is reliable and credit-limited; UDP_DATAGRAM is atomic and carries peer address metadata.
 pub const TUNNEL_LISTEN_TCP: u8 = 0x01; // host->box [family u8][local AP address][prefix u8][port u16 LE][adapter->host credit u32 LE]
-pub const TUNNEL_BIND_UDP: u8 = 0x02; // same bind tuple; final credit is ignored
+pub const TUNNEL_BIND_UDP: u8 = 0x02; // bind tuple; optional trailing u8: 1 = audio RTP diagnostics (older peers ignore)
 pub const TUNNEL_CLOSE: u8 = 0x03; // either direction [reason u8]
 pub const TUNNEL_ACCEPT: u8 = 0x04; // box->host [listener_id u32 LE][host->adapter credit u32 LE][peer family u8][addr][port u16 BE], frame object is stream_id
 pub const TUNNEL_TCP_DATA: u8 = 0x05; // either direction [stream_id u32 LE][bytes]; uses byte credits

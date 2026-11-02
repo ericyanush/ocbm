@@ -168,6 +168,40 @@ struct UdpTiming {
     kernel_last_ns: Option<u64>, kernel_samples: u64, kernel_max_gap_us: u64,
     kernel_max_age_us: u64, overflow_last: u32, overflow_delta: u64,
     truncated: u64, control_truncated: u64,
+    audio_rtp: bool, rtp: RtpRx,
+}
+/// RTP headers remain clear for the encrypted audio stream. Only sequence metadata is kept.
+#[derive(Default)]
+struct RtpRx {
+    source: Option<u32>, last: Option<u16>, packets: u64, gaps: u64, missing: u64,
+    late: u64, duplicates: u64, invalid: u64, source_changes: u64, gap_logs: u8,
+}
+impl RtpRx {
+    fn observe(&mut self, packet: &[u8]) -> Option<(u32, u16, u16, u16, u32)> {
+        if packet.len() < 12 || packet[0] >> 6 != 2 || packet.len() < 12 + (packet[0] as usize & 15) * 4 {
+            self.invalid += 1; return None;
+        }
+        let seq = u16::from_be_bytes([packet[2], packet[3]]);
+        let rtp_timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+        self.packets += 1;
+        if self.source != Some(ssrc) {
+            if self.source.is_some() { self.source_changes += 1; }
+            self.source = Some(ssrc); self.last = Some(seq); return None;
+        }
+        let previous = self.last.unwrap_or(seq);
+        let delta = seq.wrapping_sub(previous);
+        match delta {
+            0 => self.duplicates += 1,
+            1 => self.last = Some(seq),
+            2..=32767 => {
+                self.last = Some(seq); self.gaps += 1; self.missing += (delta - 1) as u64;
+                if self.gap_logs < 4 { self.gap_logs += 1; return Some((ssrc, previous, seq, delta - 1, rtp_timestamp)); }
+            }
+            _ => self.late += 1,
+        }
+        None
+    }
 }
 impl UdpTiming {
     fn received(&mut self, bytes: usize) {
@@ -200,6 +234,8 @@ impl UdpTiming {
         let line = format!("[udp-perf] id={id} port={port} packets={} bytes={} event_drops={} rejected={} max_gap_us={} idle_ms={idle_ms} interval_ms={}", self.packets, self.bytes, self.drops, self.rejected, self.max_gap_us, now.duration_since(*start).as_millis());
         let line = format!("{line} kernel_samples={} kernel_max_gap_us={} kernel_max_age_us={} socket_drops={} socket_drops_total={} truncated={} control_truncated={}",
             self.kernel_samples, self.kernel_max_gap_us, self.kernel_max_age_us, self.overflow_delta, self.overflow_last, self.truncated, self.control_truncated);
+        let line = if self.audio_rtp { format!("{line} rtp_packets={} rtp_gap_events={} rtp_missing_provisional={} rtp_late={} rtp_duplicates={} rtp_invalid={} rtp_source_changes={}", self.rtp.packets, self.rtp.gaps, self.rtp.missing, self.rtp.late, self.rtp.duplicates, self.rtp.invalid, self.rtp.source_changes) } else { line };
+        self.rtp.packets=0; self.rtp.gaps=0; self.rtp.missing=0; self.rtp.late=0; self.rtp.duplicates=0; self.rtp.invalid=0; self.rtp.source_changes=0; self.rtp.gap_logs=0;
         self.kernel_samples=0; self.kernel_max_gap_us=0; self.kernel_max_age_us=0; self.overflow_delta=0; self.truncated=0; self.control_truncated=0;
         self.packets=0; self.bytes=0; self.drops=0; self.rejected=0; self.max_gap_us=0; self.report=Some(now);
         Some(line)
@@ -455,6 +491,7 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
                         if unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut unread) } == 0 { timing.peak_unread = timing.peak_unread.max(unread); }
                         match socket.read(&mut rx[..nmax]) {
                             Ok(0) => {
+                                let _ = events.diagnostics.try_send(format!("[tunnel-close] epoch={epoch} id={id} source=phone_socket event=read_eof peer={:?} local={:?} revents={readiness:#x}", socket.peer_addr().ok(), socket.local_addr().ok()));
                                 let eof = header(p::TUNNEL_TCP_EOF, epoch, id);
                                 if let Err(eof) = try_event(&events, eof) { *pending = Some(eof); }
                                 *read_eof = true;
@@ -469,26 +506,26 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(_) => remove = true,
+                            Err(e) => { let _ = events.diagnostics.try_send(format!("[tunnel-close] epoch={epoch} id={id} source=phone_socket event=read_error kind={:?} errno={:?} error={e} revents={readiness:#x}", e.kind(), e.raw_os_error())); remove = true; },
                         }
                     }
                     if writable { if let Some(front) = writeq.front() {
                         match socket.write(&front[*write_offset..]) {
-                            Ok(0) => remove = true,
+                            Ok(0) => { let _ = events.diagnostics.try_send(format!("[tunnel-close] epoch={epoch} id={id} source=phone_socket event=write_zero revents={readiness:#x}")); remove = true; },
                             Ok(n) => {
                                 *write_offset += n;
                                 *pending_credit = pending_credit.saturating_add(n as u32);
                                 if *write_offset == front.len() { writeq.pop_front(); *write_offset = 0; }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(_) => remove = true,
+                            Err(e) => { let _ = events.diagnostics.try_send(format!("[tunnel-close] epoch={epoch} id={id} source=phone_socket event=write_error kind={:?} errno={:?} error={e} revents={readiness:#x}", e.kind(), e.raw_os_error())); remove = true; },
                         }
                     }}
                     if writeq.is_empty() && *write_eof {
                         let _ = socket.shutdown(std::net::Shutdown::Write);
                         *write_eof = false;
                     }
-                    if *read_eof && *remote_eof && writeq.is_empty() && !*write_eof { remove = true; }
+                    if *read_eof && *remote_eof && writeq.is_empty() && !*write_eof { let _ = events.diagnostics.try_send(format!("[tunnel-close] epoch={epoch} id={id} source=both event=half_closes_complete")); remove = true; }
                 }
                 Some(Object::Udp { socket, prefix, timing }) => {
                     if let Some(line) = timing.report(id, socket.local_addr().map(|a| a.port()).unwrap_or(0)) { let _ = events.diagnostics.try_send(line); }
@@ -496,9 +533,16 @@ fn run(commands: Receiver<Vec<u8>>, command_wake: UnixStream, events: EventSende
                     match receive_udp(socket, &mut rx[..UDP_MAX]) {
                         Ok((n, peer, metadata)) if prefix.contains(peer.ip()) => {
                             let truncated = metadata.truncated;
+                            let kernel_ns = metadata.timestamp_ns;
                             timing.kernel(metadata);
                             if truncated || n > UDP_MAX { timing.truncated += 1; continue; }
                             timing.received(n);
+                            if timing.audio_rtp {
+                                if let Some((ssrc, previous, current, missing, rtp_timestamp)) = timing.rtp.observe(&rx[..n]) {
+                                    let timestamp = kernel_ns.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into());
+                                    let _ = events.diagnostics.try_send(format!("[rtp-rx-gap] epoch={epoch} id={id} port={} ssrc={ssrc:08x} previous={previous} current={current} missing_provisional={missing} rtp_timestamp={rtp_timestamp} kernel_unix_ns={timestamp}", socket.local_addr().map(|a| a.port()).unwrap_or(0)));
+                                }
+                            }
                             let mut event = header(p::TUNNEL_UDP_DATAGRAM, epoch, id);
                             encode_peer(&mut event, peer);
                             event.extend_from_slice(&rx[..n]);
@@ -549,7 +593,7 @@ fn command(frame: &[u8], epoch: &mut u32, objects: &mut HashMap<u32, Object>, ne
     if incoming_epoch != *epoch { return; }
     match op {
         p::TUNNEL_STOP => { objects.clear(); *mdns = None; *epoch = 0; }
-        p::TUNNEL_CLOSE => { objects.remove(&id); }
+        p::TUNNEL_CLOSE => { if objects.contains_key(&id) { let _ = events.diagnostics.try_send(format!("[tunnel-close] epoch={} id={id} source=host event=close reason={:?}", *epoch, frame.get(9))); } objects.remove(&id); }
         p::TUNNEL_LISTEN_TCP | p::TUNNEL_BIND_UDP => {
             let parsed = parse_bind(&frame[9..]);
             let (addr, prefix, port, credit) = match parsed {
@@ -560,7 +604,7 @@ fn command(frame: &[u8], epoch: &mut u32, objects: &mut HashMap<u32, Object>, ne
             let bound = if op == p::TUNNEL_LISTEN_TCP {
                 TcpListener::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); Object::Listener { socket: s, prefix, credit } })
             } else {
-                UdpSocket::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); { let support = enable_udp_metrics(&s); let _ = events.diagnostics.try_send(format!("[udp-perf] id={id} {support}")); Object::Udp { socket: s, prefix, timing: UdpTiming::default() } } })
+                UdpSocket::bind(SocketAddr::new(addr, port)).map(|s| { let _ = s.set_nonblocking(true); { let support = enable_udp_metrics(&s); let mut timing = UdpTiming::default(); let base = if frame.get(9) == Some(&4) { 12 } else { 24 }; timing.audio_rtp = frame.get(9 + base) == Some(&1); let _ = events.diagnostics.try_send(format!("[udp-perf] id={id} {support} audio_rtp={}", timing.audio_rtp)); Object::Udp { socket: s, prefix, timing } } })
             };
             match bound {
                 Ok(object) => {
@@ -582,13 +626,14 @@ fn command(frame: &[u8], epoch: &mut u32, objects: &mut HashMap<u32, Object>, ne
                     *rx_credit -= len as u32;
                     writeq.push_back(frame[9..].to_vec());
                 } else {
+                    let _ = events.diagnostics.try_send(format!("[tunnel-close] epoch={} id={id} source=host event=invalid_data bytes={len} remaining_credit={rx_credit}", *epoch));
                     objects.remove(&id);
                 }
             }
         }
         // Host closed its write half. Drain queued bytes then half-close the AP socket; keep
         // forwarding the adapter peer's read half until it independently closes.
-        p::TUNNEL_TCP_EOF => if let Some(Object::Tcp { write_eof, remote_eof, .. }) = objects.get_mut(&id) { *write_eof = true; *remote_eof = true; },
+        p::TUNNEL_TCP_EOF => if let Some(Object::Tcp { write_eof, remote_eof, .. }) = objects.get_mut(&id) { let _ = events.diagnostics.try_send(format!("[tunnel-close] epoch={} id={id} source=host event=write_eof", *epoch)); *write_eof = true; *remote_eof = true; },
         p::TUNNEL_UDP_SEND => {
             if let Some(Object::Udp { socket, prefix, .. }) = objects.get(&id) {
                 if let Some((peer, body)) = parse_peer(&frame[9..]) {
@@ -703,6 +748,26 @@ fn allocate_id(next: &mut u32, objects: &HashMap<u32, Object>) -> u32 {
 mod wake_tests {
     use super::*;
 
+    #[test]
+    fn audio_rtp_sequence_tracking_handles_wrap_reordering_and_source_changes() {
+        fn packet(seq: u16, ssrc: u32) -> [u8; 12] {
+            let mut p = [0u8; 12]; p[0] = 0x80;
+            p[2..4].copy_from_slice(&seq.to_be_bytes());
+            p[8..12].copy_from_slice(&ssrc.to_be_bytes()); p
+        }
+        let mut r = RtpRx::default();
+        assert_eq!(r.observe(&packet(65534, 9)), None);
+        assert_eq!(r.observe(&packet(65535, 9)), None);
+        assert_eq!(r.observe(&packet(0, 9)), None);
+        assert_eq!(r.observe(&packet(3, 9)), Some((9, 0, 3, 2, 0)));
+        assert_eq!(r.observe(&packet(2, 9)), None); // late does not move high-water mark
+        assert_eq!(r.observe(&packet(3, 9)), None); // duplicate
+        assert_eq!(r.observe(&packet(4, 9)), None);
+        assert_eq!(r.observe(&packet(500, 10)), None); // new source resets sequence
+        assert_eq!(r.observe(&[0; 4]), None);
+        assert_eq!((r.gaps, r.missing, r.late, r.duplicates, r.source_changes, r.invalid), (1, 2, 1, 1, 1, 1));
+    }
+
     fn broker(capacity: usize) -> (TunnelBroker, thread::JoinHandle<()>) {
         let (tx, rx) = mpsc::sync_channel(COMMAND_CAP);
         let (events, incoming) = mpsc::sync_channel(capacity);
@@ -785,6 +850,38 @@ mod wake_tests {
         assert_eq!(receive(&broker)[0], p::TUNNEL_ACCEPT);
         drop(broker);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn labelled_audio_udp_logs_sequence_gap_and_still_forwards_datagrams() {
+        let (broker, worker) = broker(EVENT_CAP);
+        assert!(broker.command(&header(p::TUNNEL_START, 7, 0)));
+        let reservation = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port(); drop(reservation);
+        let mut bind = header(p::TUNNEL_BIND_UDP, 7, 5);
+        bind.extend_from_slice(&[4, 127, 0, 0, 1, 8]);
+        bind.extend_from_slice(&port.to_le_bytes()); bind.extend_from_slice(&0u32.to_le_bytes()); bind.push(1);
+        assert!(broker.command(&bind)); assert_eq!(receive(&broker)[9], 0);
+        let phone = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for seq in [100u16, 103] {
+            let mut packet = [0u8; 12]; packet[0] = 0x80;
+            packet[2..4].copy_from_slice(&seq.to_be_bytes()); packet[11] = 42;
+            phone.send_to(&packet, (std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        }
+        for _ in 0..2 { assert_eq!(receive(&broker)[0], p::TUNNEL_UDP_DATAGRAM); }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut saw_gap = false;
+        while Instant::now() < deadline {
+            if let Some(line) = broker.take_metrics() {
+                if line.contains("[rtp-rx-gap]") {
+                    assert!(line.contains("previous=100 current=103 missing_provisional=2"));
+                    assert!(line.contains("epoch=7 id=5")); saw_gap = true; break;
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(saw_gap, "audio gap diagnostic not emitted");
+        drop(broker); worker.join().unwrap();
     }
 
     #[test]

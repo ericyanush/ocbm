@@ -122,7 +122,7 @@ fn redirect_stdio_to_logcat() {
 
 // Only protocol summaries are exported. Never forward arbitrary native payload/key dumps.
 fn export_protocol_log(line: &str) {
-    if !(line.starts_with("[native-diag]") || line.starts_with("[receiver]") || line.starts_with("[audio-perf]") || line.starts_with("[screen-perf]")) { return; }
+    if !(line.starts_with("[native-diag]") || line.starts_with("[receiver]") || line.starts_with("[audio-perf]") || line.starts_with("[screen-perf]") || line.starts_with("[uplink]")) { return; }
     let (Some(vm), Some(class)) = (JVM.get(), LOG_CLASS.get()) else { return; };
     let Ok(mut env) = vm.attach_current_thread() else { return; };
     let _ = env.with_local_frame(8, |env| -> jni::errors::Result<()> {
@@ -337,6 +337,7 @@ impl RemoteSocketRegistrar {
 impl receiver::session::SocketRegistrar for RemoteSocketRegistrar {
     fn register_tcp(&self, port: u16) -> io::Result<()> { self.call("registerTcp", port) }
     fn register_udp(&self, port: u16) -> io::Result<()> { self.call("registerUdp", port) }
+    fn register_audio_udp(&self, port: u16) -> io::Result<()> { self.call("registerAudioUdp", port) }
     fn unregister_tcp(&self, port: u16) { self.close("unregisterTcp", port); }
     fn unregister_udp(&self, port: u16) { self.close("unregisterUdp", port); }
     fn send_udp(&self, local_port: u16, peer: std::net::SocketAddr, payload: &[u8]) -> io::Result<()> {
