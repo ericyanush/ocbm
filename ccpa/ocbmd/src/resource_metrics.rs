@@ -37,6 +37,7 @@ impl Monitor {
                 let hz = positive_sysconf(libc::_SC_CLK_TCK);
                 let page_bytes = positive_sysconf(libc::_SC_PAGESIZE);
                 let mut previous = Snapshot::read(Path::new("/"));
+                let mut wifi_previous = wifi_snapshot(Path::new("/proc/mwlan/adapter0"));
                 let mut window = Window::new(previous.at);
                 let mut deadline = Instant::now() + PERIOD;
                 loop {
@@ -57,7 +58,10 @@ impl Monitor {
                     if window.samples >= 5
                         || snapshot.at.duration_since(window.since) >= REPORT_PERIOD
                     {
-                        let lines = window.report(&snapshot, hz, page_bytes);
+                        let mut lines = window.report(&snapshot, hz, page_bytes);
+                        let wifi = wifi_snapshot(Path::new("/proc/mwlan/adapter0"));
+                        lines.extend(wifi_report(&wifi_previous, &wifi, snapshot.at.duration_since(window.since)));
+                        wifi_previous = wifi;
                         let Some(latest) = weak.upgrade() else {
                             return;
                         };
@@ -119,6 +123,108 @@ fn clean(value: &str) -> String {
 }
 fn number(value: Option<u64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "na".into())
+}
+
+// These files are read-only snapshots exported by the NXP driver. Keep the allowlist small:
+// debug also contains large binary-like dumps and values whose meanings are driver-specific.
+const WIFI_INFO_COUNTERS: &[&str] = &[
+    "num_rx_pkts", "num_tx_pkts", "num_rx_bytes", "num_tx_bytes",
+    "num_rx_pkts_dropped", "num_tx_pkts_dropped", "num_rx_pkts_err", "num_tx_pkts_err",
+    "fcs_error_count", "retry_count", "multiple_retry_count", "rts_success_count",
+    "rts_failure_count", "ack_failure_count", "frame_duplicate_count", "decrypt_failure_count",
+];
+const WIFI_DEBUG_COUNTERS: &[&str] = &[
+    "num_alloc_buffer_failure", "num_rx_c2h_fail", "num_int_read_fail", "num_cmd_timeout",
+    "num_tx_timeout", "num_tx_h2c_fail", "num_of_irq", "main_process_cnt",
+];
+const WIFI_DEBUG_GAUGES: &[&str] = &[
+    "rx_pkts_queued", "tx_pkts_queued", "rx_pending", "tx_pending", "sdio_rx_aggr",
+    "ps_mode", "ps_state", "is_deep_sleep", "scan_processing", "scan_state",
+    "mlan_processing", "mlan_rx_processing", "max_tx_buf_size", "tx_buf_size",
+    "curr_tx_buf_size", "hs_activated",
+];
+
+type WifiSnapshot = BTreeMap<String, BTreeMap<String, u64>>;
+
+fn wifi_fields(text: &str, names: &[&str], values: &mut BTreeMap<String, u64>) {
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        if names.contains(&key) {
+            if let Ok(value) = value.trim().parse::<u64>() {
+                values.insert(key.to_owned(), value);
+            }
+        }
+    }
+}
+
+fn wifi_accounting(text: &str, values: &mut BTreeMap<String, u64>) {
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let key = match key.trim() {
+            "Rx amsdu cnt" => "rx_amsdu_count",
+            "Rx amsdu pkt cnt" => "rx_amsdu_packet_count",
+            "Tx amsdu cnt" => "tx_amsdu_count",
+            "Tx amsdu pkt cnt" => "tx_amsdu_packet_count",
+            "Rx rdptr full cnt" => "rx_rdptr_full_count",
+            "Rx intr cnt" => "rx_interrupt_count",
+            "Tx intr cnt" => "tx_interrupt_count",
+            "Rx pause" => "rx_pause_count",
+            "Tx stop queue cnt" => "tx_stop_queue_count",
+            _ => continue,
+        };
+        if let Ok(value) = value.trim().parse::<u64>() { values.insert(key.into(), value); }
+    }
+}
+
+fn wifi_snapshot(root: &Path) -> WifiSnapshot {
+    let mut result = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(root) else { return result };
+    for entry in entries.flatten().take(32) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.len() > 16 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let mut values = BTreeMap::new();
+        if let Some(info) = read(entry.path().join("info")) {
+            wifi_fields(&info, WIFI_INFO_COUNTERS, &mut values);
+            wifi_accounting(&info, &mut values);
+        }
+        if let Some(debug) = read(entry.path().join("debug")) {
+            wifi_fields(&debug, WIFI_DEBUG_COUNTERS, &mut values);
+            wifi_fields(&debug, WIFI_DEBUG_GAUGES, &mut values);
+        }
+        if !values.is_empty() { result.insert(name, values); }
+    }
+    result
+}
+
+fn wifi_report(previous: &WifiSnapshot, current: &WifiSnapshot, interval: Duration) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (interface, values) in current {
+        for (group, keys, counters) in [
+            ("network", WIFI_INFO_COUNTERS, true),
+            ("driver", WIFI_DEBUG_COUNTERS, true),
+            ("aggregation", &["rx_amsdu_count", "rx_amsdu_packet_count", "tx_amsdu_count", "tx_amsdu_packet_count", "rx_rdptr_full_count", "rx_interrupt_count", "tx_interrupt_count", "rx_pause_count", "tx_stop_queue_count"][..], true),
+            ("state", WIFI_DEBUG_GAUGES, false),
+        ] {
+            let mut line = format!("[wifi-perf] implementation=nxp-proc-v1 interface={interface} group={group} interval_ms={}", interval.as_millis());
+            let mut found = false;
+            for key in keys {
+                if let Some(value) = values.get(*key) {
+                    found = true;
+                    line.push_str(&format!(" {key}={value}"));
+                    if counters {
+                        let delta = previous.get(interface).and_then(|p| p.get(*key))
+                            .and_then(|old| value.checked_sub(*old));
+                        line.push_str(&format!(" {key}_delta={}", number(delta)));
+                    }
+                }
+            }
+            if found { lines.push(line); }
+        }
+    }
+    lines
 }
 
 fn key_values(text: &str) -> BTreeMap<String, u64> {
@@ -816,6 +922,23 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wifi_counters_report_deltas_and_handle_resets() {
+        let mut old = BTreeMap::new();
+        wifi_fields("num_rx_pkts = 12\nfcs_error_count = 9\n", WIFI_INFO_COUNTERS, &mut old);
+        let mut new = BTreeMap::new();
+        wifi_fields("num_rx_pkts = 20\nfcs_error_count = 2\nunknown = 99\n", WIFI_INFO_COUNTERS, &mut new);
+        wifi_accounting("Rx amsdu cnt\t : 3\nRx rdptr full cnt : 7\n", &mut new);
+        let lines = wifi_report(&BTreeMap::from([("sta0".into(), old)]),
+            &BTreeMap::from([("sta0".into(), new)]), Duration::from_secs(5));
+        assert!(lines[0].contains("num_rx_pkts_delta=8"));
+        assert!(lines[0].contains("fcs_error_count_delta=na"));
+        assert!(lines[1].contains("rx_amsdu_count=3"));
+        assert!(lines[1].contains("rx_rdptr_full_count_delta=na"));
+        assert!(!lines.join(" ").contains("unknown"));
+        assert!(wifi_report(&BTreeMap::new(), &BTreeMap::new(), Duration::from_secs(5)).is_empty());
+    }
 
     #[test]
     fn cpu_percentages_do_not_double_count_guest_time() {
