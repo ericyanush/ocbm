@@ -103,6 +103,7 @@ private class SessionUiState {
 
     /** Current epoch has a frame and native media has not failed its liveness probe. */
     var videoOnScreen by mutableStateOf(false)
+    var videoNeedsRecovery by mutableStateOf(false)
 
     /** The wireless pairing code awaiting Pair / Cancel (CT_PAIRING_CODE), or null. */
     var pairingCode by mutableStateOf<String?>(null)
@@ -203,6 +204,15 @@ fun MainScreen(
                         .padding(24.dp),
             )
         }
+        if (ui.projecting && ui.videoNeedsRecovery) {
+            TopActions(
+                onNavigateToSettings = onNavigateToSettings,
+                onResetConnection = { showResetConfirm = true },
+                modifier = Modifier.align(Alignment.TopStart)
+                    .windowInsetsPadding(WindowInsets.safeDrawing.union(safeAreaInsets.asWindowInsets()))
+                    .padding(24.dp),
+            )
+        }
     }
 
     // Reset Device = the SAME clean-slate reset as Settings ▸ Reset Connection, same confirmation.
@@ -293,12 +303,18 @@ private fun SessionEffects(
                 ui.connectionState == CarlinkManager.State.STREAMING
         if (!canProject) {
             ui.videoOnScreen = false
+            ui.videoNeedsRecovery = false
             return@LaunchedEffect
         }
 
         var wasVisible = ui.videoOnScreen
         while (true) {
-            val hasCurrentFrame = withContext(Dispatchers.IO) { carlinkManager.videoIsResponsive() }
+            val liveness = withContext(Dispatchers.IO) { carlinkManager.videoLiveness() }
+            val hasCurrentFrame = liveness.visible
+            if (ui.videoNeedsRecovery != liveness.needsRecovery) {
+                logInfo("[UI_STATE] video recovery controls ${if (liveness.needsRecovery) "shown" else "cleared"}", tag = "UI")
+                ui.videoNeedsRecovery = liveness.needsRecovery
+            }
             if (hasCurrentFrame != ui.videoOnScreen) {
                 if (hasCurrentFrame) {
                     logInfo("[UI_STATE] Current video session responsive — hiding recovery overlay", tag = "UI")

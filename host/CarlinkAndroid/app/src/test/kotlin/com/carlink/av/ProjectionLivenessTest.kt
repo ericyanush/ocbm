@@ -9,7 +9,8 @@ class ProjectionLivenessTest {
         assertTrue(p.update(1, 1, 10, true, 0, 0).visible)
         assertEquals(ProjectionLiveness.Decision(true, true), p.update(1, 1, 10, true, 10_000, 10_000))
         assertTrue(p.update(1, 1, 10, true, 14_999, 14_999).visible)
-        assertEquals(ProjectionLiveness.Decision(false), p.update(1, 1, 10, true, 15_000, 15_000))
+        assertEquals(ProjectionLiveness.Decision(true, needsRecovery = true), p.update(1, 1, 10, true, 15_000, 15_000))
+        assertEquals(ProjectionLiveness.Decision(true), p.update(1, 1, 10, true, 50, 15_500))
         assertTrue(p.update(1, 1, 11, true, 0, 16_000).visible)
     }
 

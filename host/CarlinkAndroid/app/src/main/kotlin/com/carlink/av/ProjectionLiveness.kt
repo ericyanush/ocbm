@@ -2,7 +2,7 @@ package com.carlink.av
 
 /** A stale frame is not proof of a live session. Probe before covering a quiet/static screen. */
 internal class ProjectionLiveness {
-    data class Decision(val visible: Boolean, val requestKeyframe: Boolean = false)
+    data class Decision(val visible: Boolean, val requestKeyframe: Boolean = false, val needsRecovery: Boolean = false)
 
     private var owner: Pair<Long, Long>? = null
     private var probedAt: Long? = null
@@ -32,6 +32,8 @@ internal class ProjectionLiveness {
             framesAtProbe = frames
             return Decision(true, requestKeyframe = true)
         }
-        return Decision(now - probe < 5_000L)
+        // A call can legitimately leave the screen and A/V quiet while the control session is
+        // alive. Keep the last frame and touch access, but expose recovery controls after a probe.
+        return Decision(visible = true, needsRecovery = now - probe >= 5_000L)
     }
 }
