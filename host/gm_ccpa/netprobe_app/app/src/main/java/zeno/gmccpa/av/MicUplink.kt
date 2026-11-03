@@ -46,7 +46,18 @@ import java.util.concurrent.atomic.AtomicLong
  * (`docs/13_AUDIO_ROUTING.md` §4). The ELD bail exists only for an aarch64/Pi build made with
  * `--no-default-features`. Do not assume this class is dormant.
  */
-class MicUplink(context: Context) {
+enum class MicSource(val title: String, val description: String, val audioSource: Int?) {
+    AUTO("Automatic", "Try alternative sources if capture is silent.", null),
+    VOICE_COMMUNICATION("Voice communication", "Use the vehicle's call microphone route.", MediaRecorder.AudioSource.VOICE_COMMUNICATION),
+    VOICE_RECOGNITION("Voice recognition", "Use the voice recognition microphone route.", MediaRecorder.AudioSource.VOICE_RECOGNITION),
+    MIC("Microphone", "Use Android's default microphone source.", MediaRecorder.AudioSource.MIC);
+
+    companion object {
+        fun fromStored(value: String?): MicSource = entries.firstOrNull { it.name == value } ?: AUTO
+    }
+}
+
+class MicUplink(context: Context, private val sourcePreference: () -> MicSource = { MicSource.AUTO }) {
 
     private val context = context.applicationContext
 
@@ -59,6 +70,7 @@ class MicUplink(context: Context) {
     @Volatile private var out: OutputStream? = null
     @Volatile private var activeRate = 0
     @Volatile private var activeChannels = 0
+    @Volatile private var preferredSource = MediaRecorder.AudioSource.VOICE_COMMUNICATION
     private var gateThread: Thread? = null
     /** Written on `mic-gate`, read by [stopCapture] from the UI thread too — hence volatile. */
     @Volatile private var captureThread: Thread? = null
@@ -196,7 +208,7 @@ class MicUplink(context: Context) {
         }.getOrDefault("unavailable")
         log.i("capture preflight permission=${if (permissionGranted) "GRANTED" else "DENIED"} " +
             "appOp=${appOpMode?.let(::appOpName) ?: "unknown"} inputs=[$inputDevices] " +
-            "source=VOICE_COMMUNICATION format=${rate}Hz/${channels}ch")
+            "source=$preferredSource format=${rate}Hz/${channels}ch")
         if (!permissionGranted || appOpMode == AppOpsManager.MODE_IGNORED || appOpMode == AppOpsManager.MODE_ERRORED) {
             log.e("microphone capture blocked by permission/app-op — no mic for this gate")
             capturing.set(false)
@@ -211,8 +223,10 @@ class MicUplink(context: Context) {
             capturing.set(false)
             SessionTrace.Board.note(BOARD, "FAILED (getMinBufferSize($rate/$channels) refused — no mic this gate)"); return
         }
+        val selectedSource = sourcePreference()
+        val source = selectedSource.audioSource ?: preferredSource
         val rec = try {
-            AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, rate, mask,
+            AudioRecord(source, rate, mask,
                 AudioFormat.ENCODING_PCM_16BIT, minBuf * 3)
         } catch (t: Throwable) {
             log.e("AudioRecord: ${t.javaClass.simpleName}: ${t.message} — no mic for this gate"); capturing.set(false)
@@ -238,15 +252,15 @@ class MicUplink(context: Context) {
         SessionTrace.expect(EXPECT_FIRST_CHUNK, FIRST_CHUNK_MS,
             "the receiver said `uplink on ${rate} ${channels}` and AudioRecord is recording, so PCM " +
             "should reach the seam within one bring-up (262ms on 2026-09-09)")
-        captureThread = Thread({ captureLoop(rec, bytesPerChunk) }, "mic-capture").apply {
+        captureThread = Thread({ captureLoop(rec, source, selectedSource == MicSource.AUTO, bytesPerChunk, rate, mask, minBuf * 3) }, "mic-capture").apply {
             isDaemon = true; start()
         }
         val routedInput = runCatching {
             rec.routedDevice?.let { "${it.id}:${deviceTypeName(it.type)}" } ?: "none"
         }.getOrDefault("unavailable")
-        log.i("capturing VOICE_COMMUNICATION ${rate}Hz ${channels}ch, ${bytesPerChunk}B/chunk " +
+        log.i("capturing source=$source selection=${selectedSource.name} ${rate}Hz ${channels}ch, ${bytesPerChunk}B/chunk " +
             "(capture #$captures session=${rec.audioSessionId} routedInput=$routedInput)")
-        SessionTrace.Board.up(BOARD, "gate OPEN — capturing VOICE_COMMUNICATION ${rate}Hz ${channels}ch, ${bytesPerChunk}B/${CHUNK_MS}ms")
+        SessionTrace.Board.up(BOARD, "gate OPEN — capturing source=$source ${rate}Hz ${channels}ch, ${bytesPerChunk}B/${CHUNK_MS}ms")
     }
 
     private fun appOpName(mode: Int): String = when (mode) {
@@ -268,8 +282,14 @@ class MicUplink(context: Context) {
         else -> "type-$type"
     }
 
-    private fun captureLoop(rec: AudioRecord, chunk: Int) {
+    @SuppressLint("MissingPermission")
+    private fun captureLoop(initial: AudioRecord, initialSource: Int, automatic: Boolean, chunk: Int, rate: Int, mask: Int, bufferBytes: Int) {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+        var rec = initial
+        var source = initialSource
+        val fallbacks = listOf(MediaRecorder.AudioSource.VOICE_COMMUNICATION to "VOICE_COMMUNICATION", MediaRecorder.AudioSource.VOICE_RECOGNITION to "VOICE_RECOGNITION", MediaRecorder.AudioSource.MIC to "MIC").filter { it.first != initialSource }
+        var nextFallback = 0
+        val silence = MicZeroDetector(2000 / CHUNK_MS)
         val buf = ByteArray(chunk)
         val levels = MicPcmLevels()
         var reportAt = 0L
@@ -309,6 +329,48 @@ class MicUplink(context: Context) {
                 if (off == chunk) {
                     levels.add(buf, chunk)
                     send(buf, chunk)
+                    // Exact digital zero for two seconds is the Blazer failure signature. Normal
+                    // quiet microphone noise must never cause us to replace a working route.
+                    val allZero = buf.all { it == 0.toByte() }
+                    val shouldRetry = silence.observe(allZero)
+                    if (automatic && !allZero) {
+                        if (preferredSource != source) {
+                            preferredSource = source
+                            log.i("microphone source=$source returned nonzero samples; retaining for subsequent gates")
+                        }
+                    }
+                    if (automatic && shouldRetry && nextFallback < fallbacks.size && capturing.get() && running.get()) {
+                        log.w("microphone returned exact zero for 2s; trying another capture source")
+                        runCatching { rec.stop() }; runCatching { rec.release() }
+                        var replacement: AudioRecord? = null
+                        while (nextFallback < fallbacks.size && replacement == null && capturing.get() && running.get()) {
+                            val (candidateSource, name) = fallbacks[nextFallback++]
+                            replacement = runCatching {
+                                val candidate = AudioRecord(candidateSource, rate, mask, AudioFormat.ENCODING_PCM_16BIT, bufferBytes)
+                                try {
+                                    check(candidate.state == AudioRecord.STATE_INITIALIZED) { "uninitialised" }
+                                    candidate.startRecording()
+                                    source = candidate.audioSource
+                                    log.i("microphone fallback source=$name session=${candidate.audioSessionId} routedInput=${candidate.routedDevice?.let { "${it.id}:${deviceTypeName(it.type)}" } ?: "none"}")
+                                    candidate
+                                } catch (t: Throwable) { candidate.release(); throw t }
+                            }.onFailure { log.w("microphone fallback source=$name failed: ${it.message}") }.getOrNull()
+                        }
+                        if (replacement == null) {
+                            // Restore the original source if alternates are unavailable; keeping
+                            // the gate alive permits recovery if vehicle routing changes later.
+                            replacement = runCatching {
+                                AudioRecord(initialSource, rate, mask, AudioFormat.ENCODING_PCM_16BIT, bufferBytes).also { it.startRecording(); source = initialSource }
+                            }.getOrNull()
+                        }
+                        if (replacement == null) {
+                            log.e("all microphone capture sources failed")
+                            capturing.set(false)
+                            return
+                        }
+                        rec = replacement
+                        silence.reset()
+                    }
                     val now = android.os.SystemClock.elapsedRealtime()
                     if (now >= reportAt) {
                         reportLevels()
@@ -360,6 +422,16 @@ class MicUplink(context: Context) {
         captureThread = null   // the capture thread owns AudioRecord stop()/release() in its finally
         log.i("capture stopped — $why")
     }
+}
+
+/** Exact zero is a route failure signature; low-level or temporarily quiet PCM is not. */
+internal class MicZeroDetector(private val threshold: Int) {
+    private var consecutive = 0
+    fun observe(allZero: Boolean): Boolean {
+        consecutive = if (allZero) consecutive + 1 else 0
+        return consecutive >= threshold
+    }
+    fun reset() { consecutive = 0 }
 }
 
 /** Aggregate levels only: never retain or log microphone audio. */

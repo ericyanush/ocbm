@@ -62,6 +62,7 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import com.carlink.CarlinkManager
 import com.carlink.callui.CallNotificationMode
+import zeno.gmccpa.av.MicSource
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.ocbm.UsbTransportMode
@@ -126,6 +127,7 @@ internal fun ControlTabContent(
     val context = LocalContext.current
     var gpsEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.gpsForwardingEnabled) }
     var callNotificationMode by remember(carlinkManager) { mutableStateOf(carlinkManager.callNotificationMode) }
+    var microphoneSource by remember(carlinkManager) { mutableStateOf(carlinkManager.microphoneSource) }
     var startSessionEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.startSessionExperimentEnabled) }
     var clusterNavigationEnabled by remember(context) { mutableStateOf(ClusterNavigationController.isEnabled(context)) }
     val laneStore = remember(context) { LaneGuidanceStore.get(context) }
@@ -347,6 +349,26 @@ internal fun ControlTabContent(
                         turnAlertSolidLast = it
                         turnAlertStore.setSolidLast(it)
                     })
+                }
+            }
+            ControlCard(title = "CarPlay microphone source", icon = Icons.Default.SettingsInputComponent) {
+                Text("Choose the Android microphone route used for Siri and calls. Changes apply the next time the microphone starts.",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                MicSource.entries.forEach { option ->
+                    Row(modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable {
+                        microphoneSource = option
+                        carlinkManager.setMicrophoneSource(option)
+                    }, verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(selected = microphoneSource == option, onClick = {
+                            microphoneSource = option
+                            carlinkManager.setMicrophoneSource(option)
+                        })
+                        Column(modifier = Modifier.weight(1f).padding(vertical = 8.dp)) {
+                            Text(option.title, style = MaterialTheme.typography.titleMedium)
+                            Text(option.description, style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
                 }
             }
             ControlCard(title = "CarPlay call notifications", icon = Icons.Default.PhoneDisabled) {

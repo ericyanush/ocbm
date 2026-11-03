@@ -1,10 +1,24 @@
 package com.carlink.av
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import zeno.gmccpa.av.MicPcmLevels
+import zeno.gmccpa.av.MicZeroDetector
 
 class MicPcmLevelsTest {
+    @Test fun fallback_requires_consecutive_exact_zero_chunks() {
+        val detector = MicZeroDetector(3)
+        assertFalse(detector.observe(true))
+        assertFalse(detector.observe(true))
+        assertFalse(detector.observe(false))
+        assertFalse(detector.observe(true))
+        assertFalse(detector.observe(true))
+        assertTrue(detector.observe(true))
+        detector.reset()
+        assertFalse(detector.observe(true))
+    }
     @Test fun signedSamplesAndSilenceAreMeasuredWithoutRetainingAudio() {
         val levels = MicPcmLevels()
         levels.add(byteArrayOf(0, 0, 0, -128, -1, 127, 0, 0), 8)

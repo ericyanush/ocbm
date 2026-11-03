@@ -88,6 +88,7 @@ import com.carlink.util.PanelGeometry
 import zeno.gmccpa.CarPlayRx
 import zeno.gmccpa.NetworkDiagnostics
 import zeno.gmccpa.av.MicUplink
+import zeno.gmccpa.av.MicSource
 import zeno.gmccpa.pair.MfiRelay
 import zeno.gmccpa.pair.NativeCore
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -625,6 +626,16 @@ class CarlinkManager(
     private val gpsForwardingPreference by lazy { GpsForwardingPreference(context) }
     private val callNotificationPrefs by lazy {
         context.getSharedPreferences("carlink_call_notifications", Context.MODE_PRIVATE)
+    }
+    private val microphonePrefs by lazy {
+        context.getSharedPreferences("carlink_microphone", Context.MODE_PRIVATE)
+    }
+    val microphoneSource: MicSource
+        get() = MicSource.fromStored(microphonePrefs.getString("source", null))
+
+    fun setMicrophoneSource(source: MicSource) {
+        microphonePrefs.edit().putString("source", source.name).apply()
+        logInfo("[MIC] source=${source.name}; applies at next capture", tag = Logger.Tags.ADAPTR)
     }
     private val gnssForwarder by lazy {
         GnssForwarder(context, NativeCore::updateVehicleLocationReport) { message ->
@@ -1638,7 +1649,7 @@ class CarlinkManager(
                     },
                 )
                 if (carPlayMicUplink == null) {
-                    carPlayMicUplink = MicUplink(context).also { it.start() }
+                    carPlayMicUplink = MicUplink(context) { microphoneSource }.also { it.start() }
                 }
                 withContext(Dispatchers.IO) {
                     restoreNativeSessionVideo(receiver, sessionGeneration, controlGeneration)
