@@ -4,6 +4,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -14,6 +16,25 @@ class NativeStartSessionTest {
         .put("version", 1).put("peerMac", peer).put("slotId", "slot-1")
         .put("requestId", "").put("receiverEpoch", "").put("stage", stage)
         .put("reason", "").put("available", available)
+
+    @Test fun control_disconnect_defers_selection_until_slot_end_is_processed() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val sent = java.util.Collections.synchronizedList(mutableListOf<JSONObject>())
+        val states = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val controller = NativeStartSession(scope, { null }, { sent.add(it); true }, { null }, { states.add(it) }, {})
+        controller.enabled = true
+        try {
+            controller.event(event("available", true))
+            controller.connectionEnded()
+            controller.select(peer)
+            controller.event(event("ended", false))
+            delay(2300)
+            assertTrue(sent.isEmpty())
+            assertTrue(states.any { it == "Waiting for phone..." })
+            assertNull(controller.event(event("available", true)))
+            assertEquals(peer to true, controller.event(event("available", true).put("slotId", "new-slot")))
+        } finally { scope.cancel() }
+    }
 
     @Test fun readiness_requires_authoritative_available_event_and_preserves_failure() {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)

@@ -40,6 +40,10 @@ class NativeStartSession(
     private var timer: Job? = null
     private var pending: Job? = null
     private var networkWatch: Job? = null
+    private var reconnectSettle: Job? = null
+    private var reconnectNotBeforeNs = 0L
+    private var deferredPeer: String? = null
+    private var deferredRetryBlocked = false
 
     private fun networkKey(e: JSONObject): String = listOf("interface", "addresses", "port", "deviceId")
         .joinToString("|") { e.opt(it)?.toString().orEmpty() }
@@ -106,6 +110,8 @@ class NativeStartSession(
 
     /** Slot ordering is only meaningful within one OCBM adapter session. */
     fun adapterSessionChanged() {
+        reconnectSettle?.cancel(); reconnectSettle = null
+        reconnectNotBeforeNs = 0L; deferredPeer = null; deferredRetryBlocked = false
         generation.incrementAndGet()
         timer?.cancel(); timer = null
         pending?.cancel(); pending = null
@@ -200,6 +206,24 @@ class NativeStartSession(
      */
     fun select(peer: String?, retryBlocked: Boolean = false) {
         if (!enabled || receiver()?.sessionLive == true) return
+        val remainingNs = reconnectNotBeforeNs - System.nanoTime()
+        if (remainingNs > 0) {
+            deferredPeer = peer
+            deferredRetryBlocked = retryBlocked
+            if (reconnectSettle?.isActive != true) {
+                log("waiting for Bluetooth slot teardown before selecting a reconnect target")
+                reconnectSettle = scope.launch {
+                    delay((remainingNs / 1_000_000L).coerceAtLeast(1L) + 1L)
+                    reconnectNotBeforeNs = 0L
+                    reconnectSettle = null
+                    val target = deferredPeer
+                    val retry = deferredRetryBlocked
+                    deferredPeer = null; deferredRetryBlocked = false
+                    select(target, retry)
+                }
+            }
+            return
+        }
         if (peer == null) {
             cancel(clearSlots = false)
             reportWaitingUnlessFailed()
@@ -273,8 +297,18 @@ class NativeStartSession(
         }
     }
 
-    fun connected() { progressText = null; timer?.cancel(); pending?.cancel(); networkWatch?.cancel() }
-    fun connectionEnded() { progressText = null; cancel(clearSlots = false) }
+    fun connected() {
+        reconnectSettle?.cancel(); reconnectSettle = null
+        reconnectNotBeforeNs = 0L; deferredPeer = null; deferredRetryBlocked = false
+        progressText = null; timer?.cancel(); pending?.cancel(); networkWatch?.cancel()
+    }
+    fun connectionEnded() {
+        progressText = null
+        cancel(clearSlots = false)
+        // Bluetooth disconnection events can arrive after control teardown. Give them time to
+        // retire the old slot before selecting; a still-live slot remains eligible afterwards.
+        reconnectNotBeforeNs = System.nanoTime() + 2_000_000_000L
+    }
     fun cancel(clearSlots: Boolean = true) {
         generation.incrementAndGet()
         timer?.cancel(); timer = null; pending?.cancel(); pending = null
@@ -288,6 +322,10 @@ class NativeStartSession(
         }
         request = null
         receiver()?.revokeStartSession()
-        if (clearSlots) { slots.clear(); blocked.clear(); retiredSlots.clear(); progressText = null }
+        if (clearSlots) {
+            reconnectSettle?.cancel(); reconnectSettle = null
+            reconnectNotBeforeNs = 0L; deferredPeer = null; deferredRetryBlocked = false
+            slots.clear(); blocked.clear(); retiredSlots.clear(); progressText = null
+        }
     }
 }
