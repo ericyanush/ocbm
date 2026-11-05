@@ -1858,6 +1858,10 @@ class CarPlayRx(
         private fun xRequest() = "auth-setup gen=$gen"
         private fun xChipOps() = "auth-setup chip ops gen=$gen"
 
+        // The native core chooses SHA-1 or SHA-256 from this value. Without forwarding it,
+        // MfiRelay's protocol-2 default sends a 20-byte digest to a protocol-3 signer.
+        override fun protocolMajor(): Int = inner.protocolMajor()
+
         private fun <T> traced(op: String, body: () -> T): T {
             if (seen.compareAndSet(false, true)) {
                 SessionTrace.met(xRequest())
@@ -1880,7 +1884,10 @@ class CarPlayRx(
         }
 
         override fun copyCertificate(): ByteArray = traced("certificate") { inner.copyCertificate() }
-        override fun createSignature(digest: ByteArray): ByteArray = traced("signature") { inner.createSignature(digest) }
+        override fun createSignature(digest: ByteArray): ByteArray = traced("signature") {
+            log.i("MFi request path=airplay-auth-setup op=create_signature gen=$gen protocol=${protocolMajor()} digestBytes=${digest.size}")
+            inner.createSignature(digest)
+        }
         override fun copyCertificateFast(): ByteArray {
             log.i("MFi request path=iap2-tunnel op=copy_certificate gen=$gen handoffPhone=$handoffPhoneMac controlPeer=$controlPeer")
             return inner.copyCertificateFast()

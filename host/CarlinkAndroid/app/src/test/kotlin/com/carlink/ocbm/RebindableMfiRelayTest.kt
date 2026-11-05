@@ -33,7 +33,7 @@ class RebindableMfiRelayTest {
             relay.createSignature(byteArrayOf(9))
         }
 
-        assertTrue(error.message.orEmpty().contains("MFi adapter unavailable"))
+        assertTrue(error.message.orEmpty().contains("MFi signer unavailable"))
     }
 
     @Test
@@ -82,7 +82,7 @@ class RebindableMfiRelayTest {
         worker.join(1000)
 
         assertTrue(failure is IllegalStateException)
-        assertTrue(failure?.message.orEmpty().contains("session changed"))
+        assertTrue(failure?.message.orEmpty().contains("MFi signer changed"))
     }
 
     private class FakeRelay(

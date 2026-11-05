@@ -18,7 +18,7 @@ internal class SoftwareMfiSigner private constructor(
     override fun protocolMajor(): Int = 3
     override fun copyCertificate(): ByteArray = certificate.copyOf()
     override fun createSignature(digest: ByteArray): ByteArray {
-        require(digest.size == 32)
+        require(digest.size == 32) { "MFi protocol 3 requires a 32-byte digest; got ${digest.size}" }
         return raw(Signature.getInstance("NONEwithECDSA").apply { initSign(key); update(digest) }.sign())
     }
     companion object {
