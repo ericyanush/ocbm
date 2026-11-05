@@ -52,6 +52,15 @@ object NativeCore {
         return key.joinToString("") { "%02x".format(it.toInt() and 255) }
     }
 
+    /** Reuses the project's proven iAP2 identification builder for app-owned RFCOMM. */
+    fun wirelessIdentifyBody(name: String, bluetoothAddress: String): ByteArray {
+        check(available) { "Native iAP2 builder unavailable" }
+        return nativeWirelessIdentifyBody(name, bluetoothAddress)
+            ?: error("Could not build wireless IdentificationInformation")
+    }
+
+    private external fun nativeWirelessIdentifyBody(name: String, bluetoothAddress: String): ByteArray?
+
     /**
      * [start] could not install because the INCUMBENT generation still held the native CORE mutex.
      *

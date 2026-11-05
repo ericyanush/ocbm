@@ -71,6 +71,7 @@ dependencies = [
 name = "carplay-jni"
 version = "0.1.0"
 dependencies = [
+ "carplay-iap2-core",
  "jni",
  "libc",
  "mfi",

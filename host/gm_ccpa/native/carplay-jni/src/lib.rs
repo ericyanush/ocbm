@@ -570,6 +570,34 @@ pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativePublicKey<'l>(
     })).unwrap_or(std::ptr::null_mut())
 }
 
+/// Build the same wireless 0x1D01 body used by the adapter, with native StartSession declared.
+#[no_mangle]
+pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeWirelessIdentifyBody<'l>(
+    mut env: JNIEnv<'l>, _object: JObject<'l>, name: JString<'l>, address: JString<'l>,
+) -> jbyteArray {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = (|| -> Result<jbyteArray, String> {
+            let name: String = env.get_string(&name).map_err(|e| e.to_string())?.into();
+            let address: String = env.get_string(&address).map_err(|e| e.to_string())?.into();
+            let parts = address.split(':').map(|p| {
+                if p.len() != 2 { return Err("invalid Bluetooth address".to_owned()); }
+                u8::from_str_radix(p, 16).map_err(|_| "invalid Bluetooth address".to_owned())
+            }).collect::<Result<Vec<_>, _>>()?;
+            let bt_mac: [u8; 6] = parts.try_into().map_err(|_| "invalid Bluetooth address")?;
+            let body = carplay_iap2_core::message::build_ident_info(
+                &name, carplay_iap2_core::message::TransportComponent::Wireless { bt_mac }, false,
+            );
+            let body = carplay_iap2_core::message::with_wireless_start_session(body);
+            env.byte_array_from_slice(&body).map(|v| v.into_raw()).map_err(|e| e.to_string())
+        })();
+        result.unwrap_or_else(|e| {
+            eprintln!("[jni] wireless identify builder failed: {e}");
+            if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
+            std::ptr::null_mut()
+        })
+    })).unwrap_or(std::ptr::null_mut())
+}
+
 /// `nativeInit(..., localBindAddress, socketRelay, phonePeerAddress) -> handle`
 #[no_mangle]
 pub extern "system" fn Java_zeno_gmccpa_pair_NativeCore_nativeInit<'l>(

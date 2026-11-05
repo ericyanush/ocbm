@@ -39,6 +39,7 @@ libc = "0.2"
 receiver = { path = "../../../../crates/vendor/receiver", default-features = false, features = ["mic-uplink"] }
 pairing  = { path = "../../../../crates/vendor/pairing" }
 mfi      = { path = "../../../../crates/vendor/mfi" }
+carplay-iap2-core = { path = "../../../../crates/vendor/iap2-core" }
 
 # `mic-uplink-eld` statically links libfdk-aac. FDK_AAC_PREFIX must point to an archive built for
 # the SAME ABI. The CarlinkAndroid build uses install-android-x86_64 and install-android-arm64,
