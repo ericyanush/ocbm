@@ -69,6 +69,8 @@ import com.carlink.ocbm.UsbTransportMode
 import com.carlink.ocbm.UsbAdapterIdentity
 import com.carlink.ocbm.CarPlayFrameRate
 import com.carlink.ocbm.CarPlayNetworkMode
+import com.carlink.ocbm.SoftwareMfiIdentityStore
+import com.carlink.ocbm.AppBluetoothRfcomm
 import com.carlink.navigation.ClusterNavigationController
 import com.carlink.ui.settings.LaneGuidanceStore
 import com.carlink.ui.settings.TurnAlertStore
@@ -125,6 +127,30 @@ internal fun ControlTabContent(
     val maxContentWidth = (window.widthDp * 0.75f).dp.coerceIn(400.dp, 1200.dp)
     val connected = connectionState != CarlinkManager.State.DISCONNECTED
     val context = LocalContext.current
+    val identityStore = remember(context) { SoftwareMfiIdentityStore(context) }
+    val identityScope = rememberCoroutineScope()
+    var identityStatus by remember { mutableStateOf(if (identityStore.isReady()) "Identity ready" else "No identity imported") }
+    val identityPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) {
+            identityStatus = "Validating identity…"
+            identityScope.launch {
+                val result = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    runCatching { identityStore.importDocuments(uris) }
+                }
+                identityStatus = if (result.isSuccess) "Identity ready" else "Import failed. Select the matching key and certificate."
+            }
+        }
+    }
+    var bluetoothStatus by remember { mutableStateOf("Not checked") }
+    var bluetoothPhones by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+    fun refreshBluetooth() {
+        val result = runCatching { AppBluetoothRfcomm(context).readiness() }.getOrNull()
+        bluetoothStatus = result?.detail ?: "Bluetooth service unavailable"
+        bluetoothPhones = result?.pairedPhones.orEmpty()
+    }
+    val bluetoothPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) refreshBluetooth() else bluetoothStatus = "Bluetooth permission denied"
+    }
     var gpsEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.gpsForwardingEnabled) }
     var callNotificationMode by remember(carlinkManager) { mutableStateOf(carlinkManager.callNotificationMode) }
     var microphoneSource by remember(carlinkManager) { mutableStateOf(carlinkManager.microphoneSource) }
@@ -172,6 +198,44 @@ internal fun ControlTabContent(
             } else {
                 AdapterCard(carlinkManager, connected, Modifier.fillMaxWidth())
                 AppControlCard(carlinkManager, connected, displayMode, onDisplayModeSelected, Modifier.fillMaxWidth())
+            }
+            ControlCard(title = "Software MFi identity", icon = Icons.Default.SettingsInputComponent) {
+                Text("Import your authorized identity.pk8 and certificate.p7b together. They are stored in private app storage and excluded from backups.")
+                Text(identityStatus, style = MaterialTheme.typography.bodyMedium)
+                OutlinedButton(onClick = { identityPicker.launch(arrayOf("*/*")) }) {
+                    Text("Import identity files")
+                }
+                Text("The current adapter connection continues to use its hardware signer.", style = MaterialTheme.typography.bodySmall)
+            }
+            ControlCard(title = "Android Bluetooth", icon = Icons.Default.SettingsInputComponent) {
+                Text("Checks whether this head unit exposes Bluetooth Classic to the app. This check does not connect to a phone.")
+                Text(bluetoothStatus, style = MaterialTheme.typography.bodyMedium)
+                OutlinedButton(onClick = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                        refreshBluetooth()
+                    } else bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                }) { Text("Check Android Bluetooth") }
+                if (identityStatus == "Identity ready" && !connected) {
+                    bluetoothPhones.forEach { (address, name) ->
+                        OutlinedButton(onClick = {
+                            bluetoothStatus = "Testing iAP2 authentication with $name…"
+                            identityScope.launch {
+                                val result = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        AppBluetoothRfcomm(context).probeAuthentication(address, identityStore.load()) { phase ->
+                                            logInfo("[APP_BT] iAP2 auth phase=$phase", tag = "Bluetooth")
+                                        }
+                                    }
+                                }
+                                bluetoothStatus = result.fold(
+                                    { "iAP2 authentication: $it ($name)" },
+                                    { "iAP2 test failed: ${it.message?.take(120) ?: "connection error"}" },
+                                )
+                                result.onFailure { logWarn("[APP_BT] iAP2 authentication failed: ${it.javaClass.simpleName}: ${it.message}", tag = "Bluetooth") }
+                            }
+                        }) { Text("Test iAP2 auth: $name") }
+                    }
+                }
             }
             ControlCard(title = "CarPlay StartSession (experimental)", icon = Icons.Default.Wifi) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(20.dp)) {

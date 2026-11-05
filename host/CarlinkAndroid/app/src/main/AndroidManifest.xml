@@ -4,6 +4,9 @@
 
     <!-- Permissions -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- App-owned RFCOMM experiment uses paired-device access; requested only when tested. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
