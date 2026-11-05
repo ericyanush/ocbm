@@ -45,6 +45,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -129,7 +130,11 @@ internal fun ControlTabContent(
     val context = LocalContext.current
     val identityStore = remember(context) { SoftwareMfiIdentityStore(context) }
     val identityScope = rememberCoroutineScope()
-    var identityStatus by remember { mutableStateOf(if (identityStore.isReady()) "Identity ready" else "No identity imported") }
+    var identityStatus by remember { mutableStateOf("Checking identity…") }
+    LaunchedEffect(identityStore) {
+        val ready = kotlinx.coroutines.withContext(Dispatchers.IO) { identityStore.isReady() }
+        if (identityStatus == "Checking identity…") identityStatus = if (ready) "Identity ready" else "No identity imported"
+    }
     val identityPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
             identityStatus = "Validating identity…"
@@ -200,7 +205,7 @@ internal fun ControlTabContent(
                 AppControlCard(carlinkManager, connected, displayMode, onDisplayModeSelected, Modifier.fillMaxWidth())
             }
             ControlCard(title = "Software MFi identity", icon = Icons.Default.SettingsInputComponent) {
-                Text("Import your authorized identity.pk8 and certificate.p7b together. They are stored in private app storage and excluded from backups.")
+                Text("Import your authorized identity.pk8 and certificate.p7b together, or build with -PbundleOfflineMfi=true. The active identity is copied to private app storage and excluded from backups.")
                 Text(identityStatus, style = MaterialTheme.typography.bodyMedium)
                 OutlinedButton(onClick = { identityPicker.launch(arrayOf("*/*")) }) {
                     Text("Import identity files")

@@ -7,7 +7,11 @@ existing adapter path remains the default.
 
 - The app can import `identity.pk8` and `certificate.p7b` together through Android's document
   picker. It validates the P-256 key/certificate pair, stores them under `noBackupFilesDir`, and
-  does not include them in source or APK assets.
+  does not include them in source.
+- An explicit `-PbundleOfflineMfi=true` build option stages exactly those two files from
+  `../carplay-certs/offline-mfi` (relative to the OCBM repo), or `CARLINK_MFI_DIR` if set. The app
+  validates and copies the bundled identity to private storage on first use. A build without the
+  option removes staged assets, including after a previous bundled build.
 - The receiver's MFi relay accepts protocol 2 (adapter SHA-1/RSA) and protocol 3 (local
   SHA-256/P-256) digest/signature sizes. MFi-SAP has a protocol-3 test vector.
 - Android Bluetooth Classic access is permission-gated. Settings → Control → Android Bluetooth
@@ -19,7 +23,8 @@ existing adapter path remains the default.
 ## On-device test
 
 1. Build/install the sideload or Play app on the target AAOS head unit.
-2. Import the two identity files in Settings → Control. The picker must select both in one action.
+2. Import the two identity files in Settings → Control (select both in one action), or build the
+   APK explicitly with `./gradlew :app:assembleSideloadDebug -PbundleOfflineMfi=true`.
 3. Stop any active CarPlay session and pair an iPhone to **Android's** Bluetooth radio. The phone
    being paired to the adapter's separate Bluetooth radio does not populate Android's bonded list.
 4. Tap **Check Android Bluetooth**, grant the permission, then tap **Test iAP2 auth** for that phone.
@@ -44,3 +49,7 @@ path cannot work with public Android Bluetooth APIs on that head unit. The adapt
 
 The protocol implementation is original work informed by the project's existing iAP2 Rust code and
 behavioral references. Reference projects with GPL/AGPL licenses are not copied into this tree.
+
+**Distribution:** `identity.pk8` is extractable from every APK built with the bundling flag. Keep
+that artifact restricted to recipients authorized to use the identity. The build flag is off by
+default; normal Play and sideload builds do not contain it.

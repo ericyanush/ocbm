@@ -5,6 +5,35 @@ plugins {
     id("io.gitlab.arturbosch.detekt")
 }
 
+abstract class StageOfflineMfiIdentity : org.gradle.api.DefaultTask() {
+    @get:org.gradle.api.tasks.Input
+    abstract val bundle: org.gradle.api.provider.Property<Boolean>
+
+    @get:org.gradle.api.tasks.Optional
+    @get:org.gradle.api.tasks.InputDirectory
+    abstract val sourceDir: org.gradle.api.file.DirectoryProperty
+
+    @get:org.gradle.api.tasks.OutputDirectory
+    abstract val outputDir: org.gradle.api.file.DirectoryProperty
+
+    @org.gradle.api.tasks.TaskAction
+    fun stage() {
+        val stagedRoot = outputDir.get().asFile
+        check(!stagedRoot.exists() || stagedRoot.deleteRecursively()) { "Cannot clear staged MFi assets" }
+        check(stagedRoot.mkdirs()) { "Cannot create staged MFi assets directory" }
+        if (!bundle.get()) return
+        val source = sourceDir.get().asFile
+        check(source.resolve("identity.pk8").isFile && source.resolve("certificate.p7b").isFile) {
+            "Missing identity.pk8 or certificate.p7b in CARLINK_MFI_DIR"
+        }
+        val target = stagedRoot.resolve("offline-mfi")
+        check(target.mkdir()) { "Cannot stage MFi identity directory" }
+        for (name in listOf("identity.pk8", "certificate.p7b")) {
+            source.resolve(name).copyTo(target.resolve(name))
+        }
+    }
+}
+
 val gmCcpaRoot =
     rootProject.projectDir.parentFile.parentFile
         .resolve("host/gm_ccpa")
@@ -23,6 +52,20 @@ val gmCcpaKotlinSources =
     ).map(gmCcpaJavaRoot::resolve)
 
 val gmRepoRoot = rootProject.projectDir.parentFile.parentFile
+// Opt-in only: the private key is extractable from any APK containing it. The source stays outside
+// this repository and only the two explicitly named identity files are staged into generated assets.
+val bundleOfflineMfi = providers.gradleProperty("bundleOfflineMfi").map(String::toBoolean).getOrElse(false)
+val offlineMfiSource = providers.environmentVariable("CARLINK_MFI_DIR")
+    .map { file(it) }.getOrElse(gmRepoRoot.parentFile.resolve("carplay-certs/offline-mfi"))
+val offlineMfiAssets = layout.buildDirectory.dir("generated/offlineMfiAssets")
+val stageOfflineMfiIdentity = tasks.register<StageOfflineMfiIdentity>("stageOfflineMfiIdentity") {
+    bundle.set(bundleOfflineMfi)
+    if (bundleOfflineMfi) sourceDir.set(offlineMfiSource)
+    outputDir.set(offlineMfiAssets)
+}
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(stageOfflineMfiIdentity)
+}
 val carPlayJniDir = gmCcpaRoot.resolve("native/carplay-jni")
 val cargoTargetDir =
     file("${System.getProperty("user.home")}/.cache/cargo-targets/carlink-android-carplay-jni")
@@ -71,6 +114,7 @@ android {
     sourceSets.getByName("main").assets.srcDir(
         gmCcpaRoot.resolve("netprobe_app/app/src/main/assets"),
     )
+    sourceSets.getByName("main").assets.srcDir(offlineMfiAssets.get().asFile)
     sourceSets.getByName("main").jniLibs.srcDir(
         layout.buildDirectory
             .dir("generated/carplayJni/jniLibs")
