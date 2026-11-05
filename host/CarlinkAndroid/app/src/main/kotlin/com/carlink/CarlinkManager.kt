@@ -2492,7 +2492,11 @@ class CarlinkManager(
 
     private fun sendMediaButton(index: Byte) {
         if (carPlayReceiver != null) {
-            scope.launch(Dispatchers.IO) { NativeCore.mediaButton(index.toInt()) }
+            logInfo("[MEDIA_CONTROL] outbound native button=${index.toInt()} transport=${if (appOwnedBluetoothEnabled) "Android Bluetooth" else "adapter"}", tag = Logger.Tags.PHONE)
+            scope.launch(Dispatchers.IO) {
+                val sent = NativeCore.mediaButton(index.toInt())
+                logInfo("[MEDIA_CONTROL] native button=${index.toInt()} delivered=$sent", tag = Logger.Tags.PHONE)
+            }
             return
         }
         val c = client ?: return
@@ -3326,7 +3330,10 @@ class CarlinkManager(
         val player =
             MediaAudioPlayer(
                 am,
-                onFocusLost = { sendMediaButton(Ocbm.MEDIA_BTN_PAUSE) },
+                onFocusLost = {
+                    logWarn("[MEDIA_CONTROL] permanent audio focus loss requested phone pause", tag = Logger.Tags.PHONE)
+                    sendMediaButton(Ocbm.MEDIA_BTN_PAUSE)
+                },
                 // Audible media while our own Siri/call sink still holds transient focus: iOS has
                 // ended the session, so release the quiet sink and let AAOS hand focus back.
                 onAudibleWhileSuppressed = {
@@ -4050,6 +4057,12 @@ class CarlinkManager(
         // playbackStatus: 0 stop, 1 play, 2 pause (3/4 seek). 0 is the clear-snapshot signal.
         val playStatus = if (obj.has("playbackStatus")) obj.optInt("playbackStatus") else null
         val isPlaying = if (playStatus != null) playStatus == 1 else lastIsPlaying
+        if (playStatus != null && isPlaying != lastIsPlaying) {
+            logInfo(
+                "[MEDIA_CONTROL] inbound phone playbackStatus=$playStatus playing=$isPlaying app=${obj.optString("appName", "unknown")}",
+                tag = Logger.Tags.PHONE,
+            )
+        }
 
         lastDuration = duration
         lastPosition = position
