@@ -56,6 +56,8 @@ import com.carlink.ocbm.OcbmSocketTunnel
 import com.carlink.ocbm.DirectUsbBulkTransport
 import com.carlink.ocbm.Mfi
 import com.carlink.ocbm.RebindableMfiRelay
+import com.carlink.ocbm.AppOwnedIap2Session
+import com.carlink.ocbm.SoftwareMfiIdentityStore
 import com.carlink.ocbm.ConnectionMfiRelay
 import com.carlink.ocbm.OemIcon
 import com.carlink.ocbm.UsbBulkTransport
@@ -503,7 +505,11 @@ class CarlinkManager(
             withContext(Dispatchers.IO) {
                 if (released || !controlPortStore.save(port, bridgeOnly)) return@withContext false
                 logInfo("[CP_RX] control port saved=$port bridgeOnly=$bridgeOnly; restarting session", tag = Logger.Tags.ADAPTR)
-                cleanSlate.run()
+                if (appOwnedBluetoothEnabled) {
+                    stopImpl()
+                    startImpl()
+                    true
+                } else cleanSlate.run()
             }
         }
     }
@@ -527,7 +533,10 @@ class CarlinkManager(
     fun applyCarPlayNetworkMode(mode: CarPlayNetworkMode) {
         scope.launch {
             setCarPlayNetworkMode(mode)
-            cleanSlateReset()
+            if (appOwnedBluetoothEnabled) {
+                disconnect()
+                start()
+            } else cleanSlateReset()
         }
     }
     private var client: OcbmClient? = null
@@ -725,6 +734,9 @@ class CarlinkManager(
     private var voiceRouter: VoiceRouter? = null
     /** Loopback ingress from the native AirPlay receiver, started only for an armed media session. */
     @Volatile private var carPlaySocketBridge: CarPlaySocketMediaBridge? = null
+    /** Native-only mode uses the same audio/video consumers without constructing an OCBM client. */
+    @Volatile private var localAvLanes: OcbmAvLanes? = null
+    private val activeAvLanes: OcbmAvLanes? get() = client?.lanes ?: localAvLanes
     @Volatile private var carPlayReceiver: CarPlayRx? = null
     // The receiver can outlive a USB reconnect. Keep one stable object passed into native code,
     // while swapping its OCBM-backed delegate only after the replacement session is subscribed.
@@ -744,6 +756,34 @@ class CarlinkManager(
     private val wirelessRecoveryAttempted = AtomicBoolean(false)
     private var nativeStartForConnection = false
     private var nativeStartEndpoint: JSONObject? = null
+    private val sessionTransportPrefs by lazy { context.getSharedPreferences("session_transport", Context.MODE_PRIVATE) }
+    val appOwnedBluetoothEnabled: Boolean get() = sessionTransportPrefs.getBoolean("app_bluetooth", false)
+    val appBluetoothPhone: String? get() = sessionTransportPrefs.getString("phone", null)
+    @Volatile private var appOwnedSession: AppOwnedIap2Session? = null
+    @Volatile private var appOwnedHadControlSession = false
+    private var appOwnedJob: Job? = null
+    private var appOwnedRetryJob: Job? = null
+
+    /** Persist the selected control transport and restart the receiver without rebooting USB. */
+    suspend fun applySessionTransport(appBluetooth: Boolean, phone: String?): Boolean =
+        lifecycleMutex.withLock {
+            withContext(Dispatchers.IO) {
+                if (released) return@withContext false
+                if (appBluetooth && (phone == null || !phone.matches(Regex("(?i)[0-9a-f]{2}(:[0-9a-f]{2}){5}")))) {
+                    setStatusText("Select a paired Android Bluetooth phone first")
+                    return@withContext false
+                }
+                if (appBluetooth && carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL) {
+                    setStatusText("Choose vehicle hotspot mode before using Android Bluetooth")
+                    return@withContext false
+                }
+                stopImpl()
+                sessionTransportPrefs.edit().putBoolean("app_bluetooth", appBluetooth).putString("phone", phone).apply()
+                logInfo("[APP_BT] session transport=${if (appBluetooth) "Android Bluetooth + software MFi" else "OCBM adapter"} phone=${phone ?: "none"}", tag = Logger.Tags.PHONE)
+                startImpl()
+                true
+            }
+        }
     private val startSessionPrefs by lazy { context.getSharedPreferences("carplay_start_session", Context.MODE_PRIVATE) }
     val startSessionExperimentEnabled: Boolean get() = startSessionPrefs.getBoolean("enabled", false)
     fun setStartSessionExperimentEnabled(enabled: Boolean) {
@@ -1050,7 +1090,7 @@ class CarlinkManager(
                     // A new Surface is a new epoch: retire the old one first so its codec is
                     // released before a second is configured. This VPU's codec pool is small.
                     retireVideoEpoch("surface changed")
-                    if (client?.lanes != null) openVideoEpoch(finalSurface)
+                    if (activeAvLanes != null) openVideoEpoch(finalSurface)
                 }
             return
         }
@@ -1262,6 +1302,11 @@ class CarlinkManager(
     private suspend fun startImpl() {
         if (released) {
             logWarn("[LIFECYCLE] start() on a released manager — ignoring", tag = Logger.Tags.ADAPTR)
+            return
+        }
+
+        if (appOwnedBluetoothEnabled) {
+            startAppOwnedSession()
             return
         }
 
@@ -1495,6 +1540,152 @@ class CarlinkManager(
         }
     }
 
+    /** The selected phone is the only RFCOMM peer; CarPlay media still enters the native receiver. */
+    private suspend fun startAppOwnedSession() {
+        if (appOwnedJob?.isActive == true && carPlayReceiver != null && localAvLanes != null) {
+            logDebug("[APP_BT] already running; ignoring duplicate start", tag = Logger.Tags.PHONE)
+            return
+        }
+        if (client != null || appOwnedJob != null || carPlayReceiver != null) stopImpl()
+        val phone = appBluetoothPhone ?: run {
+            setState(State.DISCONNECTED)
+            setStatusText("Select a paired Android Bluetooth phone in Settings")
+            return
+        }
+        if (carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL) {
+            setState(State.DISCONNECTED)
+            setStatusText("Android Bluetooth requires vehicle hotspot mode")
+            return
+        }
+        val signer = try { SoftwareMfiIdentityStore(context).load() } catch (error: Exception) {
+            logWarn("[APP_BT] software identity unavailable: ${error.message}", tag = Logger.Tags.PHONE)
+            setState(State.DISCONNECTED)
+            setStatusText("Import software MFi identity in Settings")
+            return
+        }
+        val generation = connectionGeneration.incrementAndGet()
+        nativeStartForConnection = true
+        nativeStart.enabled = false // No adapter StartSession request is sent in this mode.
+        nativeStartEndpoint = null
+        carPlayMfiRelay.clear()
+        carPlayMfiRelay.bind(generation, signer)
+        setState(State.CONNECTING)
+        setStatusText("Preparing vehicle hotspot receiver...")
+        val endpoint = try {
+            val lanes = OcbmAvLanes(
+                log = ProbeLog.sub("APP_AV"),
+                onKeyframeNeeded = { requestCurrentKeyframe() },
+                onMetadata = { marker, bytes -> onMetadata(marker, bytes) },
+            )
+            localAvLanes = lanes
+            onLanesArmed(lanes)
+            check(carPlaySocketBridge != null) { "Native media bridge could not open its loopback listeners" }
+            if (carPlayBridgeOnly) kotlinx.coroutines.withTimeout(60_000) {
+                awaitHotspotReady(
+                    isCurrent = { !released && connectionGeneration.get() == generation },
+                    read = { StartSessionHotspot.selectIpv4(StartSessionHotspot.snapshot()) },
+                    waiting = { setStatusText("Waiting for vehicle hotspot bridge...") },
+                )
+            }
+            startCarPlayReceiver()
+            check(carPlayReceiver?.awaitAdvertRegistered(10_000) == true) {
+                "AirPlay service registration did not complete"
+            }
+            kotlinx.coroutines.withTimeout(60_000) {
+                nativeStart.awaitEndpoint { !released && appOwnedBluetoothEnabled && connectionGeneration.get() == generation }
+            }
+        } catch (error: Exception) {
+            logWarn("[APP_BT] receiver preparation failed: ${error.message}", tag = Logger.Tags.PHONE)
+            stopImpl()
+            setStatusText("Vehicle hotspot receiver unavailable: ${error.message}")
+            scheduleAppOwnedRetry()
+            return
+        }
+        if (released || connectionGeneration.get() != generation) return
+        val receiver = carPlayReceiver ?: return
+        logInfo("[APP_BT] receiver ready interface=${endpoint.optString("interface")} addresses=${endpoint.optJSONArray("addresses")} port=${endpoint.optInt("port")}", tag = Logger.Tags.PHONE)
+        setStatusText("Connecting to selected phone over Android Bluetooth...")
+        appOwnedJob = scope.launch(Dispatchers.IO) {
+            while (isActive && !released && connectionGeneration.get() == generation) {
+                val refreshedEndpoint = runCatching { nativeStart.endpoint() }.getOrNull()
+                if (refreshedEndpoint == null ||
+                    refreshedEndpoint.optString("interface") != endpoint.optString("interface") ||
+                    refreshedEndpoint.optJSONArray("addresses")?.toString() != endpoint.optJSONArray("addresses")?.toString() ||
+                    refreshedEndpoint.optString("ssid") != endpoint.optString("ssid") ||
+                    refreshedEndpoint.optString("passphrase") != endpoint.optString("passphrase") ||
+                    refreshedEndpoint.optInt("channel") != endpoint.optInt("channel") ||
+                    refreshedEndpoint.optInt("security") != endpoint.optInt("security")
+                ) {
+                    logWarn("[APP_BT] hotspot endpoint changed or unavailable; restarting receiver", tag = Logger.Tags.PHONE)
+                    scope.launch {
+                        lifecycleMutex.withLock { withContext(Dispatchers.IO) { stopImpl(); startImpl() } }
+                    }
+                    break
+                }
+                appOwnedHadControlSession = false
+                lateinit var session: AppOwnedIap2Session
+                session = AppOwnedIap2Session(context, phone, signer, receiver, endpoint,
+                    log = { logInfo("[APP_BT] $it", tag = Logger.Tags.PHONE) },
+                    onStartSessionSent = {
+                        setStatusText("StartSession sent — waiting for phone...")
+                        scope.launch {
+                            delay(45_000)
+                            if (appOwnedSession === session && !receiver.sessionLive) {
+                                logWarn("[APP_BT] dialback timeout; closing RFCOMM to retry", tag = Logger.Tags.PHONE)
+                                session.close()
+                            }
+                        }
+                    },
+                )
+                appOwnedSession = session
+                scope.launch {
+                    delay(75_000)
+                    if (appOwnedSession === session && !session.startSessionSent && !receiver.sessionLive) {
+                        logWarn("[APP_BT] iAP2 setup timeout before StartSession; retrying RFCOMM", tag = Logger.Tags.PHONE)
+                        session.close()
+                    }
+                }
+                try {
+                    session.run()
+                    logWarn("[APP_BT] RFCOMM link ended", tag = Logger.Tags.PHONE)
+                } catch (error: Exception) {
+                    logWarn("[APP_BT] RFCOMM/StartSession failed: ${error.javaClass.simpleName}: ${error.message}", tag = Logger.Tags.PHONE)
+                } finally {
+                    session.close()
+                    if (appOwnedSession === session) appOwnedSession = null
+                }
+                if (!isActive || released || connectionGeneration.get() != generation) break
+                if (session.startSessionSent && !appOwnedHadControlSession) {
+                    // RFCOMM can close immediately after 0x4301. Keep the phone-specific Wi-Fi
+                    // authorization alive until the receiver accepts the phone or its deadline ends.
+                    val deadline = SystemClock.elapsedRealtime() + 40_000
+                    while (isActive && !released && connectionGeneration.get() == generation &&
+                        !receiver.sessionLive && SystemClock.elapsedRealtime() < deadline) delay(200)
+                }
+                if (receiver.sessionLive) {
+                    while (isActive && !released && connectionGeneration.get() == generation && receiver.sessionLive) delay(200)
+                }
+                receiver.revokeStartSession()
+                receiver.setHandoffTarget(null, false)
+                if (!isActive || released || connectionGeneration.get() != generation) break
+                if (!receiver.sessionLive) setStatusText("Phone link ended — retrying Android Bluetooth...")
+                delay(3_000)
+            }
+        }
+    }
+
+    private fun scheduleAppOwnedRetry() {
+        val generation = connectionGeneration.get()
+        appOwnedRetryJob?.cancel()
+        appOwnedRetryJob = scope.launch {
+            delay(5_000)
+            if (!released && appOwnedBluetoothEnabled && connectionGeneration.get() == generation && state == State.DISCONNECTED) {
+                logInfo("[APP_BT] retrying receiver preparation", tag = Logger.Tags.PHONE)
+                start()
+            }
+        }
+    }
+
     /**
      * Android T extension 7 manages multicast reception for foreground apps. Before that extension
      * (including the truck's Android 12L build), acquire a Wi-Fi multicast lock for mDNS receive.
@@ -1612,6 +1803,7 @@ class CarlinkManager(
         }
         logInfo("[CP_RX] using shared GM /info with Carlink return-icon customization", tag = Logger.Tags.ADAPTR)
         receiver.onSessionUp = {
+            if (appOwnedBluetoothEnabled) appOwnedHadControlSession = true
             if (nativeStartForConnection) nativeStart.connected()
             val sessionGeneration = carPlaySessionGeneration.incrementAndGet()
             val controlGeneration = receiver.activeControlGeneration
@@ -1664,6 +1856,7 @@ class CarlinkManager(
             )
         }
         receiver.onSessionDown = {
+            if (appOwnedBluetoothEnabled) appOwnedSession?.close()
             val endedGeneration = carPlaySessionGeneration.incrementAndGet()
             logInfo("[CP_RX] phone control session ended; retiring phone-only state (generation=$endedGeneration)", tag = Logger.Tags.ADAPTR)
             gnssForwarder.stop()
@@ -1924,6 +2117,13 @@ class CarlinkManager(
         reboot: Boolean = false,
         preserveEscalation: Boolean = false,
     ) {
+        appOwnedSession?.close()
+        appOwnedSession = null
+        appOwnedHadControlSession = false
+        appOwnedJob?.cancel()
+        appOwnedJob = null
+        appOwnedRetryJob?.cancel()
+        appOwnedRetryJob = null
         OcbmNavigationFeed.clear()
         scope.launch { appFocusClaimer?.setNavigating(false) }
         nativeStart.cancel()
@@ -1952,6 +2152,11 @@ class CarlinkManager(
             receiver.stop()
         }
         carPlayReceiver = null
+        localAvLanes?.let { lanes ->
+            onLanesRetired()
+            lanes.close()
+            localAvLanes = null
+        }
         socketTunnel?.let { tunnel -> runCatching { tunnel.close() } }
         socketTunnel = null
         dongleApInfo = null
@@ -2232,7 +2437,14 @@ class CarlinkManager(
     suspend fun cleanSlateReset(): Boolean {
         if (released) return false
         return lifecycleMutex.withLock {
-            withContext(Dispatchers.IO) { cleanSlate.run() }
+            withContext(Dispatchers.IO) {
+                if (appOwnedBluetoothEnabled) {
+                    logInfo("[APP_BT] resetting app-owned Bluetooth/CarPlay session", tag = Logger.Tags.PHONE)
+                    stopImpl()
+                    startImpl()
+                    true
+                } else cleanSlate.run()
+            }
         }
     }
 
@@ -2586,7 +2798,7 @@ class CarlinkManager(
      */
     @Synchronized
     private fun openVideoEpoch(surface: Surface) {
-        val lanes = client?.lanes ?: return
+        val lanes = activeAvLanes ?: return
         if (videoPaused) return
         if (videoEpoch != null) return
         if (!surface.isValid) {
@@ -2646,7 +2858,7 @@ class CarlinkManager(
 
         // Detach first so no further frames enter a pipe we are closing, then close to give the
         // consumer EOF, then flag the renderer, then wait for the codec to actually be released.
-        client?.lanes?.videoSeam?.attach(null)
+        activeAvLanes?.videoSeam?.attach(null)
         e.pipe.close()
         e.renderer.stop()
         runCatching { e.thread.join(1500) }
@@ -2696,7 +2908,7 @@ class CarlinkManager(
             logWarn("[LIFECYCLE] Deferred video start skipped — no valid surface", tag = Logger.Tags.VIDEO)
             return // stays deferred; the debounce or resumeVideo() will retry
         }
-        if (client?.lanes == null) {
+        if (activeAvLanes == null) {
             logDebug("[LIFECYCLE] Deferred video start skipped — no session yet", tag = Logger.Tags.VIDEO)
             return
         }

@@ -4,8 +4,8 @@ import java.util.concurrent.atomic.AtomicReference
 import zeno.gmccpa.pair.MfiRelay
 
 /**
- * Stable relay object for the native CarPlay receiver, whose lifetime can exceed a USB/OCBM
- * connection. Its delegate is replaced only after a new OCBM client has subscribed successfully.
+ * Stable relay object for the native CarPlay receiver, whose lifetime can exceed an OCBM
+ * connection. Its delegate is either the live adapter or the app's software signer.
  * Calls that race a replacement are rejected rather than returning a result from a retired link.
  */
 internal class RebindableMfiRelay : MfiRelay {
@@ -52,11 +52,11 @@ internal class RebindableMfiRelay : MfiRelay {
         call: (MfiRelay) -> ByteArray,
     ): ByteArray {
         val current = binding.get()
-            ?: throw IllegalStateException("MFi adapter unavailable during $operation request")
+            ?: throw IllegalStateException("MFi signer unavailable during $operation request")
         val result = call(current.delegate)
         if (binding.get() !== current) {
             throw IllegalStateException(
-                "MFi adapter session changed during $operation request " +
+                "MFi signer changed during $operation request " +
                     "(generation=${current.generation})",
             )
         }

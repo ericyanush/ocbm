@@ -148,6 +148,11 @@ internal fun ControlTabContent(
     }
     var bluetoothStatus by remember { mutableStateOf("Not checked") }
     var bluetoothPhones by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+    var appBluetoothSelected by remember(carlinkManager) { mutableStateOf(carlinkManager.appOwnedBluetoothEnabled) }
+    var selectedBluetoothPhone by remember(carlinkManager) { mutableStateOf(carlinkManager.appBluetoothPhone) }
+    var accessoryBluetoothAddress by remember(context) { mutableStateOf(AppBluetoothRfcomm(context).localAddressOverride().orEmpty()) }
+    var applyingSessionTransport by remember { mutableStateOf(false) }
+    var sessionTransportMessage by remember { mutableStateOf<String?>(null) }
     fun refreshBluetooth() {
         val result = runCatching { AppBluetoothRfcomm(context).readiness() }.getOrNull()
         bluetoothStatus = result?.detail ?: "Bluetooth service unavailable"
@@ -210,10 +215,10 @@ internal fun ControlTabContent(
                 OutlinedButton(onClick = { identityPicker.launch(arrayOf("*/*")) }) {
                     Text("Import identity files")
                 }
-                Text("The current adapter connection continues to use its hardware signer.", style = MaterialTheme.typography.bodySmall)
+                Text("Used when Android Bluetooth + software MFi is selected. Adapter mode uses its hardware signer.", style = MaterialTheme.typography.bodySmall)
             }
             ControlCard(title = "Android Bluetooth", icon = Icons.Default.SettingsInputComponent) {
-                Text("Checks whether this head unit exposes Bluetooth Classic and lists phones paired in Android system settings. This test does not advertise a Bluetooth service or make the head unit discoverable.")
+                Text("Lists phones paired in Android system settings. The app dials the selected phone's iAP2 RFCOMM service; it does not make the head unit discoverable.")
                 Text(bluetoothStatus, style = MaterialTheme.typography.bodyMedium)
                 OutlinedButton(onClick = {
                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
@@ -245,11 +250,57 @@ internal fun ControlTabContent(
                     }
                 }
             }
-            ControlCard(title = "CarPlay StartSession (experimental)", icon = Icons.Default.Wifi) {
+            ControlCard(title = "CarPlay session transport", icon = Icons.Default.SettingsInputComponent) {
+                Text("Choose who handles Bluetooth and MFi. Both options use the app's native Wi-Fi CarPlay receiver.")
+                listOf(false to "OCBM adapter", true to "Android Bluetooth + software MFi").forEach { (appMode, label) ->
+                    Row(modifier = Modifier.fillMaxWidth().clickable { appBluetoothSelected = appMode },
+                        verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(selected = appBluetoothSelected == appMode, onClick = { appBluetoothSelected = appMode })
+                        Text(label)
+                    }
+                }
+                if (appBluetoothSelected) {
+                    Text("Select a phone paired with Android Bluetooth. Import a software MFi identity before applying. Vehicle hotspot mode is required.")
+                    OutlinedTextField(
+                        value = accessoryBluetoothAddress,
+                        onValueChange = { accessoryBluetoothAddress = it },
+                        label = { Text("Accessory Bluetooth address (optional)") },
+                        supportingText = { Text("Use the head unit's Bluetooth MAC if Android masks it. Leave blank for a stable app-generated identity.") },
+                        isError = accessoryBluetoothAddress.isNotBlank() &&
+                            !accessoryBluetoothAddress.matches(Regex("(?i)[0-9a-f]{2}(:[0-9a-f]{2}){5}")),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (bluetoothPhones.isEmpty()) Text("Tap Check Android Bluetooth above to list paired phones.")
+                    bluetoothPhones.forEach { (address, name) ->
+                        Row(modifier = Modifier.fillMaxWidth().clickable { selectedBluetoothPhone = address },
+                            verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(selected = selectedBluetoothPhone == address, onClick = { selectedBluetoothPhone = address })
+                            Text("$name ($address)")
+                        }
+                    }
+                }
+                Button(
+                    enabled = !applyingSessionTransport && (!appBluetoothSelected ||
+                        (selectedBluetoothPhone != null && (accessoryBluetoothAddress.isBlank() ||
+                            accessoryBluetoothAddress.matches(Regex("(?i)[0-9a-f]{2}(:[0-9a-f]{2}){5}"))))),
+                    onClick = {
+                        if (appBluetoothSelected) AppBluetoothRfcomm(context).setLocalAddressOverride(accessoryBluetoothAddress.ifBlank { null })
+                        applyingSessionTransport = true
+                        identityScope.launch {
+                            try {
+                                val applied = carlinkManager.applySessionTransport(appBluetoothSelected, selectedBluetoothPhone)
+                                sessionTransportMessage = if (applied) "Session transport saved; connection restarted." else "Could not apply session transport; check the phone and Wi-Fi settings."
+                            } finally { applyingSessionTransport = false }
+                        }
+                    },
+                ) { Text(if (applyingSessionTransport) "Restarting…" else "Apply transport and reconnect") }
+                sessionTransportMessage?.let { Text(it) }
+            }
+            ControlCard(title = "Adapter iAP2 StartSession", icon = Icons.Default.Wifi) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(20.dp)) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Use iAP2 StartSession", style = MaterialTheme.typography.titleMedium)
-                        Text("Requires updated adapter firmware. Disables HTTP connection nudges. " +
+                        Text("Applies to OCBM adapter mode; Android Bluetooth always uses iAP2 StartSession. Requires updated adapter firmware. Disables HTTP connection nudges. " +
                             "Takes effect after a complete session restart; saving does not stop playback.",
                             style = MaterialTheme.typography.bodyMedium)
                     }
@@ -506,8 +557,9 @@ private fun AdapterCard(
     var applyingPort by remember(carlinkManager) { mutableStateOf(false) }
     var portMessage by remember(carlinkManager) { mutableStateOf<String?>(null) }
 
-    ControlCard(title = "Adapter", icon = Icons.Default.SettingsInputComponent, modifier = modifier) {
+    ControlCard(title = "Connection and receiver", icon = Icons.Default.SettingsInputComponent, modifier = modifier) {
         Text("USB connection path", style = MaterialTheme.typography.titleMedium)
+        if (carlinkManager.appOwnedBluetoothEnabled) Text("USB settings take effect when OCBM adapter transport is selected.")
         UsbTransportMode.entries.forEach { mode ->
             Row(
                 modifier = Modifier.fillMaxWidth().clickable { selectedUsbMode = mode },
@@ -632,37 +684,41 @@ private fun AdapterCard(
         ) { Text(if (applyingPort) "Restarting session…" else "Apply listener settings and reconnect") }
         portMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         Spacer(modifier = Modifier.height(16.dp))
-        Text(
-            text = "Connect phone to: ${carlinkManager.adapterName}",
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        BoxStatusLine(carlinkManager, Modifier.padding(top = 4.dp))
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Shown DISABLED rather than hidden: the control belongs on this card (carlink_native
-        // had it, and the driver expects it here), and a visible reason beats a missing button
-        // nobody can explain. Enabling it is the manager's capability flag flipping — no UI edit.
-        ControlButton(DISCONNECT_PHONE, enabled = connected && phoneDisconnectSupported, onClick = {
-            logWarn("[UI_ACTION] Disconnect Phone button clicked", tag = "UI")
-            carlinkManager.disconnectPhone()
-        })
-        if (!phoneDisconnectSupported) {
+        if (carlinkManager.appOwnedBluetoothEnabled) {
+            Text("Android Bluetooth phone: ${carlinkManager.appBluetoothPhone ?: "none selected"}",
+                style = MaterialTheme.typography.titleMedium)
+        } else {
             Text(
-                text = DISCONNECT_PHONE_UNSUPPORTED,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp),
+                text = "Connect phone to: ${carlinkManager.adapterName}",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
+            BoxStatusLine(carlinkManager, Modifier.padding(top = 4.dp))
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Shown DISABLED rather than hidden: the control belongs on this card (carlink_native
+            // had it, and the driver expects it here), and a visible reason beats a missing button.
+            ControlButton(DISCONNECT_PHONE, enabled = connected && phoneDisconnectSupported, onClick = {
+                logWarn("[UI_ACTION] Disconnect Phone button clicked", tag = "UI")
+                carlinkManager.disconnectPhone()
+            })
+            if (!phoneDisconnectSupported) {
+                Text(
+                    text = DISCONNECT_PHONE_UNSUPPORTED,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            ControlButton(RESTART_WIRELESS, enabled = connected, onClick = { confirm = AdapterConfirm.RESTART_WIRELESS })
+            Spacer(modifier = Modifier.height(12.dp))
+            ControlButton(REBOOT_ADAPTER, enabled = true, onClick = { confirm = AdapterConfirm.REBOOT })
+            Spacer(modifier = Modifier.height(12.dp))
+            ControlButton(DISCONNECT_ADAPTER, enabled = connected, onClick = { confirm = AdapterConfirm.DISCONNECT_ADAPTER })
         }
-        Spacer(modifier = Modifier.height(12.dp))
-        ControlButton(RESTART_WIRELESS, enabled = connected, onClick = { confirm = AdapterConfirm.RESTART_WIRELESS })
-        Spacer(modifier = Modifier.height(12.dp))
-        ControlButton(REBOOT_ADAPTER, enabled = true, onClick = { confirm = AdapterConfirm.REBOOT })
-        Spacer(modifier = Modifier.height(12.dp))
-        ControlButton(DISCONNECT_ADAPTER, enabled = connected, onClick = { confirm = AdapterConfirm.DISCONNECT_ADAPTER })
     }
 
     AdapterConfirmDialog(confirm, carlinkManager, scope, onDone = { confirm = null })
