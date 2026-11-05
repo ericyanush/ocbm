@@ -21,6 +21,13 @@ existing adapter path remains the default.
 - The **Test iAP2 auth** button on a paired device opens an app-owned RFCOMM socket, sends the iAP2
   detect/SYN, and handles 0xAA00/0xAA02/0xAA05 using the imported software signer. It stops after
   authentication. No private key material or challenge bytes are logged.
+- The probe now requests the phone's SDP UUIDs and waits up to 12 seconds for `ACTION_UUID` before
+  dialing, so service discovery and the RFCOMM connect do not race. It logs cached and reported
+  availability of DiPlay's phone service `00000000-deca-fade-deca-deafdecacafe` and the
+  `02030302-1d19-415f-86f2-22a2106a0a77` service captured from an iPhone by the OCBM adapter.
+  It tries the advertised service first, preferring DiPlay's when both appear; if that dial fails,
+  it tries the other service. Android may report cached UUIDs even after an SDP failure, so the
+  logged result is diagnostic, not proof that the phone currently exposes a service.
 
 ## On-device test
 
@@ -34,7 +41,8 @@ existing adapter path remains the default.
    when the system settings cannot pair a phone; in particular, an emulator reporting an enabled
    Bluetooth service does not establish that its virtual radio can pair a physical iPhone.
 4. Tap **Check Android Bluetooth**, grant the permission, then tap **Test iAP2 auth** for that phone.
-5. Export the regular app diagnostics. Look for `[APP_BT] iAP2 auth phase=`. `AUTHENTICATED` proves
+5. Export the regular app diagnostics. Look for `[APP_BT] SDP`, `[APP_BT] RFCOMM`, and
+   `[APP_BT] iAP2 auth phase=`. `AUTHENTICATED` proves
    app-owned Bluetooth and software iAP2 authentication on that head unit. It does not yet prove
    identify, Wi-Fi handoff, StartSession, or CarPlay streaming.
 

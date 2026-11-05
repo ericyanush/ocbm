@@ -227,9 +227,12 @@ internal fun ControlTabContent(
                             identityScope.launch {
                                 val result = kotlinx.coroutines.withContext(Dispatchers.IO) {
                                     runCatching {
-                                        AppBluetoothRfcomm(context).probeAuthentication(address, identityStore.load()) { phase ->
-                                            logInfo("[APP_BT] iAP2 auth phase=$phase", tag = "Bluetooth")
-                                        }
+                                        AppBluetoothRfcomm(context).probeAuthentication(
+                                            address,
+                                            identityStore.load(),
+                                            onPhase = { phase -> logInfo("[APP_BT] iAP2 auth phase=$phase", tag = "Bluetooth") },
+                                            onDiagnostic = { detail -> logInfo("[APP_BT] $detail", tag = "Bluetooth") },
+                                        )
                                     }
                                 }
                                 bluetoothStatus = result.fold(
