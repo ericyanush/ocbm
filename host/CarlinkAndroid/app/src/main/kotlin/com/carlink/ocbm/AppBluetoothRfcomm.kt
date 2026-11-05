@@ -15,6 +15,7 @@ import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
 import java.io.Closeable
 import java.io.IOException
+import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -28,6 +29,31 @@ class AppBluetoothRfcomm(private val context: Context) {
     private fun adapter(): BluetoothAdapter =
         context.getSystemService(BluetoothManager::class.java)?.adapter
             ?: throw IOException("Android Bluetooth service unavailable")
+
+    private val identityPrefs get() = context.getSharedPreferences("app_bluetooth_identity", Context.MODE_PRIVATE)
+
+    /** Android may mask the controller address. Keep an accessory ID stable across app restarts. */
+    fun localAddress(): String {
+        check(readiness().available) { "Android Bluetooth unavailable" }
+        val override = identityPrefs.getString("local_address", null)
+        if (override != null) return override
+        val actual = runCatching { adapter().address }.getOrNull()
+        if (actual != null && actual != "02:00:00:00:00:00") return actual
+        val saved = identityPrefs.getString("fallback_address", null)
+        if (saved != null) return saved
+        val bytes = ByteArray(6).also(SecureRandom()::nextBytes)
+        bytes[0] = ((bytes[0].toInt() and 0xFC) or 0x02).toByte()
+        val generated = bytes.joinToString(":") { "%02X".format(it.toInt() and 255) }
+        identityPrefs.edit().putString("fallback_address", generated).commit()
+        return generated
+    }
+
+    fun setLocalAddressOverride(address: String?) {
+        require(address == null || address.matches(Regex("(?i)[0-9a-f]{2}(:[0-9a-f]{2}){5}")))
+        identityPrefs.edit().putString("local_address", address?.uppercase()).apply()
+    }
+
+    fun localAddressOverride(): String? = identityPrefs.getString("local_address", null)
 
     fun readiness(): Readiness {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) !=
@@ -70,13 +96,40 @@ class AppBluetoothRfcomm(private val context: Context) {
         signer: SoftwareMfiSigner,
         onPhase: (AppIap2AuthSession.Phase) -> Unit = {},
         onDiagnostic: (String) -> Unit = {},
-    ): String {
+    ): String = connectAuthenticated(address, signer, onPhase, onDiagnostic).use { "AUTHENTICATED" }
+
+    internal class AuthenticatedLink(val socket: Link, val session: AppIap2AuthSession) : Closeable {
+        override fun close() = socket.close()
+    }
+
+    internal fun connectAuthenticated(
+        address: String,
+        signer: SoftwareMfiSigner,
+        onPhase: (AppIap2AuthSession.Phase) -> Unit = {},
+        onDiagnostic: (String) -> Unit = {},
+        onLinkOpened: (Link) -> Unit = {},
+    ): AuthenticatedLink {
+        val socket = connectPhone(address, onDiagnostic)
+        try {
+            onLinkOpened(socket)
+            val session = AppIap2AuthSession(signer)
+            check(authenticate(socket, session, onPhase) == AppIap2AuthSession.Phase.AUTHENTICATED.name) {
+                "iAP2 authentication was rejected"
+            }
+            return AuthenticatedLink(socket, session)
+        } catch (error: Throwable) {
+            socket.close()
+            throw error
+        }
+    }
+
+    private fun connectPhone(address: String, onDiagnostic: (String) -> Unit): Link {
         val device = adapter().getRemoteDevice(address)
         check(device.bondState == BluetoothDevice.BOND_BONDED) { "Phone is not paired with Android Bluetooth" }
         val services = discoverServices(device, onDiagnostic)
-        // DiPlay/carlink-fenyx use the iPhone's ...cafe record. An OCBM phone SDP capture also
-        // found a "Wireless iAP v2" record at 02030302...; try it if the first dial fails.
-        val candidates = listOf(DIPLAY_PHONE_SERVICE, IAP2_V2_PHONE_SERVICE).sortedBy {
+        // The tested phone accepted the Wireless iAP v2 record. Keep the ...cafe record as a
+        // fallback for phones that expose only the DiPlay/carlink-fenyx service.
+        val candidates = listOf(IAP2_V2_PHONE_SERVICE, DIPLAY_PHONE_SERVICE).sortedBy {
             if (it in services) 0 else 1
         }
         var lastConnectError: IOException? = null
@@ -90,17 +143,16 @@ class AppBluetoothRfcomm(private val context: Context) {
                 continue
             }
             onDiagnostic("RFCOMM connected service=$service; starting iAP2 authentication")
-            return socket.use { link -> authenticate(link, signer, onPhase) }
+            return socket
         }
         throw IOException("RFCOMM could not connect using either phone service", lastConnectError)
     }
 
     private fun authenticate(
         socket: Link,
-        signer: SoftwareMfiSigner,
+        session: AppIap2AuthSession,
         onPhase: (AppIap2AuthSession.Phase) -> Unit,
     ): String {
-        val session = AppIap2AuthSession(signer)
         val deadline = Executors.newSingleThreadScheduledExecutor()
         val closeTask = deadline.schedule({ runCatching { socket.close() } }, 30, TimeUnit.SECONDS)
         try {

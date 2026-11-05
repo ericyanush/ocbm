@@ -35,6 +35,19 @@ class AppIap2AuthSessionTest {
         assertEquals(AppIap2AuthSession.Phase.AUTHENTICATED, session.phase)
     }
 
+    @Test
+    fun `identification request coalesced with auth success remains queued`() {
+        val session = AppIap2AuthSession(FakeSigner())
+        session.begin()
+        val phone = AppIap2Link().also { it.begin() }
+        session.receive(phone.message(0xAA00, byteArrayOf()))
+        session.receive(phone.message(0xAA02, byteArrayOf(0, 36, 0, 0) + ByteArray(32)))
+        session.receive(phone.message(0xAA05, byteArrayOf()) + phone.message(0x1D00, byteArrayOf(7)))
+        assertEquals(AppIap2AuthSession.Phase.AUTHENTICATED, session.phase)
+        assertEquals(0x1D00, session.drainMessages().single().id)
+        assertTrue(session.drainMessages().isEmpty())
+    }
+
     private class FakeSigner : MfiRelay {
         var lastDigest = byteArrayOf()
         override fun protocolMajor() = 3

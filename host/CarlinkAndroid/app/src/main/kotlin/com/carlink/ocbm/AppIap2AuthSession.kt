@@ -5,11 +5,17 @@ import zeno.gmccpa.pair.MfiRelay
 /** App-owned iAP2 authentication plane. All calls run on one RFCOMM worker. */
 internal class AppIap2AuthSession(private val signer: MfiRelay) {
     enum class Phase { INITIAL, CERT_SENT, SIGN_SENT, AUTHENTICATED, FAILED }
+    data class Message(val id: Int, val body: ByteArray)
     private val link = AppIap2Link()
+    private val messages = ArrayDeque<Message>()
     var phase = Phase.INITIAL
         private set
 
     fun begin(): ByteArray = link.begin()
+    fun message(id: Int, body: ByteArray): ByteArray = link.message(id, body)
+    fun drainMessages(): List<Message> = buildList {
+        while (messages.isNotEmpty()) add(messages.removeFirst())
+    }
 
     /** Returns link packets to write in order. A signer failure leaves the current phase intact. */
     fun receive(bytes: ByteArray): List<ByteArray> {
@@ -40,6 +46,7 @@ internal class AppIap2AuthSession(private val signer: MfiRelay) {
                 }
                 0xAA05 -> if (phase >= Phase.SIGN_SENT && phase != Phase.FAILED) phase = Phase.AUTHENTICATED
                 0xAA04 -> phase = Phase.FAILED
+                else -> messages.addLast(Message(id, packet.body))
             }
         }
         return replies
