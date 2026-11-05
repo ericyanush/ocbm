@@ -46,7 +46,11 @@ class AppBluetoothRfcomm(private val context: Context) {
             Link(socket)
         } catch (error: Exception) {
             runCatching { socket.close() }
-            throw IOException("RFCOMM connect failed", error)
+            throw IOException(
+                "RFCOMM connect to phone iAP2 service $IAP2_SERVICE failed: " +
+                    "${error.javaClass.simpleName}: ${error.message ?: "no detail"}",
+                error,
+            )
         } finally {
             closeTask.cancel(false)
             timeout.shutdownNow()
