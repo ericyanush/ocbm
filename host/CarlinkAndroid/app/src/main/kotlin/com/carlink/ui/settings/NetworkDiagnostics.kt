@@ -124,8 +124,6 @@ internal fun NetworkDiagnosticsTabContent(carlinkManager: CarlinkManager) {
     val scope = rememberCoroutineScope()
     var snapshot by remember { mutableStateOf<NetworkSnapshot?>(null) }
     var refreshing by remember { mutableStateOf(false) }
-    var testingTcp by remember { mutableStateOf(false) }
-    var tcpResults by remember { mutableStateOf<List<String>>(emptyList()) }
     var outboundHost by remember { mutableStateOf("") }
     var outboundPort by remember { mutableStateOf("8081") }
     var testingOutbound by remember { mutableStateOf(false) }
@@ -164,33 +162,6 @@ internal fun NetworkDiagnosticsTabContent(carlinkManager: CarlinkManager) {
         )
         Button(onClick = { refresh(logSnapshot = true) }, enabled = !refreshing) {
             Text(if (refreshing) "Refreshing…" else "Refresh and record snapshot")
-        }
-        InboundTcpTestContent()
-        LocalHotspotTestContent()
-        ControlCard(title = "CarPlay TCP self-test", icon = Icons.Default.Wifi) {
-            Text("Tests CarPlay control port ${carlinkManager.carPlayControlPort} on this head unit through loopback and the current vehicle hotspot bridge. " +
-                "Results are saved in Logs. A local connection does not prove that hotspot clients can reach the app.",
-                style = MaterialTheme.typography.bodyMedium)
-            Button(
-                enabled = !testingTcp,
-                modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight),
-                onClick = {
-                    testingTcp = true
-                    tcpResults = emptyList()
-                    scope.launch {
-                        try {
-                            val result = withContext(Dispatchers.IO) {
-                                collectNetworkSnapshot(context).asLogLines().forEach { logInfo(it, tag = "NETWORK") }
-                                runTcpSelfTest(carlinkManager.carPlayControlPort)
-                            }
-                            tcpResults = result
-                        } finally {
-                            testingTcp = false
-                        }
-                    }
-                },
-            ) { Text(if (testingTcp) "Testing TCP…" else "Run TCP self-test") }
-            tcpResults.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
         }
         ControlCard(title = "Outbound TCP test", icon = Icons.Default.Wifi) {
             Text("On a computer connected to the same network, run nc -l 8081. Enter that computer's IPv4 address " +
@@ -299,35 +270,6 @@ internal fun NetworkDiagnosticsTabContent(carlinkManager: CarlinkManager) {
             }
         } ?: Text("Collecting interface information…")
     }
-}
-
-private fun runTcpSelfTest(port: Int): List<String> {
-    val runId = System.currentTimeMillis()
-    val results = mutableListOf<String>()
-    fun record(message: String) {
-        results += message
-        logInfo("[TCP_SELF_TEST] run=$runId $message", tag = "NETWORK")
-    }
-    record("Started ${DateFormat.getDateTimeInstance().format(Date())}; port=$port timeout=3000ms per address")
-    for (address in listOf("127.0.0.1", "::1")) {
-        record("Loopback: ${ReceiverTcpDiagnostics.connect(InetAddress.getByName(address), port)}")
-    }
-    val bridge = runCatching { StartSessionHotspot.select(StartSessionHotspot.snapshot()) }
-    bridge.fold(
-        onSuccess = { iface ->
-            record("Hotspot bridge=${iface.name} up=${iface.up}")
-            iface.addresses.filter {
-                !it.isAnyLocalAddress && !it.isLoopbackAddress && !it.isMulticastAddress &&
-                    (it is Inet4Address || it is Inet6Address && it.isLinkLocalAddress)
-            }.distinctBy { it.hostAddress }.forEach { address ->
-                // Keep the original Inet6Address, including its interface scope.
-                record("Hotspot ${iface.name}: ${ReceiverTcpDiagnostics.connect(address, port)}")
-            }
-        },
-        onFailure = { record("Hotspot unavailable: ${it.javaClass.simpleName}: ${it.message}") },
-    )
-    record("Finished; compare these local results with external phone/Mac TCP tests")
-    return results
 }
 
 private fun collectNetworkSnapshot(context: Context): NetworkSnapshot {
