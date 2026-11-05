@@ -66,12 +66,23 @@ class AppBluetoothRfcomm(private val context: Context) {
     }
 
     /** Call on a worker thread. Closing [Link] interrupts a blocked read on disconnect. */
-    fun dial(address: String, service: UUID = DIPLAY_PHONE_SERVICE, timeoutMs: Long = 15_000): Link {
+    fun dial(
+        address: String,
+        service: UUID = DIPLAY_PHONE_SERVICE,
+        timeoutMs: Long = 15_000,
+        onSocketCreated: (BluetoothSocket) -> Unit = {},
+    ): Link {
         require(timeoutMs in 1_000..60_000)
         check(readiness().available) { "Android Bluetooth unavailable" }
         val device = adapter().getRemoteDevice(address)
         check(device.bondState == BluetoothDevice.BOND_BONDED) { "Phone is not paired with Android Bluetooth" }
         val socket = device.createRfcommSocketToServiceRecord(service)
+        try {
+            onSocketCreated(socket)
+        } catch (error: Throwable) {
+            runCatching { socket.close() }
+            throw error
+        }
         val timeout = Executors.newSingleThreadScheduledExecutor()
         val closeTask = timeout.schedule({ runCatching { socket.close() } }, timeoutMs, TimeUnit.MILLISECONDS)
         return try {
@@ -108,8 +119,10 @@ class AppBluetoothRfcomm(private val context: Context) {
         onPhase: (AppIap2AuthSession.Phase) -> Unit = {},
         onDiagnostic: (String) -> Unit = {},
         onLinkOpened: (Link) -> Unit = {},
+        isCurrent: () -> Boolean = { true },
+        onSocketCreated: (BluetoothSocket) -> Unit = {},
     ): AuthenticatedLink {
-        val socket = connectPhone(address, onDiagnostic)
+        val socket = connectPhone(address, onDiagnostic, isCurrent, onSocketCreated)
         try {
             onLinkOpened(socket)
             val session = AppIap2AuthSession(signer)
@@ -123,10 +136,21 @@ class AppBluetoothRfcomm(private val context: Context) {
         }
     }
 
-    private fun connectPhone(address: String, onDiagnostic: (String) -> Unit): Link {
+    private fun connectPhone(
+        address: String,
+        onDiagnostic: (String) -> Unit,
+        isCurrent: () -> Boolean,
+        onSocketCreated: (BluetoothSocket) -> Unit,
+    ): Link {
+        fun ensureCurrent() {
+            if (!isCurrent()) throw IOException("Bluetooth connection attempt was cancelled")
+        }
+        ensureCurrent()
         val device = adapter().getRemoteDevice(address)
         check(device.bondState == BluetoothDevice.BOND_BONDED) { "Phone is not paired with Android Bluetooth" }
         val services = discoverServices(device, onDiagnostic)
+        // SDP waits on a blocking Android callback. A reset can retire this session while it waits.
+        ensureCurrent()
         // The tested phone accepted the Wireless iAP v2 record. Keep the ...cafe record as a
         // fallback for phones that expose only the DiPlay/carlink-fenyx service.
         val candidates = listOf(IAP2_V2_PHONE_SERVICE, DIPLAY_PHONE_SERVICE).sortedBy {
@@ -134,9 +158,10 @@ class AppBluetoothRfcomm(private val context: Context) {
         }
         var lastConnectError: IOException? = null
         for (service in candidates) {
+            ensureCurrent()
             onDiagnostic("RFCOMM dialing service=$service advertised=${service in services}")
             val socket = try {
-                dial(address, service)
+                dial(address, service, onSocketCreated = onSocketCreated)
             } catch (error: IOException) {
                 lastConnectError = error
                 onDiagnostic("RFCOMM dial failed service=$service cause=${error.message}")

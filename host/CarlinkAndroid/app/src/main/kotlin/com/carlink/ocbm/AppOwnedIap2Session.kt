@@ -1,6 +1,7 @@
 package com.carlink.ocbm
 
 import android.content.Context
+import android.bluetooth.BluetoothSocket
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.IOException
@@ -21,6 +22,7 @@ internal class AppOwnedIap2Session(
 ) : Closeable {
     private val bluetooth = AppBluetoothRfcomm(context)
     private val pending = AtomicReference<AppBluetoothRfcomm.Link?>()
+    private val pendingDial = AtomicReference<BluetoothSocket?>()
     private val active = AtomicReference<AppBluetoothRfcomm.AuthenticatedLink?>()
     @Volatile private var closed = false
     @Volatile var startSessionSent = false
@@ -34,7 +36,13 @@ internal class AppOwnedIap2Session(
             phoneAddress, signer,
             onPhase = { log("iAP2 auth phase=$it") },
             onDiagnostic = log,
+            isCurrent = { !closed },
+            onSocketCreated = { socket ->
+                pendingDial.set(socket)
+                if (closed) socket.close()
+            },
             onLinkOpened = { link ->
+                pendingDial.set(null)
                 pending.set(link)
                 if (closed) link.close()
             },
@@ -101,6 +109,7 @@ internal class AppOwnedIap2Session(
 
     override fun close() {
         closed = true
+        pendingDial.getAndSet(null)?.close()
         pending.getAndSet(null)?.close()
         active.getAndSet(null)?.close()
     }
