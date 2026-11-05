@@ -213,7 +213,7 @@ internal fun ControlTabContent(
                 Text("The current adapter connection continues to use its hardware signer.", style = MaterialTheme.typography.bodySmall)
             }
             ControlCard(title = "Android Bluetooth", icon = Icons.Default.SettingsInputComponent) {
-                Text("Checks whether this head unit exposes Bluetooth Classic to the app. This check does not connect to a phone.")
+                Text("Checks whether this head unit exposes Bluetooth Classic and lists phones paired in Android system settings. This test does not advertise a Bluetooth service or make the head unit discoverable.")
                 Text(bluetoothStatus, style = MaterialTheme.typography.bodyMedium)
                 OutlinedButton(onClick = {
                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {

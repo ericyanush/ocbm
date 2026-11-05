@@ -15,7 +15,9 @@ existing adapter path remains the default.
 - The receiver's MFi relay accepts protocol 2 (adapter SHA-1/RSA) and protocol 3 (local
   SHA-256/P-256) digest/signature sizes. MFi-SAP has a protocol-3 test vector.
 - Android Bluetooth Classic access is permission-gated. Settings → Control → Android Bluetooth
-  reports whether the Android Bluetooth service and paired devices are available.
+  reports whether the Android Bluetooth service and paired devices are available. This check does
+  not make Android discoverable or advertise an iAP2 service. A radio reporting "ready" with zero
+  paired devices does not establish that a phone can connect to it.
 - The **Test iAP2 auth** button on a paired device opens an app-owned RFCOMM socket, sends the iAP2
   detect/SYN, and handles 0xAA00/0xAA02/0xAA05 using the imported software signer. It stops after
   authentication. No private key material or challenge bytes are logged.
@@ -25,8 +27,12 @@ existing adapter path remains the default.
 1. Build/install the sideload or Play app on the target AAOS head unit.
 2. Import the two identity files in Settings → Control (select both in one action), or build the
    APK explicitly with `./gradlew :app:assembleSideloadDebug -PbundleOfflineMfi=true`.
-3. Stop any active CarPlay session and pair an iPhone to **Android's** Bluetooth radio. The phone
-   being paired to the adapter's separate Bluetooth radio does not populate Android's bonded list.
+3. Stop any active CarPlay session and pair an iPhone to **Android's** Bluetooth radio using the
+   head unit's system Bluetooth settings, if that head unit exposes pairing. The phone being paired
+   to the adapter's separate Bluetooth radio does not populate Android's bonded list. This app
+   currently has no discoverable pairing mode or inbound iAP2 listener, so the test cannot start
+   when the system settings cannot pair a phone; in particular, an emulator reporting an enabled
+   Bluetooth service does not establish that its virtual radio can pair a physical iPhone.
 4. Tap **Check Android Bluetooth**, grant the permission, then tap **Test iAP2 auth** for that phone.
 5. Export the regular app diagnostics. Look for `[APP_BT] iAP2 auth phase=`. `AUTHENTICATED` proves
    app-owned Bluetooth and software iAP2 authentication on that head unit. It does not yet prove

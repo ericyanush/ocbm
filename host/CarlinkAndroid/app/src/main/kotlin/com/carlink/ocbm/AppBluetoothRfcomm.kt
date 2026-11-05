@@ -95,6 +95,8 @@ class AppBluetoothRfcomm(private val context: Context) {
     }
 
     companion object {
-        private val IAP2_SERVICE = UUID.fromString("00000000-deca-fade-deca-deafdecacafe")
+        // iOS advertises this phone-side "Wireless iAP v2" service for accessory-initiated reconnect.
+        // The accessory-side iAP2 service is ...decacaff; ...decacafe is iOS's distinct iAP5 service.
+        private val IAP2_SERVICE = UUID.fromString("02030302-1d19-415f-86f2-22a2106a0a77")
     }
 }
