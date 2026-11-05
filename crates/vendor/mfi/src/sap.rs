@@ -122,8 +122,17 @@ impl MfiSapServer {
         let aes_key = sha1_of(&[b"AES-KEY", &shared[..]]);
         let aes_iv = sha1_of(&[b"AES-IV", &shared[..]]);
         // The MFi chip signs SHA1(ourPK ‖ peerPK); the cert lets the phone verify it.
-        let digest = sha1_of(&[our_pk.as_bytes(), &peer]);
-
+        let digest = match signer.protocol_major() {
+            2 => sha1_of(&[our_pk.as_bytes(), &peer]).to_vec(),
+            3 => {
+                use sha2::Digest;
+                let mut hash = sha2::Sha256::new();
+                hash.update(our_pk.as_bytes());
+                hash.update(peer);
+                hash.finalize().to_vec()
+            }
+            version => return Err(SapError::Version(version)),
+        };
         let mut sig = signer.create_signature(&digest).map_err(SapError::Signer)?;
         let cert = signer.copy_certificate().map_err(SapError::Signer)?;
 

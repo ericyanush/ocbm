@@ -75,6 +75,37 @@ fn rejects_bad_version_and_length() {
         .is_err());
 }
 
+struct V3Signer;
+impl MfiSigner for V3Signer {
+    fn protocol_major(&self) -> u8 { 3 }
+    fn copy_certificate(&mut self) -> io::Result<Vec<u8>> { Ok(vec![0x30, 0x00]) }
+    fn create_signature(&mut self, digest: &[u8]) -> io::Result<Vec<u8>> {
+        assert_eq!(digest.len(), 32);
+        Ok(digest.repeat(2))
+    }
+}
+
+#[test]
+fn v3_uses_sha256_and_64_byte_signature() {
+    use sha2::{Digest, Sha256};
+    let sk = [9u8; 32];
+    let peer = [3u8; 32];
+    let mut m1 = vec![VERSION1];
+    m1.extend_from_slice(&peer);
+    let m2 = MfiSapServer::new().exchange_with_secret(&m1, &mut V3Signer, sk).unwrap();
+    let our_pk = &m2[..32];
+    assert_eq!(&m2[32..36], &[0, 0, 0, 2]);
+    assert_eq!(&m2[36..38], &[0x30, 0]);
+    assert_eq!(&m2[38..42], &[0, 0, 0, 64]);
+    let shared = StaticSecret::from(sk).diffie_hellman(&PublicKey::from(peer));
+    let key = sha1(&[b"AES-KEY", shared.as_bytes()]);
+    let iv = sha1(&[b"AES-IV", shared.as_bytes()]);
+    let mut decrypted = m2[42..].to_vec();
+    Aes128Ctr::new_from_slices(&key[..16], &iv[..16]).unwrap().apply_keystream(&mut decrypted);
+    let digest = Sha256::digest([our_pk, &peer].concat());
+    assert_eq!(decrypted, digest.repeat(2));
+}
+
 fn sha1(parts: &[&[u8]]) -> [u8; 20] {
     let mut h = Sha1::new();
     for p in parts {

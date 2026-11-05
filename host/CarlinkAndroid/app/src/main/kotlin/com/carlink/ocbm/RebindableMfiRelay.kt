@@ -32,6 +32,9 @@ internal class RebindableMfiRelay : MfiRelay {
         binding.set(null)
     }
 
+    override fun protocolMajor(): Int = binding.get()?.delegate?.protocolMajor()
+        ?: throw IllegalStateException("MFi signer unavailable during protocol selection")
+
     override fun copyCertificate(): ByteArray =
         invoke("certificate") { it.copyCertificate() }
 

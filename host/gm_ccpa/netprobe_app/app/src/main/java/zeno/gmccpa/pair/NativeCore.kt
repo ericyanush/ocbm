@@ -210,6 +210,8 @@ object NativeCore {
  * changes — `call_method` resolves them by name and would fail at runtime without them.
  */
 interface MfiRelay {
+    /** MFi authentication generation: 2 for the adapter chip, 3 for P-256 software identity. */
+    fun protocolMajor(): Int = 2
     fun copyCertificate(): ByteArray
     fun createSignature(digest: ByteArray): ByteArray
 

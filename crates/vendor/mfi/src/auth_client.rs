@@ -8,6 +8,8 @@ use std::io;
 /// Supplies the MFi certificate + RSA signatures (the genuine MFi chip on the CCPA, reached directly
 /// over local I2C). Abstracted as a trait so the MFi-SAP server can be unit-tested with a mock signer.
 pub trait MfiSigner {
+    /// Authentication protocol major; existing adapter-backed implementations use version 2.
+    fn protocol_major(&self) -> u8 { 2 }
     /// The accessory's MFi certificate (DER), used by the phone to verify the signature.
     fn copy_certificate(&mut self) -> io::Result<Vec<u8>>;
     /// RSA signature over a 20-byte SHA-1 digest.

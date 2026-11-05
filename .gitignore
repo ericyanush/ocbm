@@ -8,6 +8,10 @@
 /reference
 /scratchpad
 /old
+/carplay-certs/
+**/offline-mfi/
+*.pk8
+*.p7b
 /.serena
 * [0-9].*
 * [0-9]

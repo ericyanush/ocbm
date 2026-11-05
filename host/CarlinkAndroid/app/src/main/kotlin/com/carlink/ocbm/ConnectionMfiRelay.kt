@@ -10,6 +10,10 @@ internal class ConnectionMfiRelay(
     private val ensureCurrent: () -> Unit,
     private val log: (String) -> Unit = {},
 ) : MfiRelay {
+    override fun protocolMajor(): Int {
+        ensureCurrent()
+        return delegate.protocolMajor().also { ensureCurrent() }
+    }
     private val certificateLock = Any()
     private var certificate: ByteArray? = null
 

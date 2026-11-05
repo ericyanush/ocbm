@@ -48,6 +48,22 @@ class RebindableMfiRelayTest {
     }
 
     @Test
+    fun `protocol follows the bound signer and fails closed when cleared`() {
+        val relay = RebindableMfiRelay()
+        assertThrows(IllegalStateException::class.java) { relay.protocolMajor() }
+        relay.bind(1, FakeRelay(byteArrayOf(1)))
+        assertEquals(2, relay.protocolMajor())
+        relay.bind(2, object : MfiRelay {
+            override fun protocolMajor() = 3
+            override fun copyCertificate() = byteArrayOf(1)
+            override fun createSignature(digest: ByteArray) = byteArrayOf(2)
+        })
+        assertEquals(3, relay.protocolMajor())
+        relay.clear(2)
+        assertThrows(IllegalStateException::class.java) { relay.protocolMajor() }
+    }
+
+    @Test
     fun `does not return a response from a relay replaced during the operation`() {
         val relay = RebindableMfiRelay()
         val entered = CountDownLatch(1)

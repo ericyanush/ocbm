@@ -278,6 +278,18 @@ impl RemoteMfiSigner {
 }
 
 impl MfiSigner for RemoteMfiSigner {
+    fn protocol_major(&self) -> u8 {
+        let Some(vm) = JVM.get() else { return 0 };
+        let Ok(mut env) = vm.attach_current_thread() else { return 0 };
+        let result = env.call_method(&self.relay, "protocolMajor", "()I", &[]);
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+            return 0;
+        }
+        result.ok().and_then(|v| v.i().ok()).and_then(|v| u8::try_from(v).ok()).unwrap_or(0)
+    }
+
     fn copy_certificate(&mut self) -> io::Result<Vec<u8>> {
         let m = if self.fast { "copyCertificateFast" } else { "copyCertificate" };
         let cert = self.call(m, "()[B", None)?;
@@ -286,18 +298,23 @@ impl MfiSigner for RemoteMfiSigner {
     }
 
     fn create_signature(&mut self, digest: &[u8]) -> io::Result<Vec<u8>> {
-        if digest.len() != mfi::DIGEST_LEN {
+        let (digest_len, signature_len) = match self.protocol_major() {
+            2 => (mfi::DIGEST_LEN, mfi::SIG_LEN),
+            3 => (32, 64),
+            version => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unsupported MFi protocol {version}"))),
+        };
+        if digest.len() != digest_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("digest must be {} bytes, got {}", mfi::DIGEST_LEN, digest.len()),
+                format!("digest must be {} bytes, got {}", digest_len, digest.len()),
             ));
         }
         let m = if self.fast { "createSignatureFast" } else { "createSignature" };
         let sig = self.call(m, "([B)[B", Some(digest))?;
-        if sig.len() != mfi::SIG_LEN {
+        if sig.len() != signature_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("signature must be {} bytes, got {}", mfi::SIG_LEN, sig.len()),
+                format!("signature must be {} bytes, got {}", signature_len, sig.len()),
             ));
         }
         println!("[jni] MFi signature via OCBM relay: {} bytes", sig.len());
