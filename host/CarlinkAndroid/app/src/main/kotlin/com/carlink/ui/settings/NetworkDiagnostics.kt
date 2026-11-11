@@ -23,6 +23,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import com.carlink.logging.logInfo
 import com.carlink.CarlinkManager
 import com.carlink.diagnostics.outboundTcpProbe
+import com.carlink.diagnostics.PiProxyPoc
 import com.carlink.ocbm.StartSessionHotspot
 import com.carlink.ui.components.ControlCard
 import com.carlink.ui.theme.AutomotiveDimens
@@ -128,6 +130,17 @@ internal fun NetworkDiagnosticsTabContent(carlinkManager: CarlinkManager) {
     var outboundPort by remember { mutableStateOf("8081") }
     var testingOutbound by remember { mutableStateOf(false) }
     var outboundResult by remember { mutableStateOf<String?>(null) }
+    var piHost by remember { mutableStateOf("") }
+    var piPort by remember { mutableStateOf("5101") }
+    var piToken by remember { mutableStateOf("") }
+    var piStatus by remember { mutableStateOf("Stopped") }
+    val piProxyPoc = remember {
+        PiProxyPoc { event ->
+            logInfo("[PI_PROXY_POC] $event", tag = "NETWORK")
+            scope.launch { piStatus = event }
+        }
+    }
+    DisposableEffect(piProxyPoc) { onDispose { piProxyPoc.close() } }
 
     fun refresh(logSnapshot: Boolean) {
         if (refreshing) return
@@ -211,6 +224,39 @@ internal fun NetworkDiagnosticsTabContent(carlinkManager: CarlinkManager) {
                 },
             ) { Text(if (testingOutbound) "Connecting…" else "Run outbound TCP test") }
             outboundResult?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        }
+        ControlCard(title = "Pi Wi-Fi proxy PoC", icon = Icons.Default.Wifi) {
+            Text("AAOS opens a persistent outbound link to the Pi on the vehicle hotspot. " +
+                "A phone on the Pi AP can then request a test page supplied by this app. " +
+                "This tests the network path only; it does not start CarPlay.",
+                style = MaterialTheme.typography.bodyMedium)
+            OutlinedTextField(
+                value = piHost, onValueChange = { piHost = it }, label = { Text("Pi vehicle-hotspot IPv4") },
+                singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            )
+            OutlinedTextField(
+                value = piPort, onValueChange = { piPort = it }, label = { Text("Pi tunnel port") },
+                singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            )
+            OutlinedTextField(
+                value = piToken, onValueChange = { piToken = it }, label = { Text("Shared test token") },
+                singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                Button(onClick = {
+                    piStatus = runCatching { piProxyPoc.start(piHost.trim(), piPort.toIntOrNull() ?: 0, piToken) }
+                        .fold({ "Connecting…" }, { "FAIL ${it.message}" })
+                }, modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight)) {
+                    Text("Start Pi proxy test")
+                }
+                Button(onClick = { piProxyPoc.close() }, modifier = Modifier.heightIn(min = AutomotiveDimens.ButtonMinHeight)) {
+                    Text("Stop")
+                }
+            }
+            Text(piStatus, style = MaterialTheme.typography.bodySmall)
         }
         snapshot?.let { current ->
             Text("Captured ${current.capturedAt}", style = MaterialTheme.typography.bodySmall)
