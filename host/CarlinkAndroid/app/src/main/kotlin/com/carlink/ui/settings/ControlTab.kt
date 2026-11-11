@@ -71,7 +71,6 @@ import com.carlink.ocbm.UsbAdapterIdentity
 import com.carlink.ocbm.CarPlayFrameRate
 import com.carlink.ocbm.CarPlayNetworkMode
 import com.carlink.ocbm.SoftwareMfiIdentityStore
-import com.carlink.ocbm.AppBluetoothRfcomm
 import com.carlink.navigation.ClusterNavigationController
 import com.carlink.ui.settings.LaneGuidanceStore
 import com.carlink.ui.settings.TurnAlertStore
@@ -146,21 +145,15 @@ internal fun ControlTabContent(
             }
         }
     }
-    var bluetoothStatus by remember { mutableStateOf("Not checked") }
-    var bluetoothPhones by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
-    var appBluetoothSelected by remember(carlinkManager) { mutableStateOf(carlinkManager.appOwnedBluetoothEnabled) }
+    var piBluetoothStatus by remember { mutableStateOf("Not checked") }
+    var piBluetoothPhones by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+    var piConnectedPhones by remember { mutableStateOf(emptySet<String>()) }
+    var piAdvertisedName by remember { mutableStateOf("Carlink-Pi") }
+    var piForgetCandidate by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var piModeApplied by remember(carlinkManager) { mutableStateOf(carlinkManager.carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) }
     var selectedBluetoothPhone by remember(carlinkManager) { mutableStateOf(carlinkManager.appBluetoothPhone) }
-    var accessoryBluetoothAddress by remember(context) { mutableStateOf(AppBluetoothRfcomm(context).localAddressOverride().orEmpty()) }
     var applyingSessionTransport by remember { mutableStateOf(false) }
     var sessionTransportMessage by remember { mutableStateOf<String?>(null) }
-    fun refreshBluetooth() {
-        val result = runCatching { AppBluetoothRfcomm(context).readiness() }.getOrNull()
-        bluetoothStatus = result?.detail ?: "Bluetooth service unavailable"
-        bluetoothPhones = result?.pairedPhones.orEmpty()
-    }
-    val bluetoothPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) refreshBluetooth() else bluetoothStatus = "Bluetooth permission denied"
-    }
     var gpsEnabled by remember(carlinkManager) { mutableStateOf(carlinkManager.gpsForwardingEnabled) }
     var callNotificationMode by remember(carlinkManager) { mutableStateOf(carlinkManager.callNotificationMode) }
     var microphoneSource by remember(carlinkManager) { mutableStateOf(carlinkManager.microphoneSource) }
@@ -202,11 +195,11 @@ internal fun ControlTabContent(
         ) {
             if (twoPane) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    AdapterCard(carlinkManager, connected, Modifier.weight(1f))
+                    AdapterCard(carlinkManager, connected, Modifier.weight(1f), onNetworkModeApplied = { piModeApplied = it == CarPlayNetworkMode.PI_WIFI_PROXY })
                     AppControlCard(carlinkManager, connected, displayMode, onDisplayModeSelected, Modifier.weight(1f))
                 }
             } else {
-                AdapterCard(carlinkManager, connected, Modifier.fillMaxWidth())
+                AdapterCard(carlinkManager, connected, Modifier.fillMaxWidth(), onNetworkModeApplied = { piModeApplied = it == CarPlayNetworkMode.PI_WIFI_PROXY })
                 AppControlCard(carlinkManager, connected, displayMode, onDisplayModeSelected, Modifier.fillMaxWidth())
             }
             ControlCard(title = "Software MFi identity", icon = Icons.Default.SettingsInputComponent) {
@@ -215,63 +208,76 @@ internal fun ControlTabContent(
                 OutlinedButton(onClick = { identityPicker.launch(arrayOf("*/*")) }) {
                     Text("Import identity files")
                 }
-                Text("Used when Android Bluetooth + software MFi is selected. Adapter mode uses its hardware signer.", style = MaterialTheme.typography.bodySmall)
+                Text("Used with Android or Pi Bluetooth. Adapter mode uses its hardware signer.", style = MaterialTheme.typography.bodySmall)
             }
-            ControlCard(title = "Android Bluetooth", icon = Icons.Default.SettingsInputComponent) {
-                Text("Lists phones paired in Android system settings. The app dials the selected phone's iAP2 RFCOMM service; it does not make the head unit discoverable.")
-                Text(bluetoothStatus, style = MaterialTheme.typography.bodyMedium)
+            ControlCard(title = "Pi Bluetooth", icon = Icons.Default.SettingsInputComponent) {
+                Text("Pair the phone with the Pi Bluetooth radio. The Pi exposes RFCOMM only; AAOS processes iAP2 and software MFi.")
+                Text(piBluetoothStatus)
+                OutlinedTextField(value = piAdvertisedName, onValueChange = { piAdvertisedName = it },
+                    label = { Text("Pi Bluetooth name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedButton(onClick = {
-                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
-                        refreshBluetooth()
-                    } else bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
-                }) { Text("Check Android Bluetooth") }
-                if (identityStatus == "Identity ready" && !connected) {
-                    bluetoothPhones.forEach { (address, name) ->
+                    identityScope.launch {
+                        val result = runCatching { carlinkManager.setPiBluetoothName(piAdvertisedName.trim()) }
+                        piBluetoothStatus = result.fold({ "Pi Bluetooth name set to $it" },
+                            { "Could not set name: ${it.message}" })
+                    }
+                }) { Text("Set Pi Bluetooth name") }
+                OutlinedButton(onClick = {
+                    piBluetoothStatus = "Checking Pi Bluetooth…"
+                    identityScope.launch {
+                        val result = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                            runCatching { carlinkManager.piBluetoothStatus() }
+                        }
+                        result.fold({ status ->
+                            piBluetoothPhones = status.pairedPhones
+                            piConnectedPhones = status.connectedPhones
+                            piAdvertisedName = status.name
+                            piBluetoothStatus = "Pi ${status.address}; ${status.pairedPhones.size} paired phone(s)"
+                        }, { error ->
+                            piBluetoothPhones = emptyList()
+                            piBluetoothStatus = "Pi unavailable: ${error.message?.take(120)}"
+                        })
+                    }
+                }) { Text("Check Pi Bluetooth") }
+                if (piModeApplied) piBluetoothPhones.forEach { (address, name) ->
+                    Row(verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                        Text("$name: ${if (address in piConnectedPhones) "Bluetooth connected" else "Paired"}",
+                            modifier = Modifier.weight(1f))
                         OutlinedButton(onClick = {
-                            bluetoothStatus = "Testing iAP2 authentication with $name…"
                             identityScope.launch {
-                                val result = kotlinx.coroutines.withContext(Dispatchers.IO) {
-                                    runCatching {
-                                        AppBluetoothRfcomm(context).probeAuthentication(
-                                            address,
-                                            identityStore.load(),
-                                            onPhase = { phase -> logInfo("[APP_BT] iAP2 auth phase=$phase", tag = "Bluetooth") },
-                                            onDiagnostic = { detail -> logInfo("[APP_BT] $detail", tag = "Bluetooth") },
-                                        )
-                                    }
-                                }
-                                bluetoothStatus = result.fold(
-                                    { "iAP2 authentication: $it ($name)" },
-                                    { "iAP2 test failed: ${it.message?.take(120) ?: "connection error"}" },
-                                )
-                                result.onFailure { logWarn("[APP_BT] iAP2 authentication failed: ${it.javaClass.simpleName}: ${it.message}", tag = "Bluetooth") }
+                                val result = runCatching { carlinkManager.switchPiPhone(address) }
+                                piBluetoothStatus = result.fold(
+                                    { if (it) "Switching to $name; preferred phone unchanged" else "Switch unavailable" },
+                                    { "Switch failed: ${it.message}" })
                             }
-                        }) { Text("Test iAP2 auth: $name") }
+                        }) { Text("Use now") }
+                        OutlinedButton(onClick = { piForgetCandidate = address to name }) { Text("Forget") }
                     }
                 }
+            }
+            piForgetCandidate?.let { (address, name) ->
+                AlertDialog(onDismissRequest = { piForgetCandidate = null },
+                    title = { Text("Forget $name?") },
+                    text = { Text("Remove this Bluetooth pairing from the Pi. Also forget Carlink in the iPhone's Bluetooth settings before pairing again.") },
+                    confirmButton = { TextButton(onClick = {
+                        piForgetCandidate = null
+                        identityScope.launch {
+                            val result = runCatching { carlinkManager.forgetPiBluetoothPhone(address) }
+                            piBluetoothStatus = result.fold({ "Removed $name from Pi" }, { "Remove failed: ${it.message}" })
+                            if (result.isSuccess) { piBluetoothPhones = piBluetoothPhones.filterNot { it.first == address }; piConnectedPhones -= address }
+                        }
+                    }) { Text("Forget") } },
+                    dismissButton = { TextButton(onClick = { piForgetCandidate = null }) { Text("Cancel") } })
             }
             ControlCard(title = "CarPlay session transport", icon = Icons.Default.SettingsInputComponent) {
-                Text("Choose who handles Bluetooth and MFi. Both options use the app's native Wi-Fi CarPlay receiver.")
-                listOf(false to "OCBM adapter", true to "Android Bluetooth + software MFi").forEach { (appMode, label) ->
-                    Row(modifier = Modifier.fillMaxWidth().clickable { appBluetoothSelected = appMode },
-                        verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = appBluetoothSelected == appMode, onClick = { appBluetoothSelected = appMode })
-                        Text(label)
-                    }
-                }
-                if (appBluetoothSelected) {
-                    Text("Select a phone paired with Android Bluetooth. Import a software MFi identity before applying. Vehicle hotspot mode is required.")
-                    OutlinedTextField(
-                        value = accessoryBluetoothAddress,
-                        onValueChange = { accessoryBluetoothAddress = it },
-                        label = { Text("Accessory Bluetooth address (optional)") },
-                        supportingText = { Text("Use the head unit's Bluetooth MAC if Android masks it. Leave blank for a stable app-generated identity.") },
-                        isError = accessoryBluetoothAddress.isNotBlank() &&
-                            !accessoryBluetoothAddress.matches(Regex("(?i)[0-9a-f]{2}(:[0-9a-f]{2}){5}")),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    if (bluetoothPhones.isEmpty()) Text("Tap Check Android Bluetooth above to list paired phones.")
-                    bluetoothPhones.forEach { (address, name) ->
+                Text("The selected network mode determines who handles Bluetooth and MFi.")
+                val piMode = piModeApplied
+                Text(if (piMode) "Pi Bluetooth + software MFi" else "OCBM adapter Bluetooth + hardware MFi")
+                if (piMode) {
+                    Text("Select a phone paired with the Pi. Tap Check Pi Bluetooth above. Import a software MFi identity before applying.")
+                    if (piBluetoothPhones.isEmpty()) Text("Tap Check Pi Bluetooth above to list paired phones.")
+                    piBluetoothPhones.forEach { (address, name) ->
                         Row(modifier = Modifier.fillMaxWidth().clickable { selectedBluetoothPhone = address },
                             verticalAlignment = Alignment.CenterVertically) {
                             RadioButton(selected = selectedBluetoothPhone == address, onClick = { selectedBluetoothPhone = address })
@@ -280,15 +286,13 @@ internal fun ControlTabContent(
                     }
                 }
                 Button(
-                    enabled = !applyingSessionTransport && (!appBluetoothSelected ||
-                        (selectedBluetoothPhone != null && (accessoryBluetoothAddress.isBlank() ||
-                            accessoryBluetoothAddress.matches(Regex("(?i)[0-9a-f]{2}(:[0-9a-f]{2}){5}"))))),
+                    enabled = !applyingSessionTransport && (!piMode || selectedBluetoothPhone == null ||
+                        piBluetoothPhones.any { it.first.equals(selectedBluetoothPhone, true) }),
                     onClick = {
-                        if (appBluetoothSelected) AppBluetoothRfcomm(context).setLocalAddressOverride(accessoryBluetoothAddress.ifBlank { null })
                         applyingSessionTransport = true
                         identityScope.launch {
                             try {
-                                val applied = carlinkManager.applySessionTransport(appBluetoothSelected, selectedBluetoothPhone)
+                                val applied = carlinkManager.applySessionTransport(piMode, if (piMode) selectedBluetoothPhone else null)
                                 sessionTransportMessage = if (applied) "Session transport saved; connection restarted." else "Could not apply session transport; check the phone and Wi-Fi settings."
                             } finally { applyingSessionTransport = false }
                         }
@@ -543,6 +547,7 @@ private fun AdapterCard(
     carlinkManager: CarlinkManager,
     connected: Boolean,
     modifier: Modifier = Modifier,
+    onNetworkModeApplied: (CarPlayNetworkMode) -> Unit = {},
 ) {
     var confirm by remember { mutableStateOf<AdapterConfirm?>(null) }
     val scope = rememberCoroutineScope()
@@ -637,12 +642,21 @@ private fun AdapterCard(
                 }
             }
         }
+        if (selectedNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+            Text("The app discovers the Pi on the vehicle network. Pair the phone with the Pi in iPhone Bluetooth settings, then select it under CarPlay session transport.",
+                style = MaterialTheme.typography.bodySmall)
+            Button(onClick = {
+                carlinkManager.applyCarPlayNetworkMode(CarPlayNetworkMode.PI_WIFI_PROXY)
+                onNetworkModeApplied(CarPlayNetworkMode.PI_WIFI_PROXY)
+            }) { Text("Find Pi and reconnect") }
+        }
         if (selectedNetworkMode != carlinkManager.carPlayNetworkMode) {
             Button(onClick = {
                 // The reconnect can outlive this settings composition as the overlay/activity
                 // changes. Let CarlinkManager own the coroutine so Compose cancellation cannot
                 // abort adapter startup midway through the dongle-AP wait.
                 carlinkManager.applyCarPlayNetworkMode(selectedNetworkMode)
+                onNetworkModeApplied(selectedNetworkMode)
             }, modifier = Modifier.fillMaxWidth()) {
                 Text("Apply phone network and reconnect")
             }
@@ -685,7 +699,7 @@ private fun AdapterCard(
         portMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         Spacer(modifier = Modifier.height(16.dp))
         if (carlinkManager.appOwnedBluetoothEnabled) {
-            Text("Android Bluetooth phone: ${carlinkManager.appBluetoothPhone ?: "none selected"}",
+            Text("${if (carlinkManager.carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) "Pi" else "Android"} Bluetooth phone: ${carlinkManager.appBluetoothPhone ?: "none selected"}",
                 style = MaterialTheme.typography.titleMedium)
         } else {
             Text(

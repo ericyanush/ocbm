@@ -37,6 +37,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,12 +53,14 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.carlink.CarlinkManager
+import com.carlink.ocbm.CarPlayNetworkMode
 import com.carlink.R
 import com.carlink.ocbm.Ocbm
 import com.carlink.protocol.PhoneType
 import com.carlink.ui.adaptive.AdaptiveGrid
 import com.carlink.ui.theme.AutomotiveDimens
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Device-card width envelope for the adaptive grid. The grid puts as many cards per row as fit
@@ -88,11 +91,12 @@ fun PhonesTabContent(
     modifier: Modifier = Modifier,
 ) {
     val view = LocalView.current
+    val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
 
     // Observe device list and connection state
     var pairedDevices by remember { mutableStateOf(carlinkManager.pairedDevices) }
-    var preferredBtMac by remember { mutableStateOf(carlinkManager.preferredBtMac) }
+    var preferredBtMac by remember { mutableStateOf(carlinkManager.devicePreferredBtMac) }
     var activeBtMac by remember { mutableStateOf(carlinkManager.activeCarPlayBtMac) }
     var hasLiveCarPlaySession by remember { mutableStateOf(carlinkManager.hasLiveCarPlaySession) }
     var activeWifi by remember { mutableIntStateOf(carlinkManager.currentWifi ?: -1) }
@@ -114,7 +118,7 @@ fun PhonesTabContent(
         val listener =
             CarlinkManager.DeviceListener { devices ->
                 pairedDevices = devices
-                preferredBtMac = carlinkManager.preferredBtMac
+                preferredBtMac = carlinkManager.devicePreferredBtMac
             }
         carlinkManager.addDeviceListener(listener)
         // Request fresh device list when tab opens
@@ -130,11 +134,12 @@ fun PhonesTabContent(
     LaunchedEffect(carlinkManager) {
         while (true) {
             activeBtMac = carlinkManager.activeCarPlayBtMac
-            preferredBtMac = carlinkManager.preferredBtMac
+            preferredBtMac = carlinkManager.devicePreferredBtMac
             hasLiveCarPlaySession = carlinkManager.hasLiveCarPlaySession
             activeWifi = carlinkManager.currentWifi ?: -1
             phoneType = carlinkManager.currentPhoneType
-            delay(1000)
+            if (carlinkManager.carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) carlinkManager.refreshDeviceList()
+            delay(if (carlinkManager.carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) 3000 else 1000)
         }
     }
 
@@ -205,7 +210,8 @@ fun PhonesTabContent(
         // the adapter didn't send the wifi field — treat as USB since wireless
         // always sends wifi=1 explicitly. (connectedBtMac is private backing with a
         // public read-only accessor on CarlinkManager; activeWifi mirrors currentWifi.)
-        val isUsbConnected = phoneType != null && activeWifi != 1
+        val piMode = carlinkManager.carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY
+        val isUsbConnected = !piMode && phoneType != null && activeWifi != 1
         UsbDeviceCard(
             isConnected = isUsbConnected,
             phoneType = if (isUsbConnected) phoneType else null,
@@ -228,22 +234,25 @@ fun PhonesTabContent(
 
                     WirelessDeviceCard(
                         device = device,
+                        piMode = piMode,
                         isConnected = isDeviceActive,
                         isPreferred = device.btMac.equals(preferredBtMac, ignoreCase = true),
                         canSwitch =
-                            !isDeviceActive &&
-                                device.iap2Phase == Ocbm.BTP_WIFI_HANDOFF &&
-                                hasLiveCarPlaySession,
-                        onSwitch = { carlinkManager.switchActivePhone(device.btMac) },
+                            !isDeviceActive && device.bonded &&
+                                (piMode || (device.iap2Phase == Ocbm.BTP_WIFI_HANDOFF && hasLiveCarPlaySession)),
+                        onSwitch = {
+                            if (piMode) carlinkManager.requestPiPhoneSwitch(device.btMac)
+                            else carlinkManager.switchActivePhone(device.btMac)
+                        },
                         onSelect = {
                             view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                             carlinkManager.setPreferredDevice(
                                 if (device.btMac.equals(preferredBtMac, ignoreCase = true)) null else device.btMac,
                             )
-                            preferredBtMac = carlinkManager.preferredBtMac
+                            preferredBtMac = carlinkManager.devicePreferredBtMac
                         },
                         onRemove = {
-                            deviceToRemove = device
+                        deviceToRemove = device
                         },
                     )
                 }
@@ -356,6 +365,7 @@ private fun UsbDeviceCard(
 @Composable
 private fun WirelessDeviceCard(
     device: CarlinkManager.DeviceInfo,
+    piMode: Boolean,
     isConnected: Boolean,
     isPreferred: Boolean,
     canSwitch: Boolean,
@@ -410,7 +420,9 @@ private fun WirelessDeviceCard(
             Spacer(modifier = Modifier.height(4.dp))
 
             Text(
-                text = adapterDeviceStatusText(device),
+                text = if (piMode) {
+                    if (device.bluetoothConnected) "Pi Bluetooth: Connected" else "Pi Bluetooth: Paired"
+                } else adapterDeviceStatusText(device),
                 style = MaterialTheme.typography.bodySmall,
                 color = if (isConnected) Color.White.copy(alpha = 0.85f) else colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,

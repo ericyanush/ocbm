@@ -92,7 +92,7 @@ private const val VIDEO_VISIBILITY_POLL_MS = 100L
 @Stable
 private class SessionUiState {
     var connectionState by mutableStateOf(CarlinkManager.State.DISCONNECTED)
-    var statusText by mutableStateOf("Connect Adapter")
+    var statusText by mutableStateOf("Connecting...")
     var viewAreaIndex by mutableStateOf(0)
 
     /** Container (content-area) dimensions, used for the adapter OPEN / declared-panel resolution. */
