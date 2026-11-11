@@ -15,6 +15,8 @@ import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
 import java.io.Closeable
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -109,8 +111,30 @@ class AppBluetoothRfcomm(private val context: Context) {
         onDiagnostic: (String) -> Unit = {},
     ): String = connectAuthenticated(address, signer, onPhase, onDiagnostic).use { "AUTHENTICATED" }
 
-    internal class AuthenticatedLink(val socket: Link, val session: AppIap2AuthSession) : Closeable {
+    internal interface ByteLink : Closeable {
+        val input: InputStream
+        val output: OutputStream
+    }
+
+    internal class AuthenticatedLink(val socket: ByteLink, val session: AppIap2AuthSession) : Closeable {
         override fun close() = socket.close()
+    }
+
+    internal fun authenticateLink(
+        link: ByteLink,
+        signer: SoftwareMfiSigner,
+        onPhase: (AppIap2AuthSession.Phase) -> Unit = {},
+    ): AuthenticatedLink {
+        try {
+            val session = AppIap2AuthSession(signer)
+            check(authenticate(link, session, onPhase) == AppIap2AuthSession.Phase.AUTHENTICATED.name) {
+                "iAP2 authentication was rejected"
+            }
+            return AuthenticatedLink(link, session)
+        } catch (error: Throwable) {
+            link.close()
+            throw error
+        }
     }
 
     internal fun connectAuthenticated(
@@ -125,11 +149,7 @@ class AppBluetoothRfcomm(private val context: Context) {
         val socket = connectPhone(address, onDiagnostic, isCurrent, onSocketCreated)
         try {
             onLinkOpened(socket)
-            val session = AppIap2AuthSession(signer)
-            check(authenticate(socket, session, onPhase) == AppIap2AuthSession.Phase.AUTHENTICATED.name) {
-                "iAP2 authentication was rejected"
-            }
-            return AuthenticatedLink(socket, session)
+            return authenticateLink(socket, signer, onPhase)
         } catch (error: Throwable) {
             socket.close()
             throw error
@@ -174,7 +194,7 @@ class AppBluetoothRfcomm(private val context: Context) {
     }
 
     private fun authenticate(
-        socket: Link,
+        socket: ByteLink,
         session: AppIap2AuthSession,
         onPhase: (AppIap2AuthSession.Phase) -> Unit,
     ): String {
@@ -249,10 +269,10 @@ class AppBluetoothRfcomm(private val context: Context) {
         return reported
     }
 
-    class Link(private val socket: BluetoothSocket) : Closeable {
+    class Link(private val socket: BluetoothSocket) : ByteLink {
         val peerAddress: String get() = socket.remoteDevice.address
-        val input get() = socket.inputStream
-        val output get() = socket.outputStream
+        override val input: InputStream get() = socket.inputStream
+        override val output: OutputStream get() = socket.outputStream
         override fun close() = socket.close()
     }
 

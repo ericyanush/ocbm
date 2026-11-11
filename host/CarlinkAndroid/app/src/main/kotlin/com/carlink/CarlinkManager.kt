@@ -53,6 +53,9 @@ import com.carlink.ocbm.Ocbm
 import com.carlink.ocbm.OcbmAvLanes
 import com.carlink.ocbm.OcbmClient
 import com.carlink.ocbm.OcbmSocketTunnel
+import com.carlink.ocbm.PiCarPlayLink
+import com.carlink.ocbm.PiBluetoothRfcomm
+import com.carlink.ocbm.PiDiscovery
 import com.carlink.ocbm.DirectUsbBulkTransport
 import com.carlink.ocbm.Mfi
 import com.carlink.ocbm.RebindableMfiRelay
@@ -288,6 +291,7 @@ class CarlinkManager(
         val bonded: Boolean = true,
         /** Current per-phone adapter iAP2 phase, or null when no slot is held. */
         val iap2Phase: Byte? = null,
+        val bluetoothConnected: Boolean = false,
     )
 
     /**
@@ -525,22 +529,39 @@ class CarlinkManager(
     }
 
     fun setCarPlayNetworkMode(mode: CarPlayNetworkMode) {
+        if (mode != carPlayNetworkMode) piDevices = null
         carPlayNetworkModeStore.mode = mode
+        sessionTransportPrefs.edit().putBoolean("app_bluetooth", mode == CarPlayNetworkMode.PI_WIFI_PROXY).apply()
         logInfo("[CP_NETWORK] selected mode=${mode.name}; reconnect required", tag = Logger.Tags.ADAPTR)
+        rebuildDeviceList()
+        refreshDeviceList()
     }
 
     /** Apply the phone-network choice and reconnect from the manager's lifetime scope. */
     fun applyCarPlayNetworkMode(mode: CarPlayNetworkMode) {
+        val modeChanged = carPlayNetworkMode != mode
+        setCarPlayNetworkMode(mode)
+        setStatusText(if (mode == CarPlayNetworkMode.PI_WIFI_PROXY) "Connecting to Pi CarPlay proxy..." else "Switching CarPlay network...")
         scope.launch {
-            setCarPlayNetworkMode(mode)
-            if (appOwnedBluetoothEnabled) {
-                disconnect()
-                start()
-            } else cleanSlateReset()
+            lifecycleMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    if (released || carPlayNetworkMode != mode) return@withContext
+                    if (mode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+                        // An adapter start may have noticed the mode change and entered the Pi
+                        // path while this restart waited for the lifecycle lock.
+                        if (modeChanged && appOwnedJob?.isActive == true) return@withContext
+                        stopImpl()
+                        startImpl()
+                    } else {
+                        cleanSlate.run()
+                    }
+                }
+            }
         }
     }
     private var client: OcbmClient? = null
     @Volatile private var socketTunnel: OcbmSocketTunnel? = null
+    @Volatile private var piCarPlayLink: PiCarPlayLink? = null
     @Volatile private var dongleApInfo: DongleApInfo? = null
     /** Invalidates delayed detach/error work and MFi callbacks from retired sessions. */
     private val connectionGeneration = AtomicLong(0)
@@ -757,8 +778,88 @@ class CarlinkManager(
     private var nativeStartForConnection = false
     private var nativeStartEndpoint: JSONObject? = null
     private val sessionTransportPrefs by lazy { context.getSharedPreferences("session_transport", Context.MODE_PRIVATE) }
-    val appOwnedBluetoothEnabled: Boolean get() = sessionTransportPrefs.getBoolean("app_bluetooth", false)
+    val appOwnedBluetoothEnabled: Boolean
+        get() = carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY
     val appBluetoothPhone: String? get() = sessionTransportPrefs.getString("phone", null)
+    val devicePreferredBtMac: String?
+        get() = if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) appBluetoothPhone else preferredBtMac
+    @Volatile private var piTemporaryPhone: String? = null
+    private fun piDiscovery() = PiDiscovery(context) { detail ->
+        logInfo("[PI_DISCOVERY] $detail", tag = Logger.Tags.ADAPTR)
+    }
+    private suspend fun piBluetoothClient(): PiBluetoothRfcomm = PiBluetoothRfcomm(
+        piCarPlayLink?.endpoint ?: piDiscovery().first(),
+    )
+    suspend fun piBluetoothStatus(): PiBluetoothRfcomm.Status = withContext(Dispatchers.IO) {
+        piBluetoothClient().status()
+    }
+    suspend fun setPiBluetoothName(name: String): String = withContext(Dispatchers.IO) {
+        piBluetoothClient().setName(name)
+    }
+    suspend fun forgetPiBluetoothPhone(address: String) = withContext(Dispatchers.IO) {
+        piBluetoothClient().removePairing(address)
+        if (piTemporaryPhone.equals(address, ignoreCase = true)) piTemporaryPhone = null
+        if (appBluetoothPhone.equals(address, ignoreCase = true)) {
+            sessionTransportPrefs.edit().remove("phone").apply()
+        }
+        knownStore?.update { snap -> snap.copy(preferredMac = snap.preferredMac?.takeUnless { it.equals(address, true) }) }
+        piDevices = piDevices?.let { status ->
+            status.copy(
+                pairedPhones = status.pairedPhones.filterNot { it.first.equals(address, true) },
+                connectedPhones = status.connectedPhones.filterNot { it.equals(address, true) }.toSet(),
+            )
+        }
+        rebuildDeviceList()
+    }
+    /** One session choice. The saved preferred phone stays intact. */
+    fun requestPiPhoneSwitch(address: String) {
+        scope.launch {
+            if (!switchPiPhone(address)) {
+                logWarn("[PI_BT] phone switch unavailable target=$address", tag = Logger.Tags.PHONE)
+            }
+        }
+    }
+
+    /** One session choice. The saved preferred phone stays intact. */
+    suspend fun switchPiPhone(address: String): Boolean = lifecycleMutex.withLock {
+        withContext(Dispatchers.IO) {
+            if (released || carPlayNetworkMode != CarPlayNetworkMode.PI_WIFI_PROXY || !appOwnedBluetoothEnabled) return@withContext false
+            val pi = piBluetoothClient()
+            val paired = pi.status().pairedPhones.any { it.first.equals(address, ignoreCase = true) }
+            if (!paired) return@withContext false
+            val previous = activeCarPlayBtMac ?: appBluetoothPhone
+            if (previous.equals(address, ignoreCase = true) && carPlayReceiver?.sessionLive == true) return@withContext true
+            piTemporaryPhone = address.uppercase()
+            logInfo("[PI_BT] temporary phone switch to $address; preferred remains $appBluetoothPhone", tag = Logger.Tags.PHONE)
+            stopImpl()
+            if (previous != null && !previous.equals(address, ignoreCase = true)) {
+                runCatching { pi.disconnectPhone(previous) }
+                    .onFailure { logWarn("[PI_BT] disconnect previous phone $previous failed: ${it.message}", tag = Logger.Tags.PHONE) }
+                delay(500)
+            }
+            startImpl()
+            true
+        }
+    }
+    private suspend fun choosePiPhone(preferred: String, client: PiBluetoothRfcomm): String {
+        piTemporaryPhone?.let { return it }
+        val deadline = android.os.SystemClock.elapsedRealtime() + phoneFallbackSeconds * 1000L
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            val status = runCatching { client.status() }.getOrNull() ?: return preferred
+            if (status.connectedPhones.any { it.equals(preferred, ignoreCase = true) }) return preferred
+            if (status.connectedPhones.isEmpty()) return preferred
+            delay(2_000)
+        }
+        val status = runCatching { client.status() }.getOrNull() ?: return preferred
+        val alternate = status.pairedPhones.firstOrNull { (address, _) ->
+            !address.equals(preferred, ignoreCase = true) && status.connectedPhones.contains(address)
+        }?.first
+        if (alternate != null) {
+            logInfo("[PI_BT] preferred phone absent; temporarily using $alternate", tag = Logger.Tags.PHONE)
+            return alternate
+        }
+        return preferred
+    }
     @Volatile private var appOwnedSession: AppOwnedIap2Session? = null
     @Volatile private var appOwnedHadControlSession = false
     private var appOwnedJob: Job? = null
@@ -769,8 +870,16 @@ class CarlinkManager(
         lifecycleMutex.withLock {
             withContext(Dispatchers.IO) {
                 if (released) return@withContext false
-                if (appBluetooth && (phone == null || !phone.matches(Regex("(?i)[0-9a-f]{2}(:[0-9a-f]{2}){5}")))) {
-                    setStatusText("Select a paired Android Bluetooth phone first")
+                if (appBluetooth && phone != null && !phone.matches(Regex("(?i)[0-9a-f]{2}(:[0-9a-f]{2}){5}"))) {
+                    setStatusText("Select a valid paired Bluetooth phone")
+                    return@withContext false
+                }
+                if (appBluetooth && carPlayNetworkMode != CarPlayNetworkMode.PI_WIFI_PROXY) {
+                    setStatusText("Pi Bluetooth requires Pi proxy network mode")
+                    return@withContext false
+                }
+                if (!appBluetooth && carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+                    setStatusText("Pi proxy network mode requires Pi Bluetooth")
                     return@withContext false
                 }
                 if (appBluetooth && carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL) {
@@ -778,8 +887,9 @@ class CarlinkManager(
                     return@withContext false
                 }
                 stopImpl()
+                piTemporaryPhone = null
                 sessionTransportPrefs.edit().putBoolean("app_bluetooth", appBluetooth).putString("phone", phone).apply()
-                logInfo("[APP_BT] session transport=${if (appBluetooth) "Android Bluetooth + software MFi" else "OCBM adapter"} phone=${phone ?: "none"}", tag = Logger.Tags.PHONE)
+                logInfo("[APP_BT] session transport=${if (!appBluetooth) "OCBM adapter" else if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) "Pi Bluetooth + software MFi" else "Android Bluetooth + software MFi"} phone=${phone ?: "none"}", tag = Logger.Tags.PHONE)
                 startImpl()
                 true
             }
@@ -931,6 +1041,8 @@ class CarlinkManager(
      * and silently stop marking it Connected.
      */
     @Volatile private var bondedMacs: Set<String> = emptySet()
+    @Volatile private var piDevices: PiBluetoothRfcomm.Status? = null
+    private val piDeviceRefreshInFlight = AtomicBoolean(false)
 
     @Volatile private var _connectedBtMac: String? = null
 
@@ -1207,7 +1319,7 @@ class CarlinkManager(
             logInfo("MediaSession not provided (owner skipped)", tag = Logger.Tags.ADAPTR)
         }
 
-        logInfo("CarlinkManager initialized (OCBM)", tag = Logger.Tags.ADAPTR)
+        logInfo("CarlinkManager initialized networkMode=${carPlayNetworkMode.name}", tag = Logger.Tags.ADAPTR)
     }
 
     /**
@@ -1238,6 +1350,7 @@ class CarlinkManager(
     private suspend fun acquireTransport(): UsbAdapterTransport? {
         val maxBindAttempts = 2
         for (attempt in 1..maxBindAttempts) {
+            if (released || appOwnedBluetoothEnabled) return null
             val mode = usbTransportModeStore.mode
             val t: UsbAdapterTransport = when (mode) {
                 UsbTransportMode.SPLIT_HELPER -> UsbBulkTransport(context, usbLog)
@@ -1246,6 +1359,11 @@ class CarlinkManager(
             transport = t
 
             if (t.connect()) {
+                if (released || appOwnedBluetoothEnabled) {
+                    t.stop()
+                    if (transport === t) transport = null
+                    return null
+                }
                 logInfo("[USB_TRANSPORT] acquisition mode=${mode.name} directIdentity=${usbAdapterIdentity.hexId}", tag = Logger.Tags.USB)
                 return acquireOpenedAdapter(t)
             }
@@ -1264,6 +1382,7 @@ class CarlinkManager(
                 continue
             }
 
+            if (appOwnedBluetoothEnabled) return null
             handleFailedStart("USB transport unavailable: $detail")
             return null
         }
@@ -1274,6 +1393,11 @@ class CarlinkManager(
     private suspend fun acquireOpenedAdapter(t: UsbAdapterTransport): UsbAdapterTransport? {
         val dev = findDevice(t)
         if (dev == null) {
+            if (appOwnedBluetoothEnabled) {
+                t.stop()
+                if (transport === t) transport = null
+                return null
+            }
             val detail = t.lastError ?: "Adapter not found or USB permission unavailable"
             logError("Failed to find/open the OCBM adapter: $detail", tag = Logger.Tags.USB)
             t.stop()
@@ -1281,16 +1405,16 @@ class CarlinkManager(
             handleFailedStart(detail)
             return null
         }
-        if (released) {
-            logWarn("[LIFECYCLE] released during device discovery — abandoning start", tag = Logger.Tags.ADAPTR)
+        if (released || appOwnedBluetoothEnabled) {
+            logWarn("[LIFECYCLE] mode changed or manager released during device discovery — abandoning USB start", tag = Logger.Tags.ADAPTR)
             t.stop()
             if (transport === t) transport = null
             return null
         }
 
         setStatusText("Adapter found — USB interface open")
-        return if (released) {
-            logWarn("[LIFECYCLE] released after USB open — closing and abandoning", tag = Logger.Tags.ADAPTR)
+        return if (released || appOwnedBluetoothEnabled) {
+            logWarn("[LIFECYCLE] mode changed or manager released after USB open — closing and abandoning", tag = Logger.Tags.ADAPTR)
             t.stop()
             if (transport === t) transport = null
             null
@@ -1305,6 +1429,7 @@ class CarlinkManager(
             return
         }
 
+        logInfo("[START] networkMode=${carPlayNetworkMode.name} usbMode=${usbTransportModeStore.mode.name}", tag = Logger.Tags.ADAPTR)
         if (appOwnedBluetoothEnabled) {
             startAppOwnedSession()
             return
@@ -1317,7 +1442,7 @@ class CarlinkManager(
             withContext(Dispatchers.IO) {
                 kotlinx.coroutines.withTimeout(60_000) {
                     awaitHotspotReady(
-                        isCurrent = { !released && connectionGeneration.get() == credentialsOwner },
+                        isCurrent = { !released && !appOwnedBluetoothEnabled && connectionGeneration.get() == credentialsOwner },
                         read = { VehicleHotspotStore(context).credentialsForStartSession() },
                         waiting = { evidence ->
                             setStatusText("Waiting for saved vehicle hotspot credentials...")
@@ -1328,10 +1453,24 @@ class CarlinkManager(
                 }
             }
         } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            if (appOwnedBluetoothEnabled) {
+                startAppOwnedSession()
+                return
+            }
             if (released || connectionGeneration.get() != credentialsOwner) return
             setState(State.DISCONNECTED)
             logWarn("[HOTSPOT] Saved credentials still unreadable after 60s; scheduling connection retry", tag = Logger.Tags.ADAPTR)
             scheduleReconnect()
+            return
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            if (kotlinx.coroutines.currentCoroutineContext().isActive && !released && appOwnedBluetoothEnabled) {
+                startAppOwnedSession()
+                return
+            }
+            throw cancelled
+        }
+        if (appOwnedBluetoothEnabled) {
+            startAppOwnedSession()
             return
         }
         if (hotspot == null) {
@@ -1356,7 +1495,19 @@ class CarlinkManager(
         setState(State.CONNECTING)
         setStatusText("Searching for adapter...")
 
-        val t = acquireTransport() ?: return
+        val t = acquireTransport() ?: run {
+            if (!released && appOwnedBluetoothEnabled) {
+                logInfo("[START] network mode switched to Pi during USB discovery; starting Pi session", tag = Logger.Tags.ADAPTR)
+                startAppOwnedSession()
+            }
+            return
+        }
+        if (appOwnedBluetoothEnabled) {
+            t.stop()
+            if (transport === t) transport = null
+            startAppOwnedSession()
+            return
+        }
 
         transport = t
         val c = OcbmClient(t, ocbmLog)
@@ -1547,9 +1698,14 @@ class CarlinkManager(
             return
         }
         if (client != null || appOwnedJob != null || carPlayReceiver != null) stopImpl()
-        val phone = appBluetoothPhone ?: run {
+        val preferredPhone = (appBluetoothPhone ?: if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+            runCatching { piBluetoothClient().status() }.getOrNull()?.let { status ->
+                status.pairedPhones.firstOrNull { status.connectedPhones.contains(it.first) }?.first
+                    ?: status.pairedPhones.firstOrNull()?.first
+            }
+        } else null) ?: run {
             setState(State.DISCONNECTED)
-            setStatusText("Select a paired Android Bluetooth phone in Settings")
+            setStatusText("Select a paired Bluetooth phone in Settings")
             return
         }
         if (carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL) {
@@ -1563,6 +1719,27 @@ class CarlinkManager(
             setStatusText("Import software MFi identity in Settings")
             return
         }
+        val piMode = carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY
+        val piEndpoint = if (piMode) {
+            setStatusText("Waiting for vehicle hotspot and Pi proxy...")
+            try {
+                piDiscovery().first(waiting = { setStatusText("$it...") })
+            } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
+                logWarn("[PI_DISCOVERY] Pi proxy discovery timed out after 25s", tag = Logger.Tags.ADAPTR)
+                setState(State.DISCONNECTED)
+                setStatusText("Pi proxy unavailable: vehicle hotspot bridge or Pi discovery timed out")
+                scheduleAppOwnedRetry()
+                return
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                logWarn("[PI_DISCOVERY] Pi proxy discovery failed: ${error.message}", tag = Logger.Tags.ADAPTR)
+                setState(State.DISCONNECTED)
+                setStatusText("Pi proxy unavailable: ${error.message}")
+                scheduleAppOwnedRetry()
+                return
+            }
+        } else null
         val generation = connectionGeneration.incrementAndGet()
         nativeStartForConnection = true
         nativeStart.enabled = false // No adapter StartSession request is sent in this mode.
@@ -1570,7 +1747,7 @@ class CarlinkManager(
         carPlayMfiRelay.clear()
         carPlayMfiRelay.bind(generation, signer)
         setState(State.CONNECTING)
-        setStatusText("Preparing vehicle hotspot receiver...")
+        setStatusText(if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) "Connecting to Pi CarPlay proxy..." else "Preparing vehicle hotspot receiver...")
         val endpoint = try {
             val lanes = OcbmAvLanes(
                 log = ProbeLog.sub("APP_AV"),
@@ -1580,7 +1757,28 @@ class CarlinkManager(
             localAvLanes = lanes
             onLanesArmed(lanes)
             check(carPlaySocketBridge != null) { "Native media bridge could not open its loopback listeners" }
-            if (carPlayBridgeOnly) kotlinx.coroutines.withTimeout(60_000) {
+            if (piMode) {
+                val link = PiCarPlayLink(
+                    log = { logInfo("[PI_TUNNEL] $it", tag = Logger.Tags.ADAPTR) },
+                    onLost = {
+                        if (!released && connectionGeneration.get() == generation) {
+                            logWarn("[PI_TUNNEL] link lost; restarting receiver", tag = Logger.Tags.ADAPTR)
+                            scope.launch { lifecycleMutex.withLock { withContext(Dispatchers.IO) { stopImpl(); startImpl() } } }
+                        }
+                    },
+                )
+                try {
+                    withContext(Dispatchers.IO) {
+                        link.connect(checkNotNull(piEndpoint), configuredCarPlayControlPort)
+                        link.tunnel.listenTcp(link.ap.address, 24, configuredCarPlayControlPort)
+                    }
+                    piCarPlayLink = link
+                } catch (error: Exception) {
+                    link.close()
+                    throw error
+                }
+            }
+            if (!piMode && carPlayBridgeOnly) kotlinx.coroutines.withTimeout(60_000) {
                 awaitHotspotReady(
                     isCurrent = { !released && connectionGeneration.get() == generation },
                     read = { StartSessionHotspot.selectIpv4(StartSessionHotspot.snapshot()) },
@@ -1591,23 +1789,62 @@ class CarlinkManager(
             check(carPlayReceiver?.awaitAdvertRegistered(10_000) == true) {
                 "AirPlay service registration did not complete"
             }
-            kotlinx.coroutines.withTimeout(60_000) {
+            if (piMode) piStartSessionEndpoint() else kotlinx.coroutines.withTimeout(60_000) {
                 nativeStart.awaitEndpoint { !released && appOwnedBluetoothEnabled && connectionGeneration.get() == generation }
             }
         } catch (error: Exception) {
             logWarn("[APP_BT] receiver preparation failed: ${error.message}", tag = Logger.Tags.PHONE)
             stopImpl()
-            setStatusText("Vehicle hotspot receiver unavailable: ${error.message}")
+            setStatusText("${if (piMode) "Pi proxy" else "Vehicle hotspot receiver"} unavailable: ${error.message}")
             scheduleAppOwnedRetry()
             return
         }
         if (released || connectionGeneration.get() != generation) return
         val receiver = carPlayReceiver ?: return
         logInfo("[APP_BT] receiver ready interface=${endpoint.optString("interface")} addresses=${endpoint.optJSONArray("addresses")} port=${endpoint.optInt("port")}", tag = Logger.Tags.PHONE)
-        setStatusText("Connecting to selected phone over Android Bluetooth...")
+        val piBluetooth = if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+            PiBluetoothRfcomm(checkNotNull(piCarPlayLink).endpoint)
+        } else null
+        var phone = if (piBluetooth != null) choosePiPhone(preferredPhone, piBluetooth) else preferredPhone
+        if (piBluetooth != null) {
+            val status = runCatching { piBluetooth.status() }
+            status.onSuccess {
+                logInfo("[PI_BT] selected=$phone preferred=$preferredPhone paired=${it.pairedPhones.map { peer -> peer.first }} connected=${it.connectedPhones}", tag = Logger.Tags.PHONE)
+            }.onFailure {
+                logWarn("[PI_BT] selected=$phone status unavailable: ${it.message}", tag = Logger.Tags.PHONE)
+            }
+        }
+        setStatusText(if (piBluetooth != null) "Connecting to selected phone over Pi Bluetooth..." else "Connecting to selected phone over Android Bluetooth...")
         appOwnedJob = scope.launch(Dispatchers.IO) {
+            // BlueZ reports a paired phone as disconnected until its Bluetooth link is opened.
+            // An absent preferred phone can therefore leave connectedPhones empty even while a
+            // secondary phone is nearby. After the configured grace period, try the other paired
+            // phone rather than dialing the unreachable preferred phone forever.
+            val fallbackAt = SystemClock.elapsedRealtime() + phoneFallbackSeconds * 1_000L
             while (isActive && !released && connectionGeneration.get() == generation) {
-                val refreshedEndpoint = runCatching { nativeStart.endpoint() }.getOrNull()
+                if (piBluetooth != null && piTemporaryPhone == null &&
+                    phone.equals(preferredPhone, ignoreCase = true) &&
+                    SystemClock.elapsedRealtime() >= fallbackAt && !receiver.sessionLive
+                ) {
+                    val status = runCatching { piBluetooth.status() }
+                    status.onSuccess { piStatus ->
+                        val alternates = piStatus.pairedPhones.map { it.first }
+                            .filterNot { it.equals(preferredPhone, ignoreCase = true) }
+                        val alternate = alternates.firstOrNull { candidate ->
+                            piStatus.connectedPhones.any { it.equals(candidate, ignoreCase = true) }
+                        } ?: alternates.firstOrNull()
+                        if (alternate != null) {
+                            phone = alternate
+                            logInfo("[PI_BT] preferred phone unavailable after ${phoneFallbackSeconds}s; trying paired secondary $phone (connected=${piStatus.connectedPhones})", tag = Logger.Tags.PHONE)
+                            setStatusText("Trying another paired phone over Pi Bluetooth...")
+                        }
+                    }.onFailure { error ->
+                        logWarn("[PI_BT] cannot check paired phones for fallback: ${error.message}", tag = Logger.Tags.PHONE)
+                    }
+                }
+                val refreshedEndpoint = runCatching {
+                    if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) piStartSessionEndpoint() else nativeStart.endpoint()
+                }.getOrNull()
                 if (refreshedEndpoint == null ||
                     refreshedEndpoint.optString("interface") != endpoint.optString("interface") ||
                     refreshedEndpoint.optJSONArray("addresses")?.toString() != endpoint.optJSONArray("addresses")?.toString() ||
@@ -1624,7 +1861,7 @@ class CarlinkManager(
                 }
                 appOwnedHadControlSession = false
                 lateinit var session: AppOwnedIap2Session
-                session = AppOwnedIap2Session(context, phone, signer, receiver, endpoint,
+                session = AppOwnedIap2Session(context, phone, signer, receiver, endpoint, piBluetooth = piBluetooth,
                     log = { logInfo("[APP_BT] $it", tag = Logger.Tags.PHONE) },
                     onStartSessionSent = {
                         setStatusText("StartSession sent — waiting for phone...")
@@ -1647,9 +1884,12 @@ class CarlinkManager(
                 }
                 try {
                     session.run()
-                    logWarn("[APP_BT] RFCOMM link ended", tag = Logger.Tags.PHONE)
+                    if (isActive && connectionGeneration.get() == generation)
+                        logWarn("[APP_BT] RFCOMM link ended", tag = Logger.Tags.PHONE)
                 } catch (error: Exception) {
-                    logWarn("[APP_BT] RFCOMM/StartSession failed: ${error.javaClass.simpleName}: ${error.message}", tag = Logger.Tags.PHONE)
+                    if (isActive && connectionGeneration.get() == generation)
+                        logWarn("[APP_BT] RFCOMM/StartSession failed: ${error.javaClass.simpleName}: ${error.message}", tag = Logger.Tags.PHONE)
+                    else logDebug("[APP_BT] RFCOMM closed by session teardown", tag = Logger.Tags.PHONE)
                 } finally {
                     session.close()
                     if (appOwnedSession === session) appOwnedSession = null
@@ -1663,13 +1903,24 @@ class CarlinkManager(
                         !receiver.sessionLive && SystemClock.elapsedRealtime() < deadline) delay(200)
                 }
                 if (receiver.sessionLive) {
+                    if (piBluetooth != null && piTemporaryPhone.equals(phone, ignoreCase = true)) {
+                        piTemporaryPhone = null // Applied to this session; next startup uses the preferred phone.
+                    }
                     while (isActive && !released && connectionGeneration.get() == generation && receiver.sessionLive) delay(200)
                 }
                 receiver.revokeStartSession()
                 receiver.setHandoffTarget(null, false)
                 if (!isActive || released || connectionGeneration.get() != generation) break
-                if (!receiver.sessionLive) setStatusText("Phone link ended — retrying Android Bluetooth...")
+                if (!receiver.sessionLive) setStatusText("Phone link ended — retrying Bluetooth...")
                 delay(3_000)
+            }
+        }
+        if (piBluetooth != null && piTemporaryPhone.equals(phone, ignoreCase = true)) {
+            scope.launch {
+                while (!released && connectionGeneration.get() == generation && !receiver.sessionLive) delay(500)
+                if (receiver.sessionLive && piTemporaryPhone.equals(phone, ignoreCase = true)) {
+                    piTemporaryPhone = null // This temporary choice has produced a live session.
+                }
             }
         }
     }
@@ -1763,7 +2014,8 @@ class CarlinkManager(
     private fun startCarPlayReceiver() {
         if (carPlayReceiver != null) return
         val dongleMode = carPlayNetworkMode == CarPlayNetworkMode.DONGLE_WIFI_TUNNEL
-        val bindAddress = if (dongleMode) {
+        val piMode = carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY
+        val bindAddress = if (dongleMode || piMode) {
             InetAddress.getByName("127.0.0.1")
         } else if (carPlayBridgeOnly) {
             requireNotNull(StartSessionHotspot.selectIpv4(StartSessionHotspot.snapshot())) {
@@ -1795,8 +2047,8 @@ class CarlinkManager(
             // Diagnostic test: publish only NsdManager's gm-ccpa record, not gmccpa-rx.local.
             selfHostedMdnsEnabled = false,
             startSessionOnly = nativeStartForConnection,
-            socketTunnelRelay = if (dongleMode) socketTunnel else null,
-            externalMdnsAddress = if (dongleMode) dongleApInfo?.address?.hostAddress else null,
+            socketTunnelRelay = if (dongleMode) socketTunnel else if (piMode) piCarPlayLink?.tunnel else null,
+            externalMdnsAddress = if (dongleMode) dongleApInfo?.address?.hostAddress else if (piMode) piCarPlayLink?.ap?.address?.hostAddress else null,
         )
         receiver.onPhoneDiscovered = { name, deviceId ->
             scope.launch { rememberDiscoveredPhone(name, deviceId) }
@@ -2093,6 +2345,15 @@ class CarlinkManager(
         return endpoint
     }
 
+    private fun piStartSessionEndpoint(): JSONObject {
+        val rx = checkNotNull(carPlayReceiver) { "Pi receiver unavailable" }
+        val ap = checkNotNull(piCarPlayLink) { "Pi link unavailable" }.ap
+        return rx.startSessionIdentity().put("interface", "dongle-ap")
+            .put("addresses", org.json.JSONArray().put(ap.address.hostAddress))
+            .put("ssid", ap.ssid).put("passphrase", ap.passphrase)
+            .put("channel", ap.channel).put("security", 2)
+    }
+
     /** Lazily rendered once per manager; the launcher icon cannot change under a running process. */
     private val oemIconImages: List<OemIcon.Image> by lazy { OemIcon.render(context) }
 
@@ -2159,6 +2420,8 @@ class CarlinkManager(
         }
         socketTunnel?.let { tunnel -> runCatching { tunnel.close() } }
         socketTunnel = null
+        piCarPlayLink?.let { link -> runCatching { link.close() } }
+        piCarPlayLink = null
         dongleApInfo = null
         lastTouchRoute = null
         lastTouchContactCount = 0
@@ -2307,8 +2570,28 @@ class CarlinkManager(
      * polls those at 1 Hz.
      */
     fun refreshDeviceList() {
-        logInfo("[DEVICE_MGMT] Requesting device snapshot", tag = Logger.Tags.ADAPTR)
-        scope.launch(Dispatchers.IO) { pollBoxInfo() }
+        val piMode = carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY
+        if (piMode && !piDeviceRefreshInFlight.compareAndSet(false, true)) return
+        scope.launch(Dispatchers.IO) {
+            try {
+                if (piMode) {
+                    val status = runCatching { piBluetoothClient().status() }
+                    if (carPlayNetworkMode != CarPlayNetworkMode.PI_WIFI_PROXY) return@launch
+                    status.onSuccess {
+                        piDevices = it
+                        rebuildDeviceList()
+                    }.onFailure {
+                        if (piDevices != null) {
+                            logWarn("[DEVICE_MGMT] Pi paired-device refresh failed: ${it.message}", tag = Logger.Tags.PHONE)
+                            piDevices = null
+                            rebuildDeviceList()
+                        }
+                    }
+                } else pollBoxInfo()
+            } finally {
+                if (piMode) piDeviceRefreshInFlight.set(false)
+            }
+        }
     }
 
     private fun pollBoxInfo() {
@@ -2371,7 +2654,9 @@ class CarlinkManager(
     // docs/ops/04_OPEN_ITEMS.md).
 
     /** True when the box currently holds a link key for [btMac] (from the last MGMT_INFO). */
-    fun isBonded(btMac: String): Boolean = btMac.lowercase() in bondedMacs
+    fun isBonded(btMac: String): Boolean = if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+        piDevices?.pairedPhones?.any { it.first.equals(btMac, ignoreCase = true) } == true
+    } else btMac.lowercase() in bondedMacs
 
     /**
      * Remove a device.
@@ -2385,6 +2670,14 @@ class CarlinkManager(
      */
     fun forgetDevice(btMac: String) {
         val mac = btMac.lowercase()
+        if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+            scope.launch(Dispatchers.IO) {
+                runCatching { forgetPiBluetoothPhone(btMac) }
+                    .onFailure { logWarn("[DEVICE_MGMT] Pi forget failed for $btMac: ${it.message}", tag = Logger.Tags.PHONE) }
+                refreshDeviceList()
+            }
+            return
+        }
         val bonded = mac in bondedMacs
         logInfo("[DEVICE_MGMT] Forget device: $btMac (bonded=$bonded${if (bonded) "" else " — local history delete, nothing sent"})", tag = Logger.Tags.ADAPTR)
 
@@ -3657,7 +3950,24 @@ class CarlinkManager(
         val snap = knownStore?.snapshot ?: KnownDeviceSnapshot()
         val merged =
             synchronized(deviceListLock) {
-                mergeDeviceList(
+                if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+                    val status = piDevices
+                    val pairs = status?.pairedPhones.orEmpty()
+                    val connected = status?.connectedPhones.orEmpty()
+                    val active = activeCarPlayBtMac
+                    pairs.map { (address, name) ->
+                        val mac = address.lowercase()
+                        DeviceInfo(
+                            btMac = mac,
+                            name = name.ifBlank { snap.devices[mac]?.name ?: address },
+                            type = "CarPlay",
+                            lastConnected = snap.devices[mac]?.lastConnectedMs?.let(::formatLastSeen),
+                            bonded = true,
+                            bluetoothConnected = connected.any { it.equals(address, ignoreCase = true) },
+                        )
+                    }.sortedWith(compareBy({ if (it.btMac.equals(appBluetoothPhone, true)) 0 else 1 },
+                        { if (it.btMac.equals(active, true)) 0 else 1 }, { it.name }))
+                } else mergeDeviceList(
                     known = snap.devices,
                     bondedMacs = bondedMacs,
                     suppressed = suppressedDeviceMacs(),
@@ -3686,6 +3996,13 @@ class CarlinkManager(
      */
     fun setPreferredDevice(btMac: String?) {
         val mac = btMac?.lowercase()
+        if (carPlayNetworkMode == CarPlayNetworkMode.PI_WIFI_PROXY) {
+            piTemporaryPhone = null
+            sessionTransportPrefs.edit().putString("phone", mac).apply()
+            knownStore?.update { it.copy(preferredMac = mac) }
+            rebuildDeviceList()
+            return
+        }
         logInfo("[DEVICE_MGMT] Preferred device -> ${mac ?: "(most recent)"}", tag = Logger.Tags.ADAPTR)
         phoneSwitchTimeoutJob?.cancel()
         phoneSwitchTimeoutJob = null
@@ -4405,7 +4722,9 @@ class CarlinkManager(
     private suspend fun findDevice(t: UsbAdapterTransport): String? {
         var attempts = 0
         while (attempts < 10) {
+            if (released || appOwnedBluetoothEnabled) return null
             val opened = t.findAndOpenFirstAdapter()
+            if (released || appOwnedBluetoothEnabled) return null
             if (opened != null) {
                 log("OCBM adapter discovered and opened: path=$opened mode=${usbTransportModeStore.mode}")
                 return opened

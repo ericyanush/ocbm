@@ -53,6 +53,7 @@ class OcbmSocketTunnel(
     }
     private var lastUdpStatsNs = System.nanoTime()
     private val dispatchDrops = AtomicLong()
+    private val lastPiHeartbeatNs = AtomicLong(System.nanoTime())
     private fun reportUdpStats() {
         val now = System.nanoTime()
         if (now - lastUdpStatsNs < 5_000_000_000L) return
@@ -150,6 +151,27 @@ class OcbmSocketTunnel(
         workers.execute(::dispatchLoop)
         log("socket tunnel started epoch=${epoch.toUInt().toString(16)}")
     }
+
+    /** The Pi proxy carries the same broker frames over an AAOS-initiated TCP link. */
+    fun startExternal() {
+        check(alive.compareAndSet(false, true)) { "socket tunnel already started" }
+        check(send(header(Ocbm.TUNNEL_START, 0))) { "could not start Pi socket tunnel" }
+        workers.execute(::dispatchLoop)
+        log("Pi socket tunnel started epoch=${epoch.toUInt().toString(16)}")
+    }
+
+    fun offerExternalFrame(frame: ByteArray) {
+        if (frame.size == 9 && frame[0] == 0x10.toByte() && readU32(frame, 1) == epoch) {
+            lastPiHeartbeatNs.set(System.nanoTime())
+        } else {
+            offerFrame(frame)
+        }
+    }
+
+    /** Pi-only liveness probe. The broker replies with the same epoch and opcode. */
+    fun pingExternal(): Boolean = alive.get() && send(header(0x10.toByte(), 0))
+
+    fun piHeartbeatAgeMs(): Long = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastPiHeartbeatNs.get())
 
     /** Register the adapter's phone-facing TCP port for a receiver TCP listener on loopback. */
     fun listenTcp(apAddress: InetAddress, prefixBits: Int, localPort: Int, timeoutMs: Long = 5000): Int =

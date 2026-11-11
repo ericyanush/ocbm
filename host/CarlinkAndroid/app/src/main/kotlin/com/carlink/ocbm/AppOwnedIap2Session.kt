@@ -2,6 +2,7 @@ package com.carlink.ocbm
 
 import android.content.Context
 import android.bluetooth.BluetoothSocket
+import java.net.Socket
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.IOException
@@ -17,22 +18,33 @@ internal class AppOwnedIap2Session(
     private val signer: SoftwareMfiSigner,
     private val receiver: CarPlayRx,
     private val endpoint: JSONObject,
+    private val piBluetooth: PiBluetoothRfcomm? = null,
     private val log: (String) -> Unit,
     private val onStartSessionSent: () -> Unit,
 ) : Closeable {
     private val bluetooth = AppBluetoothRfcomm(context)
-    private val pending = AtomicReference<AppBluetoothRfcomm.Link?>()
+    private val pending = AtomicReference<AppBluetoothRfcomm.ByteLink?>()
     private val pendingDial = AtomicReference<BluetoothSocket?>()
+    private val pendingPiDial = AtomicReference<Socket?>()
     private val active = AtomicReference<AppBluetoothRfcomm.AuthenticatedLink?>()
     @Volatile private var closed = false
     @Volatile var startSessionSent = false
         private set
 
     fun run() {
-        val localMac = bluetooth.localAddress()
-        check(localMac != "02:00:00:00:00:00") { "Android hides its Bluetooth address; cannot identify accessory" }
-        log("local Bluetooth identity=$localMac; phone selected")
-        val connection = bluetooth.connectAuthenticated(
+        var piLocalMac: String? = null
+        val connection = if (piBluetooth != null) {
+            log("dialing selected phone through Pi Bluetooth")
+            val link = piBluetooth.dial(phoneAddress, onSocketCreated = { socket ->
+                pendingPiDial.set(socket)
+                if (closed) socket.close()
+            })
+            pendingPiDial.set(null)
+            pending.set(link)
+            if (closed) { link.close(); return }
+            piLocalMac = link.accessoryAddress
+            bluetooth.authenticateLink(link, signer, onPhase = { log("iAP2 auth phase=$it") })
+        } else bluetooth.connectAuthenticated(
             phoneAddress, signer,
             onPhase = { log("iAP2 auth phase=$it") },
             onDiagnostic = log,
@@ -47,6 +59,8 @@ internal class AppOwnedIap2Session(
                 if (closed) link.close()
             },
         )
+        val localMac = piLocalMac ?: bluetooth.localAddress()
+        log("local Bluetooth identity=$localMac; phone selected")
         active.set(connection)
         pending.set(null)
         if (closed) { active.getAndSet(null)?.close(); return }
@@ -110,6 +124,7 @@ internal class AppOwnedIap2Session(
     override fun close() {
         closed = true
         pendingDial.getAndSet(null)?.close()
+        pendingPiDial.getAndSet(null)?.close()
         pending.getAndSet(null)?.close()
         active.getAndSet(null)?.close()
     }

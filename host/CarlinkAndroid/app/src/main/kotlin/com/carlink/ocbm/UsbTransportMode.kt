@@ -12,6 +12,7 @@ enum class UsbTransportMode(val label: String) {
 enum class CarPlayNetworkMode(val label: String, val description: String) {
     VEHICLE_HOTSPOT("Vehicle hotspot (direct)", "Phone connects to the vehicle hotspot; AAOS receives CarPlay directly."),
     DONGLE_WIFI_TUNNEL("Dongle Wi-Fi via USB", "Phone connects to the adapter AP; TCP/UDP sockets are forwarded to this app over OCBM."),
+    PI_WIFI_PROXY("Pi network proxy (test)", "Pi Bluetooth and software MFi start CarPlay; the phone joins the Wi-Fi network reported by the Pi, and the Pi relays sockets to AAOS."),
 }
 
 class CarPlayNetworkModeStore(context: Context) {
@@ -20,7 +21,7 @@ class CarPlayNetworkModeStore(context: Context) {
         get() = runCatching {
             CarPlayNetworkMode.valueOf(prefs.getString(KEY_MODE, CarPlayNetworkMode.VEHICLE_HOTSPOT.name)!!)
         }.getOrDefault(CarPlayNetworkMode.VEHICLE_HOTSPOT)
-        set(value) { prefs.edit().putString(KEY_MODE, value.name).apply() }
+        set(value) { check(prefs.edit().putString(KEY_MODE, value.name).commit()) { "Could not save CarPlay network mode" } }
 
     companion object { private const val KEY_MODE = "network_mode" }
 }
