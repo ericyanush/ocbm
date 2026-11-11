@@ -63,9 +63,6 @@ val stageOfflineMfiIdentity = tasks.register<StageOfflineMfiIdentity>("stageOffl
     if (bundleOfflineMfi) sourceDir.set(offlineMfiSource)
     outputDir.set(offlineMfiAssets)
 }
-tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
-    dependsOn(stageOfflineMfiIdentity)
-}
 val carPlayJniDir = gmCcpaRoot.resolve("native/carplay-jni")
 val cargoTargetDir =
     file("${System.getProperty("user.home")}/.cache/cargo-targets/carlink-android-carplay-jni")
@@ -114,7 +111,6 @@ android {
     sourceSets.getByName("main").assets.srcDir(
         gmCcpaRoot.resolve("netprobe_app/app/src/main/assets"),
     )
-    sourceSets.getByName("main").assets.srcDir(offlineMfiAssets.get().asFile)
     sourceSets.getByName("main").jniLibs.srcDir(
         layout.buildDirectory
             .dir("generated/carplayJni/jniLibs")
@@ -230,6 +226,12 @@ android {
 androidComponents {
     beforeVariants(selector().withName("playDebug")) { variant ->
         variant.enable = false
+    }
+    onVariants(selector().all()) { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(
+            stageOfflineMfiIdentity,
+            StageOfflineMfiIdentity::outputDir,
+        )
     }
 }
 
