@@ -1,0 +1,14 @@
+[Unit]
+Description=Carlink Pi CarPlay Wi-Fi and Bluetooth proxy
+Wants=NetworkManager.service bluetooth.service avahi-daemon.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/carlink-pi-proxy --phone-interface wlan0
+Restart=always
+RestartSec=1
+Environment=CARLINK_PI_WIFI_PASSPHRASE_FILE=/etc/carlink-pi-proxy/vehicle-passphrase
+
+[Install]
+WantedBy=multi-user.target

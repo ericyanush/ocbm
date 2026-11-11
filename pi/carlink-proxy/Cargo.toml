@@ -1,0 +1,16 @@
+[package]
+name = "carlink-pi-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+socket2 = "0.5"
+bt-common = { path = "../../crates/bt-common" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17.4", features = ["bluetoothd"] }
+dbus = { version = "0.9.12", features = ["vendored"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "time"] }
+futures = "0.3"
+uuid = "=1.11.0"
